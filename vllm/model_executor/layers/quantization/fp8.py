@@ -134,6 +134,7 @@ class Fp8Config(QuantizationConfig):
                     f"{activation_scheme} activation scheme."
                 )
         self.weight_block_size = weight_block_size
+        self.store_dtype = store_dtype
         self.use_deep_gemm: bool | None = None
 
     @classmethod
@@ -207,10 +208,14 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.store_dtype == "mxfp4":
                 from vllm.model_executor.layers.quantization.mxfp4 import (
-                    Mxfp4MoEMethod,
+                    GptOssMxfp4MoEMethod,
                 )
 
-                return Mxfp4MoEMethod(layer.moe_config)
+                logger.info_once(
+                    "Using MXFP4 MoE method for FP8 checkpoint with "
+                    "store_dtype=mxfp4."
+                )
+                return GptOssMxfp4MoEMethod(layer.moe_config)
             if self.is_checkpoint_fp8_serialized:
                 moe_quant_method = Fp8MoEMethod(self, layer)
             else:
