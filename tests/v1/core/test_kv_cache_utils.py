@@ -1500,21 +1500,41 @@ def test_get_max_concurrency_for_kv_cache_config():
     assert max_concurrency == max_concurrency_hybrid_model
 
 
-def test_dsv4_max_concurrency_uses_uniform_group_pool_math():
-    def dsv4_config(dcp: int):
-        return SimpleNamespace(
-            model_config=SimpleNamespace(
-                max_model_len=256000,
-                hf_config=SimpleNamespace(model_type="deepseek_v4"),
-            ),
-            scheduler_config=SimpleNamespace(max_num_batched_tokens=2048),
-            parallel_config=SimpleNamespace(
-                decode_context_parallel_size=dcp,
-                prefill_context_parallel_size=1,
-            ),
-            cache_config=SimpleNamespace(num_gpu_blocks_override=None),
-        )
+def _make_dsv4_vllm_config(dcp: int):
+    class _Dsv4VllmConfig(SimpleNamespace):
+        def validate_block_size(self):
+            pass
 
+    return _Dsv4VllmConfig(
+        model_config=SimpleNamespace(
+            max_model_len=256000,
+            original_max_model_len=256000,
+            hf_config=SimpleNamespace(model_type="deepseek_v4"),
+        ),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+            max_num_batched_tokens=2048,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=1,
+        ),
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            block_size=None,
+            kv_cache_max_concurrency=None,
+            kv_cache_size_tokens=None,
+            num_gpu_blocks=None,
+            num_gpu_blocks_override=None,
+        ),
+        compilation_config=SimpleNamespace(
+            compilation_time=0,
+            encoder_compilation_time=0,
+        ),
+    )
+
+
+def _make_dsv4_heterogeneous_kv_cache_specs():
     def full_mla_spec(compress_ratio: int):
         return MLAAttentionSpec(
             block_size=256,
@@ -1579,21 +1599,86 @@ def test_dsv4_max_concurrency_uses_uniform_group_pool_math():
                 compressor_state_spec(ratio)
             )
 
+    return kv_cache_specs
+
+
+def _make_dsv4_heterogeneous_kv_cache_groups():
+    kv_cache_specs = _make_dsv4_heterogeneous_kv_cache_specs()
     grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(kv_cache_specs)
     assert grouped_specs is not None
-    kv_cache_groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(
-        grouped_specs
-    )
+    return kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
 
-    for dcp, expected_request_blocks in [(5, 534), (10, 305)]:
-        vllm_config = dsv4_config(dcp)
+
+def test_dsv4_max_concurrency_uses_uniform_group_pool_math():
+    kv_cache_groups = _make_dsv4_heterogeneous_kv_cache_groups()
+
+    for dcp, expected_request_blocks in [(5, 538), (10, 307)]:
+        vllm_config = _make_dsv4_vllm_config(dcp)
         kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
             vllm_config, kv_cache_groups, available_memory=4_500_000_000
         )
-        assert kv_cache_config.num_blocks == 3036
+        assert kv_cache_config.num_blocks == 3054
         assert get_max_concurrency_for_kv_cache_config(
             vllm_config, kv_cache_config
-        ) == pytest.approx(3036 / expected_request_blocks)
+        ) == pytest.approx(3054 / expected_request_blocks)
+
+
+def test_dsv4_engine_capacity_uses_worker_kv_cache_config():
+    from vllm.v1.engine.core import EngineCore
+
+    class FakeModelExecutor:
+        def __init__(self):
+            self.initialized_kv_cache_configs = None
+
+        def get_kv_cache_specs(self):
+            return [_make_dsv4_heterogeneous_kv_cache_specs()]
+
+        def determine_available_memory(self):
+            return [4_500_000_000]
+
+        def initialize_from_config(self, kv_cache_configs):
+            self.initialized_kv_cache_configs = kv_cache_configs
+
+    class FakeEngineCore:
+        def __init__(self):
+            self.available_gpu_memory_for_kv_cache = -1
+            self.model_executor = FakeModelExecutor()
+
+        def collective_rpc(self, method, args=()):
+            raise AssertionError(f"unexpected collective_rpc({method}, {args})")
+
+    vllm_config = _make_dsv4_vllm_config(dcp=5)
+    engine_core = FakeEngineCore()
+
+    scheduler_kv_cache_config = EngineCore._initialize_kv_caches(
+        engine_core, vllm_config
+    )
+
+    initialized_kv_cache_configs = (
+        engine_core.model_executor.initialized_kv_cache_configs
+    )
+    assert initialized_kv_cache_configs is not None
+    worker_kv_cache_config = initialized_kv_cache_configs[0]
+    assert all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in worker_kv_cache_config.kv_cache_groups
+    )
+    assert not any(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in scheduler_kv_cache_config.kv_cache_groups
+    )
+    scheduler_page_sizes = {
+        group.kv_cache_spec.page_size_bytes
+        for group in scheduler_kv_cache_config.kv_cache_groups
+    }
+    assert len(scheduler_page_sizes) > 1
+    expected_num_tokens, expected_max_concurrency = get_kv_cache_capacity(
+        vllm_config, worker_kv_cache_config
+    )
+    assert vllm_config.cache_config.kv_cache_max_concurrency == pytest.approx(
+        expected_max_concurrency
+    )
+    assert vllm_config.cache_config.kv_cache_size_tokens == expected_num_tokens
 
 
 def test_allocate_with_lookahead():
