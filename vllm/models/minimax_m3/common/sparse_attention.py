@@ -14,6 +14,7 @@ attention-backend registry (by dotted path) and by spec-decode, so they must
 keep these names and stay in this module.
 """
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -47,6 +48,8 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 
 logger = init_logger(__name__)
+
+_SPARSE_STATS_ENV = "VLLM_DEBUG_MINIMAX_M3_SPARSE_STATS"
 
 
 class MiniMaxM3SparseBackend(AttentionBackend):
@@ -308,6 +311,55 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
         # Sparse selection parameters (block_size == page size == SPARSE_BLOCK_SIZE).
         self.topk_blocks = topk_blocks
         self.block_size = sparse_block_size
+        self._stats_reports = 0
+
+    def _maybe_log_sparse_stats(
+        self,
+        *,
+        layer_name: str,
+        mode: str,
+        q: torch.Tensor,
+        out: torch.Tensor,
+        topk: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        if os.getenv(_SPARSE_STATS_ENV, "0") != "1" or self._stats_reports >= 16:
+            return
+        if torch.cuda.is_available():
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    return
+            except RuntimeError:
+                return
+        q_f32 = q.float()
+        q_finite = bool(torch.isfinite(q_f32).all().item())
+        if not q_finite:
+            return
+        out_f32 = out.float()
+        logger.warning(
+            "MiniMax M3 sparse stats layer=%s mode=%s q=%s out=%s "
+            "finite q/out=%s/%s absmax q/out=%.6g/%.6g "
+            "mean_abs q/out=%.6g/%.6g topk_range=(%d,%d) "
+            "seq_lens=(%d,%d) stride q/out/topk=%s/%s/%s",
+            layer_name,
+            mode,
+            tuple(q.shape),
+            tuple(out.shape),
+            q_finite,
+            bool(torch.isfinite(out_f32).all().item()),
+            float(q_f32.abs().max().item()),
+            float(out_f32.abs().max().item()),
+            float(q_f32.abs().mean().item()),
+            float(out_f32.abs().mean().item()),
+            int(topk.min().item()),
+            int(topk.max().item()),
+            int(seq_lens.min().item()),
+            int(seq_lens.max().item()),
+            tuple(q.stride()),
+            tuple(out.stride()),
+            tuple(topk.stride()),
+        )
+        self._stats_reports += 1
 
     def forward(
         self,
@@ -363,6 +415,14 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
                 out[:nd],
                 d.decode_query_len,
             )
+            self._maybe_log_sparse_stats(
+                layer_name=layer.layer_name,
+                mode="decode" if d.decode_query_len == 1 else "extend",
+                q=q[:nd],
+                out=out[:nd],
+                topk=decode_topk,
+                seq_lens=d.seq_lens,
+            )
 
         # Prefill [nd:]: cu_seqlens_q already rebased to 0.
         if main_md.num_prefills > 0:
@@ -380,6 +440,14 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
                 self.num_kv_heads,
                 self.scale,
                 out[nd:],
+            )
+            self._maybe_log_sparse_stats(
+                layer_name=layer.layer_name,
+                mode="extend",
+                q=q[nd:],
+                out=out[nd:],
+                topk=prefill_topk,
+                seq_lens=p.seq_lens,
             )
         return output
 

@@ -16,7 +16,7 @@ export CUTE_DSL_ARCH=sm_120a
 export VLLM_USE_B12X_MOE=1
 export VLLM_USE_B12X_MINIMAX_M3_MSA=1
 
-M3_PROFILE="${M3_PROFILE:-torch}"
+M3_PROFILE="${M3_PROFILE:-}"
 PROFILER_ARGS=()
 case "${M3_PROFILE,,}" in
   0|false|no|off|"")
