@@ -144,8 +144,9 @@ while (($#)); do
     --hf-config-path|--hf-config-path=*|--quantization|--quantization=*|\
     --attention-backend|--attention-backend=*|--kv-cache-dtype|\
     --kv-cache-dtype=*|--linear-backend|--linear-backend=*|\
-    --moe-backend|--moe-backend=*|--block-size|--block-size=*|\
-    -cc.mode|-cc.mode=*|-cc.cudagraph_mode|-cc.cudagraph_mode=*)
+    --moe-backend|--moe-backend=*|--mm-encoder-tp-mode|\
+    --mm-encoder-tp-mode=*|--block-size|--block-size=*|-cc.mode|\
+    -cc.mode=*|-cc.cudagraph_mode|-cc.cudagraph_mode=*)
       echo "ERROR: this launcher is pinned to ${MODEL_PATH} as ${SERVED_MODEL_NAME}." >&2
       echo "Do not override model identity, quantization, backend, or graph settings here." >&2
       exit 1
@@ -202,10 +203,10 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}" \
   --trust-remote-code \
   --host "${HOST}" \
   --port "${PORT}" \
-  --tensor-parallel-size 4 \
+  --tensor-parallel-size 3 \
+  --mm-encoder-tp-mode data \
   --gpu-memory-utilization 0.98 \
   --max-num-batched-tokens 2048 \
-  --max-model-len 256000 \
   --max-num-seqs 4 \
   --quantization modelopt_mixed \
   --kv-cache-dtype fp8_e4m3 \
