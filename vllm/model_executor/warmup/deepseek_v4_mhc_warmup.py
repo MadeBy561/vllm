@@ -66,13 +66,15 @@ def _find_first_mhc_layer(model: torch.nn.Module) -> torch.nn.Module | None:
             hasattr(module, attr)
             for attr in (
                 "hc_pre",
-                "hc_post",
+                "hc_post_pre",
                 "hc_attn_fn",
                 "hc_attn_scale",
                 "hc_attn_base",
                 "hc_ffn_fn",
                 "hc_ffn_scale",
                 "hc_ffn_base",
+                "attn_norm",
+                "ffn_norm",
             )
         ):
             return module
@@ -108,18 +110,40 @@ def _warmup_layer_mhc(
     )
 
     for size in token_sizes:
-        residual_slice = residual[:size]
-        for fn, scale, base in (
-            (layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base),
-            (layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base),
+        residual_work = residual[:size]
+        layer_input, post_mix, comb_mix = layer.hc_pre(
+            residual_work,
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+            norm_weight=layer.attn_norm.weight.data,
+            norm_eps=layer.attn_norm.variance_epsilon,
+        )
+        for fn, scale, base, norm in (
+            (
+                layer.hc_ffn_fn,
+                layer.hc_ffn_scale,
+                layer.hc_ffn_base,
+                layer.ffn_norm,
+            ),
+            (
+                layer.hc_attn_fn,
+                layer.hc_attn_scale,
+                layer.hc_attn_base,
+                layer.attn_norm,
+            ),
         ):
-            layer_input, post_mix, comb_mix = layer.hc_pre(
-                residual_slice,
+            residual_work, post_mix, comb_mix, layer_input = layer.hc_post_pre(
+                layer_input,
+                residual_work,
+                post_mix,
+                comb_mix,
                 fn,
                 scale,
                 base,
+                norm_weight=norm.weight.data,
+                norm_eps=norm.variance_epsilon,
             )
-            layer.hc_post(layer_input, residual_slice, post_mix, comb_mix)
 
 
 def _warmup_hc_head(
@@ -171,12 +195,6 @@ def deepseek_v4_mhc_warmup(
     model_type = getattr(config, "model_type", None) if config is not None else None
     if model_type is not None and model_type != "deepseek_v4":
         return
-
-    # Under VLLM_USE_B12X_MHC the fused post_pre is served by the b12x Gram
-    # kernel (captured by the normal graph warmup); the standalone hc_pre /
-    # hc_post boundaries (first / last layer) fall through to the TileLang
-    # kernels, so the generic mHC warmup below still warms exactly the shapes
-    # the b12x forward path uses.
 
     layer = _find_first_mhc_layer(model)
     if layer is None:

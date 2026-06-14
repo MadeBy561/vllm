@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 import typing
 from collections.abc import Callable, Iterable, MutableSequence, Sequence
 from itertools import islice
 from math import lcm
+from typing import Any
 
 import regex as re
 import torch
@@ -21,6 +21,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
@@ -80,6 +81,8 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+_B12X_MHC_PREFILL_MIN_TOKENS = 96
+
 
 def _get_virtual_tp_axis_padded_size(config, axis_name: str, default: int) -> int:
     plan = getattr(config, VIRTUAL_TP_PLAN_ATTR, None)
@@ -128,14 +131,39 @@ def _use_b12x_mhc() -> bool:
     return True
 
 
-def _b12x_mhc_max_tokens() -> int:
-    raw = os.environ.get("B12X_MHC_MAX_TOKENS", "16")
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"B12X_MHC_MAX_TOKENS must be an integer, got {raw!r}"
-        ) from exc
+def _b12x_mhc_decode_expected_m(
+    tokens: int,
+    cudagraph_capture_sizes: Iterable[int],
+) -> int:
+    tokens = max(1, int(tokens))
+    capture_sizes = sorted(
+        {int(size) for size in cudagraph_capture_sizes if int(size) > 0}
+    )
+    for size in capture_sizes:
+        if tokens <= size:
+            return size
+    return tokens
+
+
+def _b12x_mhc_expected_m(
+    tokens: int,
+    *,
+    is_prefill: bool | None,
+    max_num_batched_tokens: int,
+    cudagraph_capture_sizes: Iterable[int],
+) -> int:
+    tokens = max(1, int(tokens))
+
+    if is_prefill is True:
+        expected_m = max(tokens, int(max_num_batched_tokens))
+    elif is_prefill is False:
+        expected_m = _b12x_mhc_decode_expected_m(tokens, cudagraph_capture_sizes)
+    elif tokens >= _B12X_MHC_PREFILL_MIN_TOKENS:
+        expected_m = max(tokens, int(max_num_batched_tokens))
+    else:
+        expected_m = _b12x_mhc_decode_expected_m(tokens, cudagraph_capture_sizes)
+
+    return max(tokens, expected_m)
 
 
 def _get_b12x_plan_scratch(
@@ -845,7 +873,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_config
         self.layer_name = prefix
         self._use_b12x_mhc = _use_b12x_mhc()
-        self._b12x_mhc_max_tokens = _b12x_mhc_max_tokens() if self._use_b12x_mhc else 0
+        self._b12x_mhc_max_num_batched_tokens = int(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self._b12x_mhc_cudagraph_capture_sizes = tuple(
+            int(size)
+            for size in (vllm_config.compilation_config.cudagraph_capture_sizes or ())
+            if int(size) > 0
+        )
         if self._use_b12x_mhc:
             if not prefix:
                 raise RuntimeError("DeepSeek V4 b12x mHC decoder layer needs a prefix")
@@ -854,14 +889,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 raise ValueError(f"Duplicate layer name: {prefix}")
             compilation_config.static_forward_context[prefix] = self
 
-            if self._b12x_mhc_max_tokens <= 0:
-                logger.info_once("DeepSeek V4 b12x mHC enabled for all token counts.")
-            else:
-                logger.info_once(
-                    "DeepSeek V4 b12x mHC enabled for token counts <= %d; "
-                    "refusing TileLang mHC fallback above that.",
-                    self._b12x_mhc_max_tokens,
-                )
+            logger.info_once("DeepSeek V4 b12x mHC enabled.")
 
         self.hidden_size = config.hidden_size
 
@@ -969,22 +997,65 @@ class DeepseekV4DecoderLayer(nn.Module):
             self._b12x_mhc_split_k = 0
 
     def _should_run_b12x_mhc(self, tokens: int) -> bool:
-        if not self._use_b12x_mhc:
+        del tokens
+        return self._use_b12x_mhc
+
+    def _b12x_mhc_prefill_state(self) -> bool | None:
+        if not is_forward_context_available():
+            return None
+
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        metadata: Any | None = None
+        attn_prefix = getattr(self.attn, "prefix", None)
+        if isinstance(attn_metadata, dict) and attn_prefix is not None:
+            metadata = attn_metadata.get(attn_prefix)
+        elif isinstance(attn_metadata, list) and attn_prefix is not None:
+            for item in attn_metadata:
+                if isinstance(item, dict) and attn_prefix in item:
+                    metadata = item[attn_prefix]
+                    break
+
+        split_decodes_and_prefills = getattr(
+            metadata, "split_decodes_and_prefills", None
+        )
+        if callable(split_decodes_and_prefills):
+            _, num_prefills, _, num_prefill_tokens = split_decodes_and_prefills()
+            return int(num_prefills) > 0 or int(num_prefill_tokens) > 0
+
+        max_query_len = getattr(metadata, "max_query_len", None)
+        if max_query_len is not None:
+            return int(max_query_len) > 1
+
+        batch_descriptor = forward_context.batch_descriptor
+        if batch_descriptor is not None and bool(
+            getattr(batch_descriptor, "uniform", False)
+        ):
             return False
-        max_tokens = self._b12x_mhc_max_tokens
-        tokens = int(tokens)
-        if max_tokens > 0 and tokens > max_tokens:
+        return None
+
+    def _b12x_mhc_expected_m(self, tokens: int) -> int:
+        return _b12x_mhc_expected_m(
+            tokens,
+            is_prefill=self._b12x_mhc_prefill_state(),
+            max_num_batched_tokens=self._b12x_mhc_max_num_batched_tokens,
+            cudagraph_capture_sizes=self._b12x_mhc_cudagraph_capture_sizes,
+        )
+
+    def _require_b12x_mhc_norm_weight(
+        self, norm_weight: torch.Tensor | None
+    ) -> torch.Tensor:
+        if norm_weight is None:
             raise RuntimeError(
-                "VLLM_USE_B12X_MHC is enabled, but b12x mHC was asked to run "
-                f"{tokens} tokens with B12X_MHC_MAX_TOKENS={max_tokens}. "
-                "Refusing to fall back to tilelang while b12x mHC is enabled; "
-                "raise B12X_MHC_MAX_TOKENS or disable VLLM_USE_B12X_MHC."
+                "DeepSeek V4 b12x mHC requires fused RMSNorm; pass norm_weight."
             )
-        return True
+        return norm_weight
 
     def _get_b12x_mhc_binding(
         self,
         x: torch.Tensor,
+        *,
+        expected_m: int,
         y: torch.Tensor | None = None,
         post: torch.Tensor | None = None,
         comb: torch.Tensor | None = None,
@@ -993,11 +1064,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         from b12x.integration.residual import B12XMHCScratchCaps, plan_mhc_scratch
 
         tokens = int(x.shape[0])
+        expected_m = int(expected_m)
         plan = plan_mhc_scratch(
             B12XMHCScratchCaps(
                 device=x.device,
                 dtype=x.dtype,
-                max_tokens=max(1, tokens),
+                max_tokens=max(1, tokens, expected_m),
                 hidden_size=self.hidden_size,
                 split_k=self._b12x_mhc_split_k,
             )
@@ -1010,6 +1082,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             post=post,
             comb=comb,
             out=out,
+            expected_m=expected_m,
         )
 
     def _run_b12x_mhc_pre(
@@ -1018,11 +1091,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-        norm_weight: torch.Tensor | None = None,
-        norm_eps: float = 0.0,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         from b12x.integration.residual import b12x_mhc_pre
 
+        norm_weight = self._require_b12x_mhc_norm_weight(norm_weight)
         if torch.compiler.is_compiling():
             return b12x_mhc_pre(
                 residual,
@@ -1039,6 +1113,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         tokens, hc_mult, hidden_size = residual.shape
+        expected_m = self._b12x_mhc_expected_m(int(tokens))
         layer_input = torch.empty(
             (tokens, hidden_size), dtype=residual.dtype, device=residual.device
         )
@@ -1052,6 +1127,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         binding = self._get_b12x_mhc_binding(
             residual,
+            expected_m=expected_m,
             y=layer_input,
             post=post_mix,
             comb=res_mix,
@@ -1079,11 +1155,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-        norm_weight: torch.Tensor | None = None,
-        norm_eps: float = 0.0,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         from b12x.integration.residual import b12x_mhc_post_pre
 
+        norm_weight = self._require_b12x_mhc_norm_weight(norm_weight)
+        expected_m = self._b12x_mhc_expected_m(int(residual.shape[0]))
         if torch.compiler.is_compiling():
             return b12x_mhc_post_pre(
                 x,
@@ -1100,6 +1178,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=norm_eps,
                 split_k=self._b12x_mhc_split_k,
                 block_k=self._b12x_mhc_block_k,
+                expected_m=expected_m,
             )
 
         tokens, hc_mult, hidden_size = residual.shape
@@ -1115,6 +1194,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         binding = self._get_b12x_mhc_binding(
             residual,
+            expected_m=expected_m,
             y=y_out,
             post=post_out,
             comb=comb_out,
@@ -1135,6 +1215,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_eps=norm_eps,
             binding=binding,
             block_k=self._b12x_mhc_block_k,
+            expected_m=expected_m,
         )
 
     def hc_pre(
@@ -1143,8 +1224,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-        norm_weight: torch.Tensor | None = None,
-        norm_eps: float = 1e-6,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
     ):
         if self._should_run_b12x_mhc(int(x.shape[0])):
             return self._run_b12x_mhc_pre(
@@ -1180,8 +1261,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-        norm_weight: torch.Tensor | None = None,
-        norm_eps: float = 1e-6,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._should_run_b12x_mhc(int(residual.shape[0])):
             return self._run_b12x_mhc_post_pre(
