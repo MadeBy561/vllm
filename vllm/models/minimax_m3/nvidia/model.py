@@ -24,6 +24,7 @@ from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
@@ -41,6 +42,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     MinimaxM3IndexerQKParallelLinear,
+    MinimaxM3QKVParallelLinear,
     MinimaxM3QKVParallelLinearWithIndexer,
     QKVParallelLinear,
     RowParallelLinear,
@@ -155,6 +157,48 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     if moe_layer_freq is None:
         return True
     return moe_layer_freq[layer_id] != 0
+
+
+def _get_minimax_m3_virtual_tp_plan(config: PretrainedConfig):
+    plan = getattr(config, VIRTUAL_TP_PLAN_ATTR, None)
+    if isinstance(plan, dict) and plan.get("model_type") == "minimax_m3":
+        return plan
+    return None
+
+
+def _get_minimax_m3_virtual_tp_axis_local_size(
+    config: PretrainedConfig,
+    axis_name: str,
+) -> int:
+    plan = _get_minimax_m3_virtual_tp_plan(config)
+    if plan is None:
+        raise ValueError("MiniMax M3 virtual TP plan is not active.")
+    axis = plan.get(axis_name)
+    if not isinstance(axis, dict):
+        raise ValueError(f"MiniMax M3 virtual TP plan missing {axis_name!r}.")
+    return int(axis["local_size"])
+
+
+def _get_minimax_m3_local_attention_heads(
+    config: PretrainedConfig,
+    tp_size: int,
+) -> tuple[int, int]:
+    if _get_minimax_m3_virtual_tp_plan(config) is not None:
+        return (
+            _get_minimax_m3_virtual_tp_axis_local_size(config, "attention_heads"),
+            _get_minimax_m3_virtual_tp_axis_local_size(config, "kv_heads"),
+        )
+
+    total_num_heads = config.num_attention_heads
+    assert total_num_heads % tp_size == 0
+    num_heads = total_num_heads // tp_size
+    total_num_kv_heads = config.num_key_value_heads
+    if total_num_kv_heads >= tp_size:
+        assert total_num_kv_heads % tp_size == 0
+    else:
+        assert tp_size % total_num_kv_heads == 0
+    num_kv_heads = max(1, total_num_kv_heads // tp_size)
+    return num_heads, num_kv_heads
 
 
 def minimax_m3_qknorm_rope_kv_insert(
@@ -473,20 +517,21 @@ class MiniMaxM3Attention(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
 
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_heads, self.num_kv_heads = _get_minimax_m3_local_attention_heads(
+            config, tp_size
+        )
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = QKVParallelLinear(
+        qkv_linear_cls = (
+            MinimaxM3QKVParallelLinear
+            if _get_minimax_m3_virtual_tp_plan(config) is not None
+            else QKVParallelLinear
+        )
+        self.qkv_proj = qkv_linear_cls(
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
@@ -586,14 +631,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         tp_size = get_tensor_model_parallel_world_size()
 
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_heads, self.num_kv_heads = _get_minimax_m3_local_attention_heads(
+            config, tp_size
+        )
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -604,7 +645,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # identically -- including replication when tp_size > num_key_value_heads.
         sparse_cfg = config.sparse_attention_config
         self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
-        self.num_idx_heads = self.num_kv_heads
+        self.num_idx_heads = (
+            _get_minimax_m3_virtual_tp_axis_local_size(config, "index_heads")
+            if _get_minimax_m3_virtual_tp_plan(config) is not None
+            else self.num_kv_heads
+        )
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
         self.index_q_size = self.num_idx_heads * self.idx_head_dim
 
@@ -612,7 +657,12 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             quant_config, prefix
         )
         if self.split_indexer_projection:
-            self.qkv_proj = QKVParallelLinear(
+            qkv_linear_cls = (
+                MinimaxM3QKVParallelLinear
+                if _get_minimax_m3_virtual_tp_plan(config) is not None
+                else QKVParallelLinear
+            )
+            self.qkv_proj = qkv_linear_cls(
                 self.hidden_size,
                 self.head_dim,
                 self.total_num_heads,

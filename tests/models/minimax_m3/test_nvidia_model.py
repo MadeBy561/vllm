@@ -8,12 +8,14 @@ from torch import nn
 
 import vllm.model_executor.layers.fused_allreduce_gemma_rms_norm as fused_ar_norm
 import vllm.model_executor.parameter as parameter_module
-from vllm.config import CompilationConfig, VllmConfig
+from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
+from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MinimaxM3IndexerQKParallelLinear,
+    MinimaxM3QKVParallelLinear,
     MinimaxM3QKVParallelLinearWithIndexer,
 )
 from vllm.model_executor.parameter import ModelWeightParameter
@@ -546,26 +548,84 @@ def test_minimax_m3_keeps_fused_projection_for_quantized_indexer() -> None:
     )
 
 
-def _fake_qkv_indexer_layer(tp_rank: int) -> MinimaxM3QKVParallelLinearWithIndexer:
-    layer = object.__new__(MinimaxM3QKVParallelLinearWithIndexer)
+_MINIMAX_M3_TP3_VIRTUAL_TP_PLAN = {
+    "sharding": "b12x-padded",
+    "model_type": "minimax_m3",
+    "attention_heads": {
+        "original_size": 64,
+        "padded_size": 96,
+        "tp_size": 3,
+        "local_size": 32,
+    },
+    "kv_heads": {
+        "original_size": 4,
+        "padded_size": 6,
+        "tp_size": 3,
+        "local_size": 2,
+        "q_heads_per_kv": 16,
+    },
+    "index_heads": {
+        "original_size": 4,
+        "padded_size": 6,
+        "tp_size": 3,
+        "local_size": 2,
+    },
+}
+
+
+def _fake_current_config_with_virtual_tp_plan():
+    text_config = SimpleNamespace()
+    setattr(text_config, VIRTUAL_TP_PLAN_ATTR, _MINIMAX_M3_TP3_VIRTUAL_TP_PLAN)
+    return SimpleNamespace(model_config=SimpleNamespace(hf_text_config=text_config))
+
+
+def _fake_qkv_layer(
+    tp_rank: int,
+    tp_size: int = 4,
+    virtual_tp_plan: dict | None = None,
+) -> MinimaxM3QKVParallelLinear:
+    layer = object.__new__(MinimaxM3QKVParallelLinear)
     layer.tp_rank = tp_rank
-    layer.tp_size = 4
+    layer.tp_size = tp_size
     layer.head_size = 128
-    layer.index_head_size = 128
-    layer.num_heads = 16
-    layer.num_kv_heads = 1
+    layer.v_head_size = 128
+    layer.num_heads = 32 if virtual_tp_plan is not None else 16
+    layer.num_kv_heads = 2 if virtual_tp_plan is not None else 1
     layer.num_kv_head_replicas = 1
-    layer.num_index_heads = 1
+    layer._minimax_m3_virtual_tp_plan = virtual_tp_plan
     return layer
 
 
-def _fake_indexer_qk_layer(tp_rank: int) -> MinimaxM3IndexerQKParallelLinear:
+def _fake_qkv_indexer_layer(
+    tp_rank: int,
+    tp_size: int = 4,
+    virtual_tp_plan: dict | None = None,
+) -> MinimaxM3QKVParallelLinearWithIndexer:
+    layer = object.__new__(MinimaxM3QKVParallelLinearWithIndexer)
+    layer.tp_rank = tp_rank
+    layer.tp_size = tp_size
+    layer.head_size = 128
+    layer.index_head_size = 128
+    layer.num_heads = 32 if virtual_tp_plan is not None else 16
+    layer.num_kv_heads = 2 if virtual_tp_plan is not None else 1
+    layer.num_kv_head_replicas = 1
+    layer.num_index_heads = 2 if virtual_tp_plan is not None else 1
+    layer._minimax_m3_virtual_tp_plan = virtual_tp_plan
+    return layer
+
+
+def _fake_indexer_qk_layer(
+    tp_rank: int,
+    tp_size: int = 4,
+    virtual_tp_plan: dict | None = None,
+) -> MinimaxM3IndexerQKParallelLinear:
     layer = object.__new__(MinimaxM3IndexerQKParallelLinear)
     layer.tp_rank = tp_rank
-    layer.tp_size = 4
+    layer.tp_size = tp_size
     layer.index_head_size = 128
-    layer.num_index_heads = 1
+    layer.num_index_heads = 2 if virtual_tp_plan is not None else 1
     layer.num_index_head_replicas = 1
+    layer._minimax_m3_virtual_tp_plan = virtual_tp_plan
     return layer
 
 
@@ -573,12 +633,13 @@ def _make_real_model_weight_parameter(
     tp_rank: int,
     data: torch.Tensor,
     monkeypatch,
+    tp_size: int = 4,
 ) -> ModelWeightParameter:
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_rank", lambda: tp_rank
     )
     monkeypatch.setattr(
-        parameter_module, "get_tensor_model_parallel_world_size", lambda: 4
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: tp_size
     )
     return ModelWeightParameter(
         data=data,
@@ -593,6 +654,21 @@ def _rows(rows: int, cols: int, dtype: torch.dtype) -> torch.Tensor:
     if dtype == torch.uint8:
         return values.remainder(251).to(torch.uint8)
     return values.to(dtype)
+
+
+def _expected_padded_rows(
+    rows: int,
+    cols: int,
+    dtype: torch.dtype,
+    start: int,
+    size: int,
+) -> torch.Tensor:
+    expected = torch.zeros((size, cols), dtype=dtype)
+    available = rows - start
+    if available > 0:
+        valid = min(size, available)
+        expected[:valid].copy_(_rows(rows, cols, dtype).narrow(0, start, valid))
+    return expected
 
 
 def test_minimax_m3_qkv_indexer_loader_places_real_tp_shards(monkeypatch) -> None:
@@ -647,6 +723,99 @@ def test_minimax_m3_qkv_indexer_loader_places_real_tp_shards(monkeypatch) -> Non
         torch.testing.assert_close(scale.data[2432:2560], _rows(128, cols, torch.uint8))
 
 
+def test_minimax_m3_qkv_loader_zero_fills_virtual_tp3_tail(monkeypatch) -> None:
+    local_rows = 4096 + 256 + 256
+    cols = 4
+    current_config = _fake_current_config_with_virtual_tp_plan()
+
+    for tp_rank in range(3):
+        layer = _fake_qkv_layer(
+            tp_rank,
+            tp_size=3,
+            virtual_tp_plan=_MINIMAX_M3_TP3_VIRTUAL_TP_PLAN,
+        )
+        weight = _make_real_model_weight_parameter(
+            tp_rank,
+            torch.zeros((local_rows, cols), dtype=torch.bfloat16),
+            monkeypatch,
+            tp_size=3,
+        )
+
+        with set_current_vllm_config(current_config):
+            layer.weight_loader_v2(weight, _rows(8192, cols, torch.bfloat16), "q")
+            layer.weight_loader_v2(weight, _rows(512, cols, torch.bfloat16), "k")
+            layer.weight_loader_v2(weight, _rows(512, cols, torch.bfloat16), "v")
+
+        torch.testing.assert_close(
+            weight.data[:4096],
+            _expected_padded_rows(
+                8192, cols, torch.bfloat16, tp_rank * 4096, 4096
+            ),
+        )
+        torch.testing.assert_close(
+            weight.data[4096:4352],
+            _expected_padded_rows(512, cols, torch.bfloat16, tp_rank * 256, 256),
+        )
+        torch.testing.assert_close(
+            weight.data[4352:4608],
+            _expected_padded_rows(512, cols, torch.bfloat16, tp_rank * 256, 256),
+        )
+
+
+def test_minimax_m3_qkv_indexer_loader_zero_fills_virtual_tp3_tail(
+    monkeypatch,
+) -> None:
+    local_rows = 4096 + 256 + 256 + 256 + 128
+    cols = 4
+    current_config = _fake_current_config_with_virtual_tp_plan()
+
+    for tp_rank in range(3):
+        layer = _fake_qkv_indexer_layer(
+            tp_rank,
+            tp_size=3,
+            virtual_tp_plan=_MINIMAX_M3_TP3_VIRTUAL_TP_PLAN,
+        )
+        weight = _make_real_model_weight_parameter(
+            tp_rank,
+            torch.zeros((local_rows, cols), dtype=torch.bfloat16),
+            monkeypatch,
+            tp_size=3,
+        )
+
+        with set_current_vllm_config(current_config):
+            layer.weight_loader_v2(weight, _rows(8192, cols, torch.bfloat16), "q")
+            layer.weight_loader_v2(weight, _rows(512, cols, torch.bfloat16), "k")
+            layer.weight_loader_v2(weight, _rows(512, cols, torch.bfloat16), "v")
+            layer.weight_loader_v2(
+                weight, _rows(512, cols, torch.bfloat16), "index_q"
+            )
+            layer.weight_loader_v2(
+                weight, _rows(128, cols, torch.bfloat16), "index_k"
+            )
+
+        torch.testing.assert_close(
+            weight.data[:4096],
+            _expected_padded_rows(
+                8192, cols, torch.bfloat16, tp_rank * 4096, 4096
+            ),
+        )
+        torch.testing.assert_close(
+            weight.data[4096:4352],
+            _expected_padded_rows(512, cols, torch.bfloat16, tp_rank * 256, 256),
+        )
+        torch.testing.assert_close(
+            weight.data[4352:4608],
+            _expected_padded_rows(512, cols, torch.bfloat16, tp_rank * 256, 256),
+        )
+        torch.testing.assert_close(
+            weight.data[4608:4864],
+            _expected_padded_rows(512, cols, torch.bfloat16, tp_rank * 256, 256),
+        )
+        torch.testing.assert_close(
+            weight.data[4864:4992], _rows(128, cols, torch.bfloat16)
+        )
+
+
 def test_minimax_m3_split_indexer_loader_places_real_tp_shards(
     monkeypatch,
 ) -> None:
@@ -670,6 +839,39 @@ def test_minimax_m3_split_indexer_loader_places_real_tp_shards(
         )
         torch.testing.assert_close(
             weight.data[128:256], _rows(128, cols, torch.bfloat16)
+        )
+
+
+def test_minimax_m3_split_indexer_loader_zero_fills_virtual_tp3_tail(
+    monkeypatch,
+) -> None:
+    local_rows = 256 + 128
+    cols = 4
+    current_config = _fake_current_config_with_virtual_tp_plan()
+
+    for tp_rank in range(3):
+        layer = _fake_indexer_qk_layer(
+            tp_rank,
+            tp_size=3,
+            virtual_tp_plan=_MINIMAX_M3_TP3_VIRTUAL_TP_PLAN,
+        )
+        weight = _make_real_model_weight_parameter(
+            tp_rank,
+            torch.zeros((local_rows, cols), dtype=torch.bfloat16),
+            monkeypatch,
+            tp_size=3,
+        )
+
+        with set_current_vllm_config(current_config):
+            layer.weight_loader_v2(weight, _rows(512, cols, torch.bfloat16), "index_q")
+            layer.weight_loader_v2(weight, _rows(128, cols, torch.bfloat16), "index_k")
+
+        torch.testing.assert_close(
+            weight.data[:256],
+            _expected_padded_rows(512, cols, torch.bfloat16, tp_rank * 256, 256),
+        )
+        torch.testing.assert_close(
+            weight.data[256:384], _rows(128, cols, torch.bfloat16)
         )
 
 
