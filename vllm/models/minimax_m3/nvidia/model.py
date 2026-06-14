@@ -135,7 +135,6 @@ def _enable_minimax_m3_torch_compile(vllm_config: VllmConfig) -> bool:
     del vllm_config
     return (
         envs.VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE
-        and not envs.VLLM_USE_AOT_COMPILE
         and not envs.VLLM_USE_BREAKABLE_CUDAGRAPH
     )
 
@@ -869,20 +868,27 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         eps = self.q_norm.variance_epsilon
         num_tokens = qkv.shape[0]
 
-        fwd_slot_mapping = get_forward_context().slot_mapping
-        if (
-            not isinstance(fwd_slot_mapping, dict)
-            or self.layer_name not in fwd_slot_mapping
-        ):
-            # Memory-profiling run: caches not yet bound, slot_mapping is empty.
-            return qkv.new_zeros((num_tokens, self.hidden_size))
-
-        main_slot_mapping = fwd_slot_mapping[self.layer_name]
-        index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
         encoded_layer_name = _encode_layer_name(self.layer_name)
+        main_slot_mapping = None
+        index_slot_mapping = None
+        # Slot mappings are live scheduler metadata. Keep the compiled path
+        # from reading them in Python; the cache-update custom op resolves
+        # them at runtime from the forward context.
+        if not torch.compiler.is_compiling():
+            fwd_slot_mapping = get_forward_context().slot_mapping
+            if (
+                not isinstance(fwd_slot_mapping, dict)
+                or self.layer_name not in fwd_slot_mapping
+            ):
+                # Memory-profiling run: caches not yet bound, slot_mapping is
+                # empty.
+                return qkv.new_zeros((num_tokens, self.hidden_size))
+
+            main_slot_mapping = fwd_slot_mapping[self.layer_name]
+            index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
         q = qkv.new_empty((num_tokens, self.q_size))
         index_q = qkv.new_empty((num_tokens, self.index_q_size))
-        insert_via_fused = not self._fp8_kv
+        insert_via_fused = not torch.compiler.is_compiling() and not self._fp8_kv
         kv_cache_dummy_dep = None
         _run_minimax_m3_qknorm_rope_kv_insert(
             qkv,
@@ -901,12 +907,12 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             index_slot_mapping,
             self.kv_cache if insert_via_fused else None,
             self.indexer.index_cache.kv_cache if insert_via_fused else None,
-            self.kv_cache.size(2),  # paged-cache block size
+            self.kv_cache.size(2) if insert_via_fused else 0,
             q,
             index_q,
             self.kv_cache_dtype,
         )
-        if not insert_via_fused:
+        if torch.compiler.is_compiling() or not insert_via_fused:
             kv = self.num_kv_heads * self.head_dim
             k = qkv[:, self.q_size : self.q_size + kv]
             v = qkv[:, self.q_size + kv : self.q_size + 2 * kv]
@@ -917,13 +923,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                     k,
                     v,
                     index_k,
-                    self.kv_cache,
-                    self.indexer.index_cache.kv_cache,
-                    main_slot_mapping,
-                    index_slot_mapping,
                     encoded_layer_name,
                 )
             else:
+                assert main_slot_mapping is not None
+                assert index_slot_mapping is not None
                 self._insert_kv(k, v, index_k, main_slot_mapping, index_slot_mapping)
 
         output = torch.empty_like(q)
@@ -996,44 +1000,39 @@ def minimax_m3_sparse_kv_cache_update(
     key: torch.Tensor,
     value: torch.Tensor,
     index_key: torch.Tensor,
-    main_kv_cache: torch.Tensor,
-    index_kv_cache: torch.Tensor,
-    main_slot_mapping: torch.Tensor,
-    index_slot_mapping: torch.Tensor,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     layer_name = _resolve_layer_name(layer_name)
-    layer = get_forward_context().no_compile_layers[layer_name]
+    forward_context = get_forward_context()
+    layer = forward_context.no_compile_layers[layer_name]
     assert isinstance(layer, MiniMaxM3SparseAttention)
-    layer._insert_kv_into_caches(
-        key,
-        value,
-        index_key,
-        main_kv_cache,
-        index_kv_cache,
-        main_slot_mapping,
-        index_slot_mapping,
-    )
-    return torch.empty(0, device=main_kv_cache.device, dtype=main_kv_cache.dtype)
+    slot_mapping = forward_context.slot_mapping
+    if isinstance(slot_mapping, dict) and layer_name in slot_mapping:
+        layer._insert_kv_into_caches(
+            key,
+            value,
+            index_key,
+            layer.kv_cache,
+            layer.indexer.index_cache.kv_cache,
+            slot_mapping[layer_name],
+            slot_mapping[layer.indexer.index_cache.prefix],
+        )
+    return torch.empty(0, device=layer.kv_cache.device, dtype=layer.kv_cache.dtype)
 
 
 def minimax_m3_sparse_kv_cache_update_fake(
     key: torch.Tensor,
     value: torch.Tensor,
     index_key: torch.Tensor,
-    main_kv_cache: torch.Tensor,
-    index_kv_cache: torch.Tensor,
-    main_slot_mapping: torch.Tensor,
-    index_slot_mapping: torch.Tensor,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
-    return torch.empty(0, device=main_kv_cache.device, dtype=main_kv_cache.dtype)
+    return torch.empty(0, device=key.device, dtype=key.dtype)
 
 
 direct_register_custom_op(
     op_name="minimax_m3_sparse_kv_cache_update",
     op_func=minimax_m3_sparse_kv_cache_update,
-    mutates_args=["main_kv_cache", "index_kv_cache"],
+    mutates_args=[],
     fake_impl=minimax_m3_sparse_kv_cache_update_fake,
 )
 
