@@ -81,6 +81,7 @@ from vllm.model_executor.kernels.linear.mxfp4.xpu import (
     XPUMxFp4LinearKernel,
 )
 from vllm.model_executor.kernels.linear.mxfp8 import (
+    B12xMxfp8LinearKernel,
     Mxfp8LinearKernel,
     Mxfp8LinearLayerConfig,
 )
@@ -200,6 +201,7 @@ def _get_linear_backend() -> str:
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "b12x": {
         B12xFp8BlockScaledMMKernel,
+        B12xMxfp8LinearKernel,
     },
     "cutlass": {
         CutlassInt8ScaledMMLinearKernel,
@@ -388,6 +390,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
 # in priority/performance order (when available)
 _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
         EmulationMxfp8LinearKernel,
@@ -743,7 +746,15 @@ def init_mxfp8_linear_kernel() -> Mxfp8LinearKernel:
 
     # Apply --linear-backend filtering when set.
     linear_backend = _get_linear_backend()
-    if linear_backend != "auto":
+    b12x_fp8_gemm_required = envs.VLLM_USE_B12X_FP8_GEMM
+    if b12x_fp8_gemm_required:
+        if linear_backend not in ("auto", "b12x"):
+            raise ValueError(
+                "VLLM_USE_B12X_FP8_GEMM requires --linear-backend=auto or b12x "
+                f"for MXFP8 linear layers, got {linear_backend}."
+            )
+        possible = [B12xMxfp8LinearKernel]
+    elif linear_backend != "auto":
         filtered = _filter_kernels_by_backend(linear_backend, possible)
         if not filtered:
             raise ValueError(
@@ -1049,6 +1060,7 @@ __all__ = [
     "init_mxfp8_linear_kernel",
     "Mxfp8LinearKernel",
     "Mxfp8LinearLayerConfig",
+    "B12xMxfp8LinearKernel",
     "init_mxfp4_linear_kernel",
     "MxFp4LinearKernel",
     "MxFp4LinearLayerConfig",

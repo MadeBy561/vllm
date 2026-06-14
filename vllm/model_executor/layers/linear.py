@@ -1577,6 +1577,144 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         param_data.copy_(loaded_weight)
 
 
+class MinimaxM3IndexerQKParallelLinear(ColumnParallelLinear):
+    """MiniMax-M3 lightning-indexer q/k projection.
+
+    This mirrors the indexer slice of ``MinimaxM3QKVParallelLinearWithIndexer``
+    for checkpoints where the main q/k/v projection is quantized differently
+    from the BF16 indexer projection.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        total_num_kv_heads: int,
+        total_num_index_heads: int,
+        index_head_size: int,
+        bias: bool = False,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        assert total_num_index_heads == total_num_kv_heads, (
+            "MinimaxM3IndexerQKParallelLinear requires "
+            "total_num_index_heads == total_num_kv_heads"
+        )
+        self.hidden_size = hidden_size
+        self.total_num_kv_heads = total_num_kv_heads
+        self.total_num_index_heads = total_num_index_heads
+        self.index_head_size = index_head_size
+
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size >= self.total_num_index_heads:
+            self.num_index_heads = 1
+            self.num_index_head_replicas = divide(tp_size, self.total_num_index_heads)
+        else:
+            self.num_index_heads = divide(self.total_num_index_heads, tp_size)
+            self.num_index_head_replicas = 1
+
+        index_q = self.num_index_heads * self.index_head_size
+        index_k = self.index_head_size
+        self.output_sizes = [
+            index_q * tp_size,
+            index_k * tp_size,
+        ]
+
+        ColumnParallelLinear.__init__(
+            self,
+            input_size=self.hidden_size,
+            output_size=sum(self.output_sizes),
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def validate_shard_id(self, loaded_shard_id: str | None) -> None:
+        if loaded_shard_id is None:
+            return
+        if loaded_shard_id not in ("index_q", "index_k"):
+            raise ValueError(
+                "Shard id for MinimaxM3IndexerQKParallelLinear must be one of "
+                "'index_q' or 'index_k'; got "
+                f"{loaded_shard_id}."
+            )
+
+    def _get_shard_offset_mapping(self, loaded_shard_id: str) -> int | None:
+        return {
+            "index_q": 0,
+            "index_k": self.num_index_heads * self.index_head_size,
+        }.get(loaded_shard_id)
+
+    def _get_shard_size_mapping(self, loaded_shard_id: str) -> int | None:
+        return {
+            "index_q": self.num_index_heads * self.index_head_size,
+            "index_k": self.index_head_size,
+        }.get(loaded_shard_id)
+
+    def weight_loader_v2(
+        self,
+        param: BasevLLMParameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        self.validate_shard_id(loaded_shard_id)
+        assert loaded_shard_id in ("index_q", "index_k")
+
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        assert shard_offset is not None and shard_size is not None
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        num_heads = (
+            self.tp_size
+            if loaded_shard_id == "index_k"
+            else self.num_index_head_replicas
+        )
+        param.load_qkv_weight(
+            loaded_weight=loaded_weight,
+            num_heads=num_heads,
+            shard_id=loaded_shard_id,
+            shard_offset=shard_offset,
+            shard_size=shard_size,
+            tp_rank=self.tp_rank,
+        )
+
+    def weight_loader(
+        self,
+        param: Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        self.validate_shard_id(loaded_shard_id)
+        assert loaded_shard_id in ("index_q", "index_k")
+        output_dim = getattr(param, "output_dim", None)
+        assert output_dim is not None
+
+        shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
+        shard_size = self._get_shard_size_mapping(loaded_shard_id)
+        assert shard_offset is not None and shard_size is not None
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        param_data = param.data.narrow(output_dim, shard_offset, shard_size)
+        if loaded_shard_id == "index_k":
+            shard_rank = 0
+        else:
+            shard_rank = self.tp_rank // self.num_index_head_replicas
+        loaded_weight = loaded_weight.narrow(
+            output_dim, shard_rank * shard_size, shard_size
+        )
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
+
+
 # --8<-- [start:row_parallel_linear]
 @PluggableLayer.register("row_parallel_linear")
 class RowParallelLinear(LinearBase):
