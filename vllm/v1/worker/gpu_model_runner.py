@@ -5632,6 +5632,8 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        include_mm_inputs: bool = True,
+        single_request_prefill: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5659,6 +5661,12 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            include_mm_inputs: If True, include synthetic multimodal inputs for
+                multimodal models. Text-only warmups can disable this to cover
+                the same attention specialization as text generation requests.
+            single_request_prefill: If True, create one prefill request with
+                `num_tokens` tokens. This covers text-only single-request
+                prefill kernels without keying warmup on a live prompt length.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -5693,6 +5701,7 @@ class GPUModelRunner(
         max_num_reqs = self.scheduler_config.max_num_seqs
         if create_mixed_batch:
             assert not uniform_decode
+            assert not single_request_prefill
             # Create mixed batch:
             # first half decode tokens, second half one prefill
             num_decode_tokens = min(max_num_reqs - 1, num_tokens // 2)
@@ -5705,10 +5714,15 @@ class GPUModelRunner(
             max_query_len = num_prefill_tokens
         elif uniform_decode:
             assert not create_mixed_batch
+            assert not single_request_prefill
             num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
             num_scheduled_tokens_list = [max_query_len] * num_reqs
             if num_tokens % max_query_len != 0:
                 num_scheduled_tokens_list[-1] = num_tokens % max_query_len
+        elif single_request_prefill:
+            assert not create_mixed_batch
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens]
         else:
             num_reqs = min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
@@ -5848,7 +5862,11 @@ class GPUModelRunner(
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
             model_kwargs = self._init_model_kwargs()
-            if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
+            if (
+                include_mm_inputs
+                and self.supports_mm_inputs
+                and not self.model_config.is_encoder_decoder
+            ):
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
 
                 model_kwargs = {
@@ -6246,9 +6264,19 @@ class GPUModelRunner(
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
 
-        # Add `is_profile` here to pre-allocate communication buffers
+        # Add `is_profile` here to pre-allocate communication buffers.
+        # If multimodal profiling is skipped, profile the language model with
+        # text inputs as well so compile specializes to the same forward
+        # contract used by text-only requests.
+        include_mm_inputs = not (
+            self.supports_mm_inputs
+            and self.model_config.multimodal_config is not None
+            and self.model_config.multimodal_config.skip_mm_profiling
+        )
         hidden_states, last_hidden_states = self._dummy_run(
-            self.max_num_tokens, is_profile=True
+            self.max_num_tokens,
+            is_profile=True,
+            include_mm_inputs=include_mm_inputs,
         )
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
