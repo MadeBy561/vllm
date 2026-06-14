@@ -31,12 +31,49 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
+_moe_repeat_check_reports = 0
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
         return default
     return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning_once(
+            "Ignoring invalid integer environment value %s=%r", name, value
+        )
+        return default
+
+
+def _moe_repeat_check_enabled() -> bool:
+    return _env_flag("B12X_MOE_REPEAT_CHECK") or _env_flag(
+        "VLLM_B12X_MOE_REPEAT_CHECK"
+    )
+
+
+def _moe_repeat_check_after_engine_start() -> bool:
+    return _env_flag(
+        "B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START"
+    ) or _env_flag("VLLM_B12X_MOE_REPEAT_CHECK_AFTER_ENGINE_START")
+
+
+def _moe_zero_scratch_enabled() -> bool:
+    return _env_flag("B12X_MOE_ZERO_SCRATCH") or _env_flag(
+        "VLLM_B12X_MOE_ZERO_SCRATCH"
+    )
+
+
+def _moe_core_plan(plan: Any) -> Any:
+    return getattr(plan, "_core_workspace_plan", plan)
 
 
 def _dtype_element_size(dtype: torch.dtype) -> int:
@@ -110,6 +147,34 @@ def _b12x_scratch_nbytes(plan: Any) -> int:
     return int(spec.shape[0])
 
 
+def _dynamic_moe_warmup_tokens(
+    *,
+    topk: int,
+    quant_mode: str,
+    requested_tokens: int,
+) -> int:
+    """Return a small token count that selects b12x's dynamic MoE backend."""
+    from b12x.integration.tp_moe import select_tp_moe_backend
+
+    tokens = max(int(requested_tokens), 1)
+    topk = max(int(topk), 1)
+    for _ in range(16):
+        if (
+            select_tp_moe_backend(
+                num_tokens=tokens,
+                num_topk=topk,
+                quant_mode=quant_mode,
+            )
+            == "dynamic"
+        ):
+            return tokens
+        tokens *= 2
+    raise RuntimeError(
+        "could not find a B12X dynamic MoE warmup token count for "
+        f"topk={topk}, quant_mode={quant_mode!r}"
+    )
+
+
 def _workspace2_as_b12x_scratch(
     workspace2: torch.Tensor | None,
     plan: Any,
@@ -159,6 +224,13 @@ def _run_b12x_moe_fp4(
 ) -> None:
     """Call b12x MoE with caller-owned live scratch."""
     from b12x.integration.tp_moe import b12x_moe_fp4
+
+    if _moe_zero_scratch_enabled():
+        if _is_current_stream_capturing():
+            raise RuntimeError(
+                "B12X_MOE_ZERO_SCRATCH is a diagnostic eager-only mode"
+            )
+        scratch.zero_()
 
     binding = plan.bind(
         scratch=scratch,
@@ -302,6 +374,122 @@ def _is_current_stream_capturing() -> bool:
         return False
     is_capturing = getattr(cuda, "is_current_stream_capturing", None)
     return bool(is_capturing is not None and is_capturing())
+
+
+def _maybe_repeat_check_b12x_moe(
+    *,
+    original_output: torch.Tensor,
+    a: torch.Tensor,
+    a1_gscale: torch.Tensor,
+    w1_fp4: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    apply_router_weight_on_input: bool,
+    input_scales_are_reciprocal: bool,
+    input_scales_static: bool,
+    activation: str,
+    quant_mode: str,
+    unit_scale_contract: bool,
+    source_format: str,
+    w13_layout: str,
+    prepared_w4a16: Any,
+    swiglu_limit: float | None,
+    swiglu_alpha: float | None,
+    swiglu_beta: float | None,
+    plan: Any,
+    scratch: torch.Tensor,
+) -> None:
+    global _moe_repeat_check_reports
+
+    if not _moe_repeat_check_enabled() or _is_current_stream_capturing():
+        return
+    if _moe_repeat_check_after_engine_start() and not _env_flag(
+        "B12X_VLLM_ENGINE_STARTED"
+    ):
+        return
+    max_reports = _env_int("B12X_MOE_REPEAT_CHECK_MAX_REPORTS", 8)
+    if _moe_repeat_check_reports >= max_reports:
+        return
+
+    repeat_output = torch.empty_like(original_output)
+    _run_b12x_moe_fp4(
+        a=a,
+        a1_gscale=a1_gscale,
+        w1_fp4=w1_fp4,
+        w1_blockscale=w1_blockscale,
+        w1_alphas=w1_alphas,
+        a2_gscale=a2_gscale,
+        w2_fp4=w2_fp4,
+        w2_blockscale=w2_blockscale,
+        w2_alphas=w2_alphas,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        output=repeat_output,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        input_scales_static=input_scales_static,
+        activation=activation,
+        quant_mode=quant_mode,
+        unit_scale_contract=unit_scale_contract,
+        source_format=source_format,
+        w13_layout=w13_layout,
+        prepared_w4a16=prepared_w4a16,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        plan=plan,
+        scratch=scratch,
+    )
+
+    original_f = original_output.float()
+    repeat_f = repeat_output.float()
+    finite = bool(
+        torch.isfinite(original_f).all().item()
+        and torch.isfinite(repeat_f).all().item()
+    )
+    if original_f.numel() == 0:
+        max_abs = mean_abs = 0.0
+        cosine = 1.0
+    else:
+        diff = (original_f - repeat_f).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        original_flat = original_f.flatten()
+        repeat_flat = repeat_f.flatten()
+        denom = original_flat.norm() * repeat_flat.norm()
+        cosine = (
+            float((original_flat.dot(repeat_flat) / denom).item())
+            if float(denom.item()) != 0.0
+            else 1.0
+        )
+
+    _moe_repeat_check_reports += 1
+    core_plan = _moe_core_plan(plan)
+    logger.warning(
+        "B12X MoE repeat check: finite=%s max_abs=%g mean_abs=%g "
+        "cosine=%g shape=%s dtype=%s quant_mode=%s activation=%s "
+        "implementation=%s routed_rows=%s max_rows=%s "
+        "max_tokens_per_launch=%s topk=%s",
+        finite,
+        max_abs,
+        mean_abs,
+        cosine,
+        tuple(original_output.shape),
+        original_output.dtype,
+        quant_mode,
+        activation,
+        getattr(core_plan, "implementation", None),
+        getattr(core_plan, "routed_rows", None),
+        getattr(core_plan, "max_rows", None),
+        getattr(core_plan, "max_tokens_per_launch", None),
+        getattr(core_plan, "num_topk", None),
+    )
 
 
 def _normalize_b12x_moe_topk_ids(topk_ids: torch.Tensor) -> torch.Tensor:
@@ -677,6 +865,225 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 return w4a16
         return None
 
+    def _warmup_metadata(self, layer: torch.nn.Module) -> SimpleNamespace | None:
+        w1 = getattr(layer, "w13_weight", None)
+        w2 = getattr(layer, "w2_weight", None)
+        if not isinstance(w1, torch.Tensor) or not isinstance(w2, torch.Tensor):
+            return None
+        if w1.numel() == 0 or w2.numel() == 0:
+            return None
+
+        activation = getattr(
+            layer,
+            "activation",
+            getattr(self.moe_config, "activation", MoEActivation.SILU),
+        )
+        if isinstance(activation, str):
+            activation = MoEActivation.from_str(activation)
+        activation = cast(MoEActivation, activation)
+
+        quant_mode = self._quant_mode()
+        prepared_w4a16 = (
+            self._lookup_prepared_w4a16() if quant_mode == "w4a16" else None
+        )
+        if prepared_w4a16 is not None:
+            num_experts = int(prepared_w4a16.num_experts)
+            n = int(prepared_w4a16.intermediate_size)
+        else:
+            num_experts = int(w1.shape[0])
+            n = int(w2.shape[2]) * 2
+
+        swiglu_limit, swiglu_alpha, swiglu_beta = self._b12x_swiglu_params(
+            activation
+        )
+        if (
+            quant_mode != "w4a16"
+            and activation != MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        ):
+            swiglu_limit = None
+
+        return SimpleNamespace(
+            w1=w1,
+            w2=w2,
+            activation=activation,
+            activation_name=_b12x_activation_name(activation),
+            quant_mode=quant_mode,
+            prepared_w4a16=prepared_w4a16,
+            num_experts=num_experts,
+            n=n,
+            k=int(w2.shape[1]),
+            topk=int(self.moe_config.experts_per_token),
+            dtype=getattr(self.moe_config, "in_dtype", torch.bfloat16),
+            apply_router_weight_on_input=bool(
+                getattr(layer, "apply_router_weight_on_input", False)
+            ),
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+
+    def warmup_dynamic_signature(
+        self,
+        layer: torch.nn.Module,
+    ) -> tuple[Any, ...] | None:
+        meta = self._warmup_metadata(layer)
+        if meta is None:
+            return None
+        device = meta.w1.device
+        return (
+            device.type,
+            device.index,
+            meta.dtype,
+            meta.quant_mode,
+            self._source_format(),
+            self._w13_layout(),
+            meta.num_experts,
+            meta.k,
+            meta.n,
+            meta.topk,
+            meta.activation_name,
+            meta.apply_router_weight_on_input,
+            meta.swiglu_limit,
+            meta.swiglu_alpha,
+            meta.swiglu_beta,
+        )
+
+    @torch.inference_mode()
+    def warmup_dynamic_launch(
+        self,
+        layer: torch.nn.Module,
+        *,
+        tokens: int = 1,
+    ) -> None:
+        """Compile the b12x dynamic MoE launch before serving starts."""
+        meta = self._warmup_metadata(layer)
+        if meta is None:
+            return
+
+        tokens = _dynamic_moe_warmup_tokens(
+            topk=meta.topk,
+            quant_mode=meta.quant_mode,
+            requested_tokens=tokens,
+        )
+        prepared = self._get_or_prepare_fp4_moe_weights(
+            w1=meta.w1,
+            w2=meta.w2,
+            activation=meta.activation,
+            params_dtype=meta.dtype,
+        )
+        prepared_w4a16 = prepared.w4a16 if meta.quant_mode == "w4a16" else None
+
+        if meta.quant_mode == "w4a16":
+            assert prepared_w4a16 is not None
+            num_experts = int(prepared_w4a16.num_experts)
+            n = int(prepared_w4a16.intermediate_size)
+            unit_scale = self._unit_expert_scale(meta.w1.device, num_experts)
+            a1_gscale = unit_scale
+            a2_gscale = unit_scale
+            w1_alphas = self._weight_global_scale(
+                meta.w1.device, num_experts, weight_name="w1"
+            )
+            w2_alphas = self._weight_global_scale(
+                meta.w1.device, num_experts, weight_name="w2"
+            )
+            input_scales_static = True
+            unit_scale_contract = True
+        else:
+            if self.a1_gscale is None or self.a2_gscale is None:
+                raise RuntimeError(
+                    "B12X native NVFP4 MoE requires a1/a2 global scales"
+                )
+            if (
+                prepared.w1_runtime_alphas is None
+                or prepared.w2_runtime_alphas is None
+            ):
+                raise RuntimeError(
+                    "B12X native NVFP4 MoE requires prepared runtime alphas"
+                )
+            num_experts = int(meta.w1.shape[0])
+            n = int(meta.w2.shape[2]) * 2
+            a1_gscale = _normalize_modelopt_expert_scale(self.a1_gscale)
+            a2_gscale = _normalize_modelopt_expert_scale(self.a2_gscale)
+            w1_alphas = prepared.w1_runtime_alphas
+            w2_alphas = prepared.w2_runtime_alphas
+            input_scales_static = True
+            unit_scale_contract = False
+
+        assert self.w1_scale is not None and self.w2_scale is not None, (
+            "w1_scale and w2_scale must not be None for B12xExperts"
+        )
+        hidden_states = torch.zeros(
+            (tokens, meta.k),
+            dtype=meta.dtype,
+            device=meta.w1.device,
+        )
+        output = torch.empty_like(hidden_states)
+        topk_ids = (
+            torch.arange(meta.topk, device=meta.w1.device, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(tokens, -1)
+            .contiguous()
+        )
+        if num_experts > 0:
+            topk_ids.remainder_(num_experts)
+        topk_weights = torch.full(
+            (tokens, meta.topk),
+            1.0 / max(meta.topk, 1),
+            dtype=torch.float32,
+            device=meta.w1.device,
+        )
+        plan = _plan_b12x_moe_fp4_scratch(
+            tokens=tokens,
+            weight_E=num_experts,
+            k=meta.k,
+            n=n,
+            topk=meta.topk,
+            device=meta.w1.device,
+            dtype=meta.dtype,
+            activation=meta.activation_name,
+            quant_mode=meta.quant_mode,
+            source_format=self._source_format(),
+            w13_layout=self._w13_layout(),
+            prepared_w4a16=prepared_w4a16,
+            apply_router_weight_on_input=meta.apply_router_weight_on_input,
+            swiglu_limit=meta.swiglu_limit,
+            swiglu_alpha=meta.swiglu_alpha,
+            swiglu_beta=meta.swiglu_beta,
+        )
+        scratch = torch.empty(
+            (_b12x_scratch_nbytes(plan),),
+            dtype=torch.uint8,
+            device=meta.w1.device,
+        )
+        _run_b12x_moe_fp4(
+            a=hidden_states,
+            a1_gscale=a1_gscale,
+            w1_fp4=meta.w1,
+            w1_blockscale=self.w1_scale,
+            w1_alphas=w1_alphas,
+            a2_gscale=a2_gscale,
+            w2_fp4=meta.w2,
+            w2_blockscale=self.w2_scale,
+            w2_alphas=w2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            apply_router_weight_on_input=meta.apply_router_weight_on_input,
+            output=output,
+            input_scales_are_reciprocal=True,
+            input_scales_static=input_scales_static,
+            activation=meta.activation_name,
+            quant_mode=meta.quant_mode,
+            unit_scale_contract=unit_scale_contract,
+            source_format=self._source_format(),
+            w13_layout=self._w13_layout(),
+            prepared_w4a16=prepared_w4a16,
+            swiglu_limit=meta.swiglu_limit,
+            swiglu_alpha=meta.swiglu_alpha,
+            swiglu_beta=meta.swiglu_beta,
+            plan=plan,
+            scratch=scratch,
+        )
+
     def _release_w4a16_source_scales(self, layer: torch.nn.Module) -> None:
         if self._released_w4a16_source_scales:
             return
@@ -921,6 +1328,68 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             plan=plan,
             scratch=scratch,
         )
+        _maybe_repeat_check_b12x_moe(
+            original_output=output,
+            a=hidden_states,
+            a1_gscale=a1_gscale,
+            w1_fp4=w1,
+            w1_blockscale=self.w1_scale,
+            w1_alphas=w1_alphas,
+            a2_gscale=a2_gscale,
+            w2_fp4=w2,
+            w2_blockscale=self.w2_scale,
+            w2_alphas=w2_alphas,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            apply_router_weight_on_input=(
+                apply_router_weight_on_input
+                if apply_router_weight_on_input is not None
+                else False
+            ),
+            input_scales_are_reciprocal=True,
+            input_scales_static=input_scales_static,
+            activation=_b12x_activation_name(activation),
+            quant_mode=quant_mode,
+            unit_scale_contract=unit_scale_contract,
+            source_format=self._source_format(),
+            w13_layout=self._w13_layout(),
+            prepared_w4a16=prepared_w4a16,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            plan=plan,
+            scratch=scratch,
+        )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         raise NotImplementedError("LoRA is not supported for B12xExperts")
+
+
+def warmup_b12x_moe_dynamic(
+    model: torch.nn.Module,
+    *,
+    tokens: int = 1,
+) -> int:
+    """Warm unique b12x dynamic MoE launch signatures in a loaded model."""
+    seen: set[tuple[Any, ...]] = set()
+    warmed = 0
+    for module in model.modules():
+        routed_experts = getattr(module, "routed_experts", None)
+        if routed_experts is None:
+            continue
+        quant_method = getattr(routed_experts, "quant_method", None)
+        moe_kernel = getattr(quant_method, "moe_kernel", None)
+        fused_experts = getattr(moe_kernel, "fused_experts", None)
+        if not isinstance(fused_experts, B12xExperts):
+            continue
+
+        signature = fused_experts.warmup_dynamic_signature(routed_experts)
+        if signature is None or signature in seen:
+            continue
+        seen.add(signature)
+        fused_experts.warmup_dynamic_launch(routed_experts, tokens=tokens)
+        warmed += 1
+
+    if warmed:
+        logger.info("Warmed up %d B12X MoE dynamic launch signature(s).", warmed)
+    return warmed
