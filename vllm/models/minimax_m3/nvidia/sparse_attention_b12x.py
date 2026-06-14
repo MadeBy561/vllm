@@ -40,6 +40,27 @@ _B12X_MINIMAX_MSA_TOPK = 16
 _B12X_MINIMAX_MSA_PAGE_SIZE = 128
 _B12X_FP8_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")
 _B12X_MSA_COMPARE_TRITON = "VLLM_B12X_MINIMAX_M3_MSA_COMPARE_TRITON"
+_B12X_MSA_DUMP_DIR = "VLLM_B12X_MINIMAX_M3_MSA_DUMP_DIR"
+_B12X_MSA_SYNC_AFTER = "VLLM_B12X_MINIMAX_M3_MSA_SYNC_AFTER"
+_B12X_MSA_ZERO_OUTPUT_BEFORE = "VLLM_B12X_MINIMAX_M3_MSA_ZERO_OUTPUT_BEFORE"
+
+
+def _debug_rank_label() -> str:
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return f"rank{torch.distributed.get_rank()}"
+    except RuntimeError:
+        pass
+    return f"pid{os.getpid()}"
+
+
+def _tensor_addr_range(tensor: torch.Tensor) -> tuple[int, int]:
+    start = int(tensor.data_ptr())
+    return start, start + int(tensor.numel() * tensor.element_size())
+
+
+def _ranges_overlap(lhs: tuple[int, int], rhs: tuple[int, int]) -> bool:
+    return lhs[0] < rhs[1] and rhs[0] < lhs[1]
 
 
 def _is_b12x_fp8_kv_cache(kv_cache_dtype: str) -> bool:
@@ -192,6 +213,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
         self._plan_paged_attention_scratch = plan_paged_attention_scratch
         self._decode_graph_scratch_plans: dict[tuple[Any, ...], Any] = {}
         self._triton_compare_reports = 0
+        self._triton_compare_dumps = 0
         self._debug_reports = 0
 
         logger.info_once(
@@ -483,6 +505,50 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
             ((int(scratch_plan.layout.nbytes),), torch.uint8),
         )
         num_reqs = int(cache_seqlens.shape[0])
+        compare_triton = (
+            os.getenv(_B12X_MSA_COMPARE_TRITON, "0") == "1"
+            and not capturing
+            and self._triton_compare_reports < 8
+        )
+        triton_f32_cpu: torch.Tensor | None = None
+        q_finite_before: bool | None = None
+        q2k_range_before: tuple[int, int] | None = None
+        q_f32_cpu_before: torch.Tensor | None = None
+        key_pages_f32_cpu_before: torch.Tensor | None = None
+        value_pages_f32_cpu_before: torch.Tensor | None = None
+        active_page_ids_cpu: torch.Tensor | None = None
+        if compare_triton:
+            q_finite_before = bool(torch.isfinite(q.float()).all().item())
+            q2k_range_before = (
+                int(q2k_indices.min().item()),
+                int(q2k_indices.max().item()),
+            )
+            active_page_ids_cpu = self._active_page_ids_cpu(
+                page_table,
+                cache_seqlens,
+            )
+            q_f32_cpu_before = q.float().cpu()
+            (
+                key_pages_f32_cpu_before,
+                value_pages_f32_cpu_before,
+            ) = self._active_kv_pages_f32_cpu(
+                key_cache,
+                value_cache,
+                active_page_ids_cpu,
+            )
+            triton_output = self._run_triton_reference_slice(
+                q=q,
+                kv_cache=kv_cache,
+                q2k_indices=q2k_indices,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                mode=mode,
+                prefix_lens=prefix_lens,
+                max_query_len=max_query_len,
+            )
+            torch.cuda.synchronize()
+            triton_f32_cpu = triton_output.float().cpu()
         if (
             os.getenv("VLLM_DEBUG_B12X_MINIMAX_M3_MSA", "0") == "1"
             and self._debug_reports < 12
@@ -525,51 +591,134 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
             k_descale=k_descale,
             v_descale=v_descale,
         )
-        self._paged_attention_forward(binding=binding)
+        bound_scratch = getattr(binding, "scratch", None)
+        bound_plan = getattr(bound_scratch, "_plan", None)
+        plan_debug = self._plan_debug_dict(
+            plan=bound_plan,
+            scratch=bound_scratch,
+            scratch_storage=scratch_storage,
+        )
+        if (
+            os.getenv("VLLM_DEBUG_B12X_MINIMAX_M3_MSA", "0") == "1"
+            and self._debug_reports < 12
+        ):
+            logger.warning(
+                "B12X MiniMax M3 MSA bound layer=%s mode=%s rank=%s "
+                "plan=%s scratch=%s",
+                layer_name,
+                mode,
+                _debug_rank_label(),
+                plan_debug["plan"],
+                plan_debug["scratch"],
+            )
+            self._debug_reports += 1
+        if os.getenv(_B12X_MSA_ZERO_OUTPUT_BEFORE, "0") == "1":
+            output.zero_()
+        returned_output, _ = self._paged_attention_forward(binding=binding)
+        if os.getenv(_B12X_MSA_SYNC_AFTER, "0") == "1":
+            torch.cuda.synchronize()
         if mode == "decode" and not capturing:
             scratch_plan._q2k_indices_data_ptr = None
-        if (
-            os.getenv(_B12X_MSA_COMPARE_TRITON, "0") == "1"
-            and not capturing
-            and self._triton_compare_reports < 8
-        ):
+        if compare_triton:
+            assert triton_f32_cpu is not None
             self._compare_triton_slice(
                 q=q,
-                kv_cache=kv_cache,
+                key_cache=key_cache,
+                value_cache=value_cache,
                 q2k_indices=q2k_indices,
                 b12x_output=output,
+                triton_f32_cpu=triton_f32_cpu,
                 page_table=page_table,
                 cache_seqlens=cache_seqlens,
                 cu_seqlens_q=cu_seqlens_q,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                scratch_storage=scratch_storage,
+                returned_output=returned_output,
+                q_f32_cpu_before=q_f32_cpu_before,
+                key_pages_f32_cpu_before=key_pages_f32_cpu_before,
+                value_pages_f32_cpu_before=value_pages_f32_cpu_before,
+                active_page_ids_cpu=active_page_ids_cpu,
                 mode=mode,
-                prefix_lens=prefix_lens,
-                max_query_len=max_query_len,
+                num_reqs=num_reqs,
+                q_finite_before=q_finite_before,
+                q2k_range_before=q2k_range_before,
+                plan_debug=plan_debug,
                 layer_name=layer_name,
             )
             self._triton_compare_reports += 1
 
-    def _compare_triton_slice(
+    def _plan_debug_dict(
+        self,
+        *,
+        plan: Any,
+        scratch: Any,
+        scratch_storage: torch.Tensor,
+    ) -> dict[str, Any]:
+        scratch_ptr = int(scratch_storage.data_ptr())
+        scratch_bytes = int(scratch_storage.numel() * scratch_storage.element_size())
+        union_blocks = getattr(scratch, "msa_union_blocks", None)
+        union_masks = getattr(scratch, "msa_union_masks", None)
+        union_counts = getattr(scratch, "msa_union_counts", None)
+        lse = getattr(scratch, "lse", None)
+        request_indices = getattr(plan, "request_indices", ())
+        qo_tile_indices = getattr(plan, "qo_tile_indices", ())
+        kv_tile_indices = getattr(plan, "kv_tile_indices", ())
+        plan_info = {
+            "total_q": getattr(plan, "total_q", None),
+            "mode": getattr(plan, "mode", None),
+            "cta_tile_q": getattr(plan, "cta_tile_q", None),
+            "kv_chunk_size": getattr(plan, "kv_chunk_size", None),
+            "split_kv": getattr(plan, "split_kv", None),
+            "new_batch_size": getattr(plan, "new_batch_size", None),
+            "padded_batch_size": getattr(plan, "padded_batch_size", None),
+            "num_qo_tiles": getattr(plan, "num_qo_tiles", None),
+            "total_num_partial_rows": getattr(plan, "total_num_partial_rows", None),
+            "page_size": getattr(plan, "page_size", None),
+            "gqa_group_size": getattr(plan, "gqa_group_size", None),
+            "msa_block_sparse": getattr(plan, "msa_block_sparse", None),
+            "msa_union_tile": getattr(plan, "msa_union_tile", None),
+            "request_first": tuple(request_indices[:8]),
+            "request_last": tuple(request_indices[-8:]),
+            "qo_first": tuple(qo_tile_indices[:8]),
+            "qo_last": tuple(qo_tile_indices[-8:]),
+            "kv_first": tuple(kv_tile_indices[:8]),
+            "kv_last": tuple(kv_tile_indices[-8:]),
+        }
+        scratch_info = {
+            "ptr": scratch_ptr,
+            "bytes": scratch_bytes,
+            "align256": scratch_ptr % 256,
+            "union_blocks": None if union_blocks is None else tuple(union_blocks.shape),
+            "union_masks": None if union_masks is None else tuple(union_masks.shape),
+            "union_counts": None if union_counts is None else tuple(union_counts.shape),
+            "lse": None if lse is None else tuple(lse.shape),
+        }
+        return {"plan": plan_info, "scratch": scratch_info}
+
+    def _run_triton_reference_slice(
         self,
         *,
         q: torch.Tensor,
         kv_cache: torch.Tensor,
         q2k_indices: torch.Tensor,
-        b12x_output: torch.Tensor,
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         mode: Literal["decode", "extend"],
         prefix_lens: torch.Tensor | None,
         max_query_len: int | None,
-        layer_name: str,
-    ) -> None:
-        triton_output = torch.empty_like(b12x_output)
+    ) -> torch.Tensor:
+        triton_output = torch.empty_like(q)
+        triton_kv_cache = (
+            kv_cache.view(self.kv_cache_fp8_dtype) if self.use_fp8_kv else kv_cache
+        )
         if mode == "decode":
             num_reqs = int(cache_seqlens.shape[0])
             decode_query_len = max(int(q.shape[0]) // max(num_reqs, 1), 1)
             minimax_m3_sparse_attn_decode(
                 q,
-                kv_cache,
+                triton_kv_cache,
                 q2k_indices,
                 page_table,
                 cache_seqlens,
@@ -586,7 +735,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
                 max_query_len = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max())
             minimax_m3_sparse_attn(
                 q,
-                kv_cache,
+                triton_kv_cache,
                 q2k_indices,
                 page_table,
                 cu_seqlens_q,
@@ -597,11 +746,73 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
                 self.scale,
                 triton_output,
             )
-        torch.cuda.synchronize()
-        b12x_f32 = b12x_output.float()
-        triton_f32 = triton_output.float()
+        return triton_output
+
+    def _compare_triton_slice(
+        self,
+        *,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        q2k_indices: torch.Tensor,
+        b12x_output: torch.Tensor,
+        triton_f32_cpu: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        k_descale: torch.Tensor | None,
+        v_descale: torch.Tensor | None,
+        scratch_storage: torch.Tensor,
+        returned_output: torch.Tensor,
+        q_f32_cpu_before: torch.Tensor,
+        key_pages_f32_cpu_before: torch.Tensor,
+        value_pages_f32_cpu_before: torch.Tensor,
+        active_page_ids_cpu: torch.Tensor,
+        mode: Literal["decode", "extend"],
+        num_reqs: int,
+        q_finite_before: bool | None,
+        q2k_range_before: tuple[int, int] | None,
+        plan_debug: dict[str, Any],
+        layer_name: str,
+    ) -> None:
+        b12x_f32 = b12x_output.float().cpu()
+        triton_f32 = triton_f32_cpu
+        q_finite_after = bool(torch.isfinite(q.float()).all().item())
+        q2k_range_after = (
+            int(q2k_indices.min().item()),
+            int(q2k_indices.max().item()),
+        )
         finite_b12x = bool(torch.isfinite(b12x_f32).all().item())
         finite_triton = bool(torch.isfinite(triton_f32).all().item())
+        b12x_absmax = float(b12x_f32.abs().max().item())
+        triton_absmax = float(triton_f32.abs().max().item())
+        q_f32_cpu_after = q.float().cpu()
+        key_pages_f32_cpu_after, value_pages_f32_cpu_after = (
+            self._active_kv_pages_f32_cpu(
+                key_cache,
+                value_cache,
+                active_page_ids_cpu,
+            )
+        )
+        q_absmax = float(q_f32_cpu_after.abs().max().item())
+        active_k_absmax, active_v_absmax = self._active_kv_absmax(
+            key_cache,
+            value_cache,
+            active_page_ids_cpu,
+        )
+        q_mut_max = float((q_f32_cpu_after - q_f32_cpu_before).abs().max().item())
+        k_mut_max = float(
+            (key_pages_f32_cpu_after - key_pages_f32_cpu_before).abs().max().item()
+        )
+        v_mut_max = float(
+            (value_pages_f32_cpu_after - value_pages_f32_cpu_before).abs().max().item()
+        )
+        q_storage_ptr = int(q.untyped_storage().data_ptr())
+        out_storage_ptr = int(b12x_output.untyped_storage().data_ptr())
+        returned_out_storage_ptr = int(returned_output.untyped_storage().data_ptr())
+        q2k_storage_ptr = int(q2k_indices.untyped_storage().data_ptr())
+        scratch_storage_ptr = int(scratch_storage.untyped_storage().data_ptr())
+        scratch_range = _tensor_addr_range(scratch_storage)
         abs_diff = (b12x_f32 - triton_f32).abs()
         max_abs = float(abs_diff.max().item())
         mean_abs = float(abs_diff.mean().item())
@@ -612,18 +823,221 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
         )
         logger.warning(
             "B12X MiniMax M3 MSA compare layer=%s mode=%s q=%s reqs=%d "
-            "q2k=%s finite=%s/%s max_abs=%.6g mean_abs=%.6g cos=%.8f",
+            "q2k=%s finite=%s/%s q_finite=%s/%s q2k_range=%s/%s "
+            "max_abs=%.6g mean_abs=%.6g cos=%.8f "
+            "absmax b12x/triton/q/k/v=%.6g/%.6g/%.6g/%.6g/%.6g "
+            "mut q/k/v=%.6g/%.6g/%.6g "
+            "stride q/out/ret/k/v=%s/%s/%s/%s/%s active_pages=%d "
+            "descale_stride=%s/%s alias q/out/ret/q2k/scratch=%s/%s/%s/%s "
+            "overlap q/out/ret/q2k/scratch=%s/%s/%s/%s "
+            "plan=%s scratch=%s",
             layer_name,
             mode,
             tuple(q.shape),
-            int(cache_seqlens.shape[0]),
+            num_reqs,
             tuple(q2k_indices.shape),
             finite_b12x,
             finite_triton,
+            q_finite_before,
+            q_finite_after,
+            q2k_range_before,
+            q2k_range_after,
             max_abs,
             mean_abs,
             cos,
+            b12x_absmax,
+            triton_absmax,
+            q_absmax,
+            active_k_absmax,
+            active_v_absmax,
+            q_mut_max,
+            k_mut_max,
+            v_mut_max,
+            tuple(q.stride()),
+            tuple(b12x_output.stride()),
+            tuple(returned_output.stride()),
+            tuple(key_cache.stride()),
+            tuple(value_cache.stride()),
+            int(active_page_ids_cpu.numel()),
+            None if k_descale is None else tuple(k_descale.stride()),
+            None if v_descale is None else tuple(v_descale.stride()),
+            q_storage_ptr == scratch_storage_ptr,
+            out_storage_ptr == scratch_storage_ptr,
+            returned_out_storage_ptr == scratch_storage_ptr,
+            q2k_storage_ptr == scratch_storage_ptr,
+            _ranges_overlap(_tensor_addr_range(q), scratch_range),
+            _ranges_overlap(_tensor_addr_range(b12x_output), scratch_range),
+            _ranges_overlap(_tensor_addr_range(returned_output), scratch_range),
+            _ranges_overlap(_tensor_addr_range(q2k_indices), scratch_range),
+            plan_debug["plan"],
+            plan_debug["scratch"],
         )
+        self._dump_first_mismatch(
+            q=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            q2k_indices=q2k_indices,
+            b12x_f32=b12x_f32,
+            triton_f32=triton_f32,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            active_page_ids_cpu=active_page_ids_cpu,
+            q_f32_cpu_before=q_f32_cpu_before,
+            key_pages_f32_cpu_before=key_pages_f32_cpu_before,
+            value_pages_f32_cpu_before=value_pages_f32_cpu_before,
+            q_f32_cpu_after=q_f32_cpu_after,
+            key_pages_f32_cpu_after=key_pages_f32_cpu_after,
+            value_pages_f32_cpu_after=value_pages_f32_cpu_after,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            layer_name=layer_name,
+            mode=mode,
+            max_abs=max_abs,
+            finite_b12x=finite_b12x,
+            finite_triton=finite_triton,
+            plan_debug=plan_debug,
+        )
+
+    def _active_page_ids_cpu(
+        self,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        page_table_cpu = page_table.detach().cpu()
+        cache_lens_cpu = cache_seqlens.detach().cpu()
+        active_pages: list[torch.Tensor] = []
+        for req_idx, cache_len_tensor in enumerate(cache_lens_cpu):
+            cache_len = int(cache_len_tensor.item())
+            num_pages = (cache_len + _B12X_MINIMAX_MSA_PAGE_SIZE - 1) // (
+                _B12X_MINIMAX_MSA_PAGE_SIZE
+            )
+            if num_pages > 0:
+                active_pages.append(page_table_cpu[req_idx, :num_pages])
+        if not active_pages:
+            return torch.empty((0,), dtype=torch.long)
+        return torch.cat(active_pages).to(torch.long).unique(sorted=True)
+
+    def _active_kv_absmax(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        active_page_ids_cpu: torch.Tensor,
+    ) -> tuple[float, float]:
+        if active_page_ids_cpu.numel() == 0:
+            return 0.0, 0.0
+        active_page_ids = active_page_ids_cpu.to(
+            device=key_cache.device,
+            dtype=torch.long,
+        )
+        key_pages = key_cache.index_select(0, active_page_ids)
+        value_pages = value_cache.index_select(0, active_page_ids)
+        return (
+            float(key_pages.float().abs().max().item()),
+            float(value_pages.float().abs().max().item()),
+        )
+
+    def _active_kv_pages_f32_cpu(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        active_page_ids_cpu: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if active_page_ids_cpu.numel() == 0:
+            empty = torch.empty((0,), dtype=torch.float32)
+            return empty, empty
+        active_page_ids = active_page_ids_cpu.to(
+            device=key_cache.device,
+            dtype=torch.long,
+        )
+        key_pages = key_cache.index_select(0, active_page_ids).float().cpu()
+        value_pages = value_cache.index_select(0, active_page_ids).float().cpu()
+        return key_pages, value_pages
+
+    def _dump_first_mismatch(
+        self,
+        *,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        q2k_indices: torch.Tensor,
+        b12x_f32: torch.Tensor,
+        triton_f32: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        active_page_ids_cpu: torch.Tensor,
+        q_f32_cpu_before: torch.Tensor,
+        key_pages_f32_cpu_before: torch.Tensor,
+        value_pages_f32_cpu_before: torch.Tensor,
+        q_f32_cpu_after: torch.Tensor,
+        key_pages_f32_cpu_after: torch.Tensor,
+        value_pages_f32_cpu_after: torch.Tensor,
+        k_descale: torch.Tensor | None,
+        v_descale: torch.Tensor | None,
+        layer_name: str,
+        mode: Literal["decode", "extend"],
+        max_abs: float,
+        finite_b12x: bool,
+        finite_triton: bool,
+        plan_debug: dict[str, Any],
+    ) -> None:
+        dump_dir = os.getenv(_B12X_MSA_DUMP_DIR)
+        if not dump_dir or self._triton_compare_dumps > 0:
+            return
+        if finite_b12x and finite_triton and max_abs <= 1e-2:
+            return
+        os.makedirs(dump_dir, exist_ok=True)
+        active_page_ids = active_page_ids_cpu.to(
+            device=key_cache.device,
+            dtype=torch.long,
+        )
+        safe_layer = layer_name.replace("/", "_").replace(".", "_")
+        rank_label = _debug_rank_label()
+        device_index = q.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        path = os.path.join(
+            dump_dir,
+            "b12x_minimax_m3_msa_"
+            f"{rank_label}_dev{device_index}_{mode}_{safe_layer}.pt",
+        )
+        torch.save(
+            {
+                "rank": rank_label,
+                "device_index": device_index,
+                "layer_name": layer_name,
+                "mode": mode,
+                "plan_debug": plan_debug,
+                "q": q.detach().cpu(),
+                "q_before": q_f32_cpu_before,
+                "q_after": q_f32_cpu_after,
+                "q_stride": tuple(q.stride()),
+                "key_pages": key_cache.index_select(0, active_page_ids).cpu(),
+                "key_pages_before": key_pages_f32_cpu_before,
+                "key_pages_after": key_pages_f32_cpu_after,
+                "key_cache_stride": tuple(key_cache.stride()),
+                "value_pages": value_cache.index_select(0, active_page_ids).cpu(),
+                "value_pages_before": value_pages_f32_cpu_before,
+                "value_pages_after": value_pages_f32_cpu_after,
+                "value_cache_stride": tuple(value_cache.stride()),
+                "active_page_ids": active_page_ids_cpu,
+                "q2k_indices": q2k_indices.detach().cpu(),
+                "page_table": page_table.detach().cpu(),
+                "cache_seqlens": cache_seqlens.detach().cpu(),
+                "cu_seqlens_q": cu_seqlens_q.detach().cpu(),
+                "k_descale": None if k_descale is None else k_descale.detach().cpu(),
+                "v_descale": None if v_descale is None else v_descale.detach().cpu(),
+                "b12x_output": b12x_f32,
+                "triton_output": triton_f32,
+                "max_abs": max_abs,
+                "finite_b12x": finite_b12x,
+                "finite_triton": finite_triton,
+            },
+            path,
+        )
+        self._triton_compare_dumps += 1
+        logger.warning("Dumped B12X MiniMax M3 MSA mismatch tensors to %s", path)
 
     def forward(
         self,
@@ -666,6 +1080,14 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
                 mode=decode_mode,
                 layer_name=layer.layer_name,
             )
+            self._maybe_log_sparse_stats(
+                layer_name=layer.layer_name,
+                mode=decode_mode,
+                q=q[:nd],
+                out=out[:nd],
+                topk=decode_topk,
+                seq_lens=d.seq_lens,
+            )
 
         if main_md.num_prefills > 0:
             p = main_md.prefill
@@ -684,6 +1106,14 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
                 prefix_lens=p.context_lens,
                 max_query_len=p.max_query_len,
                 layer_name=layer.layer_name,
+            )
+            self._maybe_log_sparse_stats(
+                layer_name=layer.layer_name,
+                mode="extend",
+                q=q[nd:],
+                out=out[nd:],
+                topk=prefill_topk,
+                seq_lens=p.seq_lens,
             )
 
         return output
