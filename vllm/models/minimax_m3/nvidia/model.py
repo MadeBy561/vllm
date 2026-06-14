@@ -19,8 +19,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -35,8 +37,10 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
+    MinimaxM3IndexerQKParallelLinear,
     MinimaxM3QKVParallelLinearWithIndexer,
     QKVParallelLinear,
     RowParallelLinear,
@@ -84,12 +88,54 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+    kv_cache_dtype_str_to_dtype,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     get_kv_quant_mode,
 )
+
+
+def _resolve_quant_algo(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> str | None:
+    resolver = getattr(quant_config, "_resolve_quant_algo", None)
+    if not callable(resolver):
+        return None
+    return resolver(prefix)
+
+
+def _should_split_mxfp8_indexer_projection(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> bool:
+    """Use a BF16 indexer projection for mixed checkpoints.
+
+    MiniMax M3 mixed MXFP8 checkpoints quantize the main q/k/v projection but
+    leave the sparse indexer q/k projections in BF16. A single fused projection
+    cannot represent that mixed dtype faithfully.
+    """
+    if _resolve_quant_algo(quant_config, f"{prefix}.qkv_proj") != "MXFP8":
+        return False
+    index_q_algo = _resolve_quant_algo(quant_config, f"{prefix}.indexer.q_proj")
+    index_k_algo = _resolve_quant_algo(quant_config, f"{prefix}.indexer.k_proj")
+    return index_q_algo is None and index_k_algo is None
+
+
+def _enable_minimax_m3_torch_compile(vllm_config: VllmConfig) -> bool:
+    del vllm_config
+    return (
+        envs.VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE
+        and not envs.VLLM_USE_AOT_COMPILE
+        and not envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+    )
 
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
@@ -111,35 +157,162 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     return moe_layer_freq[layer_id] != 0
 
 
-class MiniMAXGemmaRMSNorm(nn.Module):
-    """Gemma-style RMS normalization backed by FlashInfer kernels.
+def minimax_m3_qknorm_rope_kv_insert(
+    qkv: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    rotary_dim: int,
+    eps: float,
+    index_q_norm_weight: torch.Tensor | None = None,
+    index_k_norm_weight: torch.Tensor | None = None,
+    num_index_heads: int = 0,
+    slot_mapping: torch.Tensor | None = None,
+    index_slot_mapping: torch.Tensor | None = None,
+    kv_cache: torch.Tensor | None = None,
+    index_cache: torch.Tensor | None = None,
+    block_size: int = 0,
+    q_out: torch.Tensor | None = None,
+    index_q_out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "auto",
+) -> None:
+    ops.fused_minimax_m3_qknorm_rope_kv_insert(
+        qkv,
+        q_norm_weight,
+        k_norm_weight,
+        cos_sin_cache,
+        positions,
+        num_heads,
+        num_kv_heads,
+        rotary_dim,
+        eps,
+        index_q_norm_weight,
+        index_k_norm_weight,
+        num_index_heads,
+        slot_mapping,
+        index_slot_mapping,
+        kv_cache,
+        index_cache,
+        block_size,
+        q_out,
+        index_q_out,
+        kv_cache_dtype,
+    )
 
-    When ``residual`` is given, the fused add + norm runs in place and the
-    updated ``(x, residual)`` pair is returned.
+
+def minimax_m3_qknorm_rope_kv_insert_fake(
+    qkv: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    rotary_dim: int,
+    eps: float,
+    index_q_norm_weight: torch.Tensor | None = None,
+    index_k_norm_weight: torch.Tensor | None = None,
+    num_index_heads: int = 0,
+    slot_mapping: torch.Tensor | None = None,
+    index_slot_mapping: torch.Tensor | None = None,
+    kv_cache: torch.Tensor | None = None,
+    index_cache: torch.Tensor | None = None,
+    block_size: int = 0,
+    q_out: torch.Tensor | None = None,
+    index_q_out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "auto",
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_qknorm_rope_kv_insert",
+    op_func=minimax_m3_qknorm_rope_kv_insert,
+    mutates_args=["qkv", "kv_cache", "index_cache", "q_out", "index_q_out"],
+    fake_impl=minimax_m3_qknorm_rope_kv_insert_fake,
+)
+
+
+def _run_minimax_m3_qknorm_rope_kv_insert(
+    qkv: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    rotary_dim: int,
+    eps: float,
+    index_q_norm_weight: torch.Tensor | None = None,
+    index_k_norm_weight: torch.Tensor | None = None,
+    num_index_heads: int = 0,
+    slot_mapping: torch.Tensor | None = None,
+    index_slot_mapping: torch.Tensor | None = None,
+    kv_cache: torch.Tensor | None = None,
+    index_cache: torch.Tensor | None = None,
+    block_size: int = 0,
+    q_out: torch.Tensor | None = None,
+    index_q_out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "auto",
+) -> None:
+    if torch.compiler.is_compiling():
+        torch.ops.vllm.minimax_m3_qknorm_rope_kv_insert(
+            qkv,
+            q_norm_weight,
+            k_norm_weight,
+            cos_sin_cache,
+            positions,
+            num_heads,
+            num_kv_heads,
+            rotary_dim,
+            eps,
+            index_q_norm_weight,
+            index_k_norm_weight,
+            num_index_heads,
+            slot_mapping,
+            index_slot_mapping,
+            kv_cache,
+            index_cache,
+            block_size,
+            q_out,
+            index_q_out,
+            kv_cache_dtype,
+        )
+    else:
+        minimax_m3_qknorm_rope_kv_insert(
+            qkv,
+            q_norm_weight,
+            k_norm_weight,
+            cos_sin_cache,
+            positions,
+            num_heads,
+            num_kv_heads,
+            rotary_dim,
+            eps,
+            index_q_norm_weight,
+            index_k_norm_weight,
+            num_index_heads,
+            slot_mapping,
+            index_slot_mapping,
+            kv_cache,
+            index_cache,
+            block_size,
+            q_out,
+            index_q_out,
+            kv_cache_dtype,
+        )
+
+
+class MiniMAXGemmaRMSNorm(GemmaRMSNorm):
+    """MiniMax M3 Gemma-style RMSNorm.
+
+    Keep the local class name for checkpoint/module compatibility while using
+    vLLM's GemmaRMSNorm custom-op path, which is safe to trace through
+    torch.compile.
     """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
-
-        if residual is None:
-            return gemma_rmsnorm(x, self.weight, self.variance_epsilon)
-
-        # gemma_fused_add_rmsnorm mutates x and residual in place.
-        gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
-        return x, residual
 
 
 class MiniMaxM3MLP(nn.Module):
@@ -366,7 +539,7 @@ class MiniMaxM3Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         # Fused per-head Gemma QK-norm + partial NeoX RoPE on q/k, in place.
 
-        ops.fused_minimax_m3_qknorm_rope_kv_insert(
+        _run_minimax_m3_qknorm_rope_kv_insert(
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
@@ -435,18 +608,42 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
         self.index_q_size = self.num_idx_heads * self.idx_head_dim
 
-        # Single fused projection: q, k, v, index_q, index_k in one GEMM.
-        self.qkv_proj = MinimaxM3QKVParallelLinearWithIndexer(
-            self.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            self.total_idx_heads,
-            self.idx_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+        self.split_indexer_projection = _should_split_mxfp8_indexer_projection(
+            quant_config, prefix
         )
+        if self.split_indexer_projection:
+            self.qkv_proj = QKVParallelLinear(
+                self.hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.indexer_qk_proj = MinimaxM3IndexerQKParallelLinear(
+                self.hidden_size,
+                self.total_num_kv_heads,
+                self.total_idx_heads,
+                self.idx_head_dim,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.indexer_qk_proj",
+            )
+        else:
+            # Single fused projection: q, k, v, index_q, index_k in one GEMM.
+            self.qkv_proj = MinimaxM3QKVParallelLinearWithIndexer(
+                self.hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                self.total_idx_heads,
+                self.idx_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.indexer_qk_proj = None
         # reduce_results=False: the attention all-reduce is fused with the
         # following post_attention_layernorm (GemmaRMSNorm) in the decoder layer
         # via fused_allreduce_gemma_rms_norm.
@@ -548,13 +745,64 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
+    def _insert_kv(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        index_key: torch.Tensor,
+        main_slot_mapping: torch.Tensor,
+        index_slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write main K/V and index-K into their paged caches."""
+        self._insert_kv_into_caches(
+            key,
+            value,
+            index_key,
+            self.kv_cache,
+            self.indexer.index_cache.kv_cache,
+            main_slot_mapping,
+            index_slot_mapping,
+        )
+
+    def _insert_kv_into_caches(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        index_key: torch.Tensor,
+        main_kv_cache: torch.Tensor,
+        index_kv_cache: torch.Tensor,
+        main_slot_mapping: torch.Tensor,
+        index_slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write main K/V and index-K into explicit paged cache tensors."""
+        key_cache, value_cache = main_kv_cache.unbind(1)
+        scale = torch.ones((), device=key.device)
+        ops.reshape_and_cache_flash(
+            key.view(-1, self.num_kv_heads, self.head_dim),
+            value.view(-1, self.num_kv_heads, self.head_dim),
+            key_cache,
+            value_cache,
+            main_slot_mapping,
+            self.kv_cache_dtype,
+            scale,
+            scale,
+        )
+
+        # Index-key cache: single vector per token, scatter by slot.
+        idx_cache = index_kv_cache.view(-1, self.idx_head_dim)
+        idx_cache[index_slot_mapping] = index_key.to(idx_cache.dtype)
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Single fused projection emitting [q | k | v | index_q | index_k].
+        # Projection result consumed by the fused norm/rope/cache-insert op as
+        # [q | k | v | index_q | index_k].
         qkv, _ = self.qkv_proj(hidden_states)
+        if self.indexer_qk_proj is not None:
+            index_qk, _ = self.indexer_qk_proj(hidden_states)
+            qkv = torch.cat((qkv, index_qk), dim=-1)
 
         # Horizontally-fused per-head Gemma QK-norm + partial NeoX RoPE on the
         # main (q/k) and index (index_q/index_k) branches, all read straight out
@@ -581,10 +829,12 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
+        encoded_layer_name = _encode_layer_name(self.layer_name)
         q = qkv.new_empty((num_tokens, self.q_size))
         index_q = qkv.new_empty((num_tokens, self.index_q_size))
         insert_via_fused = not self._fp8_kv
-        ops.fused_minimax_m3_qknorm_rope_kv_insert(
+        kv_cache_dummy_dep = None
+        _run_minimax_m3_qknorm_rope_kv_insert(
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
@@ -612,10 +862,34 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             v = qkv[:, self.q_size + kv : self.q_size + 2 * kv]
             ik0 = self.q_size + 2 * kv + self.index_q_size
             index_k = qkv[:, ik0 : ik0 + self.num_idx_heads * self.idx_head_dim]
-            self._insert_kv(k, v, index_k, main_slot_mapping, index_slot_mapping)
+            if torch.compiler.is_compiling():
+                kv_cache_dummy_dep = torch.ops.vllm.minimax_m3_sparse_kv_cache_update(
+                    k,
+                    v,
+                    index_k,
+                    self.kv_cache,
+                    self.indexer.index_cache.kv_cache,
+                    main_slot_mapping,
+                    index_slot_mapping,
+                    encoded_layer_name,
+                )
+            else:
+                self._insert_kv(k, v, index_k, main_slot_mapping, index_slot_mapping)
 
         output = torch.empty_like(q)
-        attn_output = self._run_attention(q, index_q, output)
+        if torch.compiler.is_compiling():
+            torch.ops.vllm.minimax_m3_sparse_attention_with_output(
+                q,
+                index_q,
+                self.kv_cache,
+                self.indexer.index_cache.kv_cache,
+                output,
+                encoded_layer_name,
+                kv_cache_dummy_dep,
+            )
+            attn_output = output
+        else:
+            attn_output = self._run_attention(q, index_q, output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -628,6 +902,90 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     ) -> torch.Tensor:
         topk_idx = self.indexer(index_query)
         return self.impl.forward(self, query, self.kv_cache, topk_idx, output)
+
+
+@eager_break_during_capture
+def minimax_m3_sparse_attention_with_output(
+    query: torch.Tensor,
+    index_query: torch.Tensor,
+    main_kv_cache: torch.Tensor,
+    index_kv_cache: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+    kv_cache_dummy_dep: torch.Tensor | None = None,
+) -> None:
+    del kv_cache_dummy_dep
+    layer_name = _resolve_layer_name(layer_name)
+    layer = get_forward_context().no_compile_layers[layer_name]
+    assert isinstance(layer, MiniMaxM3SparseAttention)
+    topk_idx = layer.indexer.forward_with_cache(index_query, index_kv_cache)
+    layer.impl.forward(layer, query, main_kv_cache, topk_idx, output)
+
+
+def minimax_m3_sparse_attention_with_output_fake(
+    query: torch.Tensor,
+    index_query: torch.Tensor,
+    main_kv_cache: torch.Tensor,
+    index_kv_cache: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+    kv_cache_dummy_dep: torch.Tensor | None = None,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_sparse_attention_with_output",
+    op_func=minimax_m3_sparse_attention_with_output,
+    mutates_args=["output"],
+    fake_impl=minimax_m3_sparse_attention_with_output_fake,
+)
+
+
+def minimax_m3_sparse_kv_cache_update(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    index_key: torch.Tensor,
+    main_kv_cache: torch.Tensor,
+    index_kv_cache: torch.Tensor,
+    main_slot_mapping: torch.Tensor,
+    index_slot_mapping: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    layer_name = _resolve_layer_name(layer_name)
+    layer = get_forward_context().no_compile_layers[layer_name]
+    assert isinstance(layer, MiniMaxM3SparseAttention)
+    layer._insert_kv_into_caches(
+        key,
+        value,
+        index_key,
+        main_kv_cache,
+        index_kv_cache,
+        main_slot_mapping,
+        index_slot_mapping,
+    )
+    return torch.empty(0, device=main_kv_cache.device, dtype=main_kv_cache.dtype)
+
+
+def minimax_m3_sparse_kv_cache_update_fake(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    index_key: torch.Tensor,
+    main_kv_cache: torch.Tensor,
+    index_kv_cache: torch.Tensor,
+    main_slot_mapping: torch.Tensor,
+    index_slot_mapping: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return torch.empty(0, device=main_kv_cache.device, dtype=main_kv_cache.dtype)
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_sparse_kv_cache_update",
+    op_func=minimax_m3_sparse_kv_cache_update,
+    mutates_args=["main_kv_cache", "index_kv_cache"],
+    fake_impl=minimax_m3_sparse_kv_cache_update_fake,
+)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -740,6 +1098,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@support_torch_compile(enable_if=_enable_minimax_m3_torch_compile)
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
 
@@ -773,9 +1132,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         )
 
         if get_pp_group().is_last_rank:
-            self.norm = MiniMAXGemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
-            )
+            self.norm = MiniMAXGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 
@@ -793,6 +1150,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
+                assert input_ids is not None
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
         else:
@@ -835,18 +1193,24 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # q/k/v_proj -> fused qkv_proj; gate_proj/up_proj -> fused gate_up_proj
         # (dense MLP and shared expert). On sparse layers the indexer
-        # index_q/index_k_proj fold into the same fused qkv_proj
-        # (MinimaxM3QKVParallelLinearWithIndexer); these entries simply never match on
-        # dense layers, whose checkpoints have no index_*_proj weights. Leading
-        # dots keep `q_proj`/`k_proj` from matching `index_q_proj`/`index_k_proj`
-        # (preceded by `_`, not `.`).
+        # self_attn.indexer.{q,k}_proj either fold into the same fused qkv_proj
+        # or load into a separate BF16 indexer_qk_proj for mixed MXFP8 checkpoints.
+        # These entries simply never match on dense layers, whose checkpoints
+        # have no indexer projection weights.
+        # Keep the indexer-specific keys before the generic q/k mappings.
         stacked_params_mapping: list[tuple[str, str, int | str]] = [
             # (param_name, shard_name, shard_id)
+            (".indexer_qk_proj", ".indexer.q_proj", "index_q"),
+            (".indexer_qk_proj", ".indexer.k_proj", "index_k"),
+            (".indexer_qk_proj", ".index_q_proj", "index_q"),
+            (".indexer_qk_proj", ".index_k_proj", "index_k"),
+            (".qkv_proj", ".indexer.q_proj", "index_q"),
+            (".qkv_proj", ".indexer.k_proj", "index_k"),
+            (".qkv_proj", ".index_q_proj", "index_q"),
+            (".qkv_proj", ".index_k_proj", "index_k"),
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            (".qkv_proj", ".index_q_proj", "index_q"),
-            (".qkv_proj", ".index_k_proj", "index_k"),
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
@@ -861,6 +1225,17 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             if "mtp." in name:
                 continue
 
+            if ".self_attn.indexer.q_norm." in name:
+                name = name.replace(
+                    ".self_attn.indexer.q_norm.",
+                    ".self_attn.index_q_norm.",
+                )
+            elif ".self_attn.indexer.k_norm." in name:
+                name = name.replace(
+                    ".self_attn.indexer.k_norm.",
+                    ".self_attn.index_k_norm.",
+                )
+
             # The checkpoint stores block scales as ``weight_scale_inv``; the
             # ModelOpt MXFP8 layers expose them as ``weight_scale``.
             if "weight_scale_inv" in name:
@@ -869,20 +1244,24 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
+                mapped_name = name.replace(weight_name, param_name)
                 # Routed experts (w1/w2/w3) are handled below; don't let the
                 # stacked mapping rewrite them.
-                if ("block_sparse_moe.experts." in name) and name not in params_dict:
+                if (
+                    "block_sparse_moe.experts." in mapped_name
+                    and mapped_name not in params_dict
+                ):
                     continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
+                if mapped_name.endswith(".bias") and mapped_name not in params_dict:
                     continue
-                if is_pp_missing_parameter(name, self):
+                if is_pp_missing_parameter(mapped_name, self):
                     continue
-                if name not in params_dict:
+                if mapped_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[mapped_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                name = mapped_name
                 break
             else:
                 for (
@@ -933,6 +1312,11 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     """MiniMax M3 (sparse/dense backbone) for causal language modeling."""
 
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
@@ -964,6 +1348,16 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        if intermediate_tensors is not None:
+            input_ids = None
+            inputs_embeds = None
+        elif inputs_embeds is None:
+            assert input_ids is not None
+            inputs_embeds = self.embed_input_ids(input_ids)
+            input_ids = None
+        else:
+            input_ids = None
+
         return self.model(
             input_ids,
             positions,
@@ -1001,6 +1395,7 @@ class MiniMaxM3SparseForConditionalGeneration(
     # data``; ``run_dp_sharded_mrope_vision_model`` shards the work across
     # ranks (see ``_process_image_input`` / ``_process_video_input``).
     supports_encoder_tp_data = True
+    packed_modules_mapping = MiniMaxM3SparseForCausalLM.packed_modules_mapping
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -1009,9 +1404,7 @@ class MiniMaxM3SparseForConditionalGeneration(
             "model.vision_tower.embeddings.proj.": (
                 "vision_tower.vision_model.embeddings.patch_embedding."
             ),
-            "model.vision_tower.embeddings.": (
-                "vision_tower.vision_model.embeddings."
-            ),
+            "model.vision_tower.embeddings.": ("vision_tower.vision_model.embeddings."),
             "model.vision_tower.pre_layrnorm.": (
                 "vision_tower.vision_model.pre_layrnorm."
             ),

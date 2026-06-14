@@ -397,15 +397,21 @@ class MiniMaxM3IndexerImpl(nn.Module):
         """Return ``(decode_topk, prefill_topk)``; implemented per kernel impl."""
         raise NotImplementedError
 
+    def forward_with_cache(
+        self,
+        index_query: torch.Tensor,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return top-k indices using an explicit index KV cache."""
+        raise NotImplementedError
+
     def _topk_out_buffer(
         self,
         kind: str,
         total_q: int,
     ) -> torch.Tensor | None:
         buffer = (
-            self._decode_topk_buffer
-            if kind == "decode"
-            else self._prefill_topk_buffer
+            self._decode_topk_buffer if kind == "decode" else self._prefill_topk_buffer
         )
         if buffer is None:
             return None
@@ -424,6 +430,13 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
         self,
         index_query: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self.forward_with_cache(index_query, self.index_cache.kv_cache)
+
+    def forward_with_cache(
+        self,
+        index_query: torch.Tensor,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             return None, None  # profiling run; caches unbound
@@ -434,7 +447,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
         iq = index_query[:num_tokens].view(
             -1, self.num_index_heads, self.index_head_dim
         )
-        kv = self.index_cache.kv_cache
+        kv = kv_cache
 
         decode_topk: torch.Tensor | None = None
         prefill_topk: torch.Tensor | None = None
@@ -561,3 +574,10 @@ class MiniMaxM3Indexer(nn.Module):
         index_query: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         return self.impl(index_query)
+
+    def forward_with_cache(
+        self,
+        index_query: torch.Tensor,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self.impl.forward_with_cache(index_query, kv_cache)
