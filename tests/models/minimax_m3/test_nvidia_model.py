@@ -8,6 +8,7 @@ from torch import nn
 
 import vllm.model_executor.layers.fused_allreduce_gemma_rms_norm as fused_ar_norm
 import vllm.model_executor.parameter as parameter_module
+import vllm.models.minimax_m3.nvidia.model as minimax_model
 from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
 from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
@@ -151,7 +152,7 @@ def test_minimax_m3_torch_compile_is_env_gated(monkeypatch) -> None:
     assert _enable_minimax_m3_torch_compile(VllmConfig()) is True
 
     monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "1")
-    assert _enable_minimax_m3_torch_compile(VllmConfig()) is False
+    assert _enable_minimax_m3_torch_compile(VllmConfig()) is True
 
     monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "0")
     monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
@@ -323,9 +324,15 @@ def test_minimax_m3_sparse_kv_cache_update_uses_forward_context() -> None:
     layer = object.__new__(MiniMaxM3SparseAttention)
     nn.Module.__init__(layer)
     layer.layer_name = "layers.3.self_attn"
+    main_kv_cache = torch.empty(1, 2, 2, 1, 4)
+    index_kv_cache = torch.empty(1, 2, 3)
     layer.indexer = SimpleNamespace(
-        index_cache=SimpleNamespace(prefix="layers.3.self_attn.index_cache")
+        index_cache=SimpleNamespace(
+            prefix="layers.3.self_attn.index_cache",
+            kv_cache=index_kv_cache,
+        )
     )
+    layer.kv_cache = main_kv_cache
 
     def record_insert_kv(
         key: torch.Tensor,
@@ -354,20 +361,18 @@ def test_minimax_m3_sparse_kv_cache_update_uses_forward_context() -> None:
     key = torch.randn(2, 4)
     value = torch.randn(2, 4)
     index_key = torch.randn(2, 3)
-    main_kv_cache = torch.empty(1, 2, 2, 1, 4)
-    index_kv_cache = torch.empty(1, 2, 3)
     main_slot_mapping = torch.tensor([0, 1], dtype=torch.int32)
     index_slot_mapping = torch.tensor([2, 3], dtype=torch.int32)
+    slot_mapping = {
+        layer.layer_name: main_slot_mapping,
+        layer.indexer.index_cache.prefix: index_slot_mapping,
+    }
 
-    with set_forward_context({}, vllm_config):
+    with set_forward_context({}, vllm_config, slot_mapping=slot_mapping):
         dummy = minimax_m3_sparse_kv_cache_update(
             key,
             value,
             index_key,
-            main_kv_cache,
-            index_kv_cache,
-            main_slot_mapping,
-            index_slot_mapping,
             layer.layer_name,
         )
 
@@ -385,6 +390,123 @@ def test_minimax_m3_sparse_kv_cache_update_uses_forward_context() -> None:
             index_slot_mapping,
         )
     ]
+
+
+def test_minimax_m3_sparse_attention_compile_path_avoids_python_slot_mapping(
+    monkeypatch,
+) -> None:
+    class FakeQKVProj(nn.Module):
+        def __init__(self, qkv: torch.Tensor) -> None:
+            super().__init__()
+            self.qkv = qkv
+
+        def forward(self, hidden_states: torch.Tensor):
+            return self.qkv[: hidden_states.shape[0]].clone(), None
+
+    class FakeOProj(nn.Module):
+        def forward(self, hidden_states: torch.Tensor):
+            return hidden_states, None
+
+    def fail_forward_context():
+        raise AssertionError("compile path must not read slot_mapping in Python")
+
+    qknorm_calls = []
+    kv_update_calls = []
+    sparse_attn_calls = []
+
+    def record_qknorm_rope_kv_insert(*args) -> None:
+        qkv = args[0]
+        q_out = args[17]
+        index_q_out = args[18]
+        q_out.copy_(qkv[:, : q_out.shape[1]])
+        index_q_out.copy_(qkv[:, -index_q_out.shape[1] :])
+        qknorm_calls.append(args)
+
+    def record_kv_cache_update(*args) -> torch.Tensor:
+        kv_update_calls.append(args)
+        return torch.empty(0, device=args[0].device, dtype=args[0].dtype)
+
+    def record_sparse_attention_with_output(*args) -> None:
+        query = args[0]
+        output = args[4]
+        output.copy_(query)
+        sparse_attn_calls.append(args)
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(minimax_model, "get_forward_context", fail_forward_context)
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "minimax_m3_qknorm_rope_kv_insert",
+        record_qknorm_rope_kv_insert,
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "minimax_m3_sparse_kv_cache_update",
+        record_kv_cache_update,
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "minimax_m3_sparse_attention_with_output",
+        record_sparse_attention_with_output,
+    )
+
+    layer = object.__new__(MiniMaxM3SparseAttention)
+    nn.Module.__init__(layer)
+    layer.layer_name = "layers.3.self_attn"
+    layer.num_heads = 2
+    layer.num_kv_heads = 1
+    layer.num_idx_heads = 1
+    layer.head_dim = 2
+    layer.idx_head_dim = 3
+    layer.q_size = 4
+    layer.index_q_size = 3
+    layer.hidden_size = 4
+    layer._fp8_kv = False
+    layer.q_norm = SimpleNamespace(
+        weight=torch.empty(layer.head_dim),
+        variance_epsilon=1e-6,
+    )
+    layer.k_norm = SimpleNamespace(weight=torch.empty(layer.head_dim))
+    layer.index_q_norm = SimpleNamespace(weight=torch.empty(layer.idx_head_dim))
+    layer.index_k_norm = SimpleNamespace(weight=torch.empty(layer.idx_head_dim))
+    layer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.empty(8, layer.head_dim * 2),
+        rotary_dim=layer.head_dim,
+    )
+    layer.indexer = SimpleNamespace(
+        index_cache=SimpleNamespace(
+            prefix="layers.3.self_attn.index_cache",
+            kv_cache=torch.empty(1, 2, layer.idx_head_dim),
+        )
+    )
+    layer.kv_cache = torch.empty(1, 2, 2, layer.num_kv_heads, layer.head_dim)
+    total_qkv_size = (
+        layer.q_size
+        + 2 * layer.num_kv_heads * layer.head_dim
+        + layer.index_q_size
+        + layer.num_idx_heads * layer.idx_head_dim
+    )
+    layer.qkv_proj = FakeQKVProj(torch.arange(2 * total_qkv_size).view(2, -1).float())
+    layer.indexer_qk_proj = None
+    layer.o_proj = FakeOProj()
+
+    positions = torch.arange(2)
+    hidden_states = torch.empty(2, layer.hidden_size)
+
+    output = MiniMaxM3SparseAttention.forward(layer, positions, hidden_states)
+
+    assert len(qknorm_calls) == 1
+    qknorm_args = qknorm_calls[0]
+    assert qknorm_args[12] is None
+    assert qknorm_args[13] is None
+    assert qknorm_args[14] is None
+    assert qknorm_args[15] is None
+    assert qknorm_args[16] == 0
+    assert len(kv_update_calls) == 1
+    assert minimax_model._resolve_layer_name(kv_update_calls[0][3]) == layer.layer_name
+    assert len(sparse_attn_calls) == 1
+    assert sparse_attn_calls[0][6] is not None
+    torch.testing.assert_close(output, qknorm_args[17])
 
 
 def test_minimax_m3_sparse_attention_custom_op_uses_forward_context() -> None:

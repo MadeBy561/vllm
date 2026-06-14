@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -62,6 +63,40 @@ def _b12x_mxfp8_enabled() -> bool:
     return _current_linear_backend() == "b12x" or envs.VLLM_USE_B12X_FP8_GEMM
 
 
+def _b12x_mxfp8_expected_m(tokens: int) -> int:
+    tokens = int(tokens)
+    if tokens <= 1:
+        return 1
+    if tokens <= 8:
+        return tokens
+    if tokens <= 128:
+        return 64
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is not None:
+        max_tokens = getattr(
+            vllm_config.scheduler_config,
+            "max_num_batched_tokens",
+            None,
+        )
+        if max_tokens is not None and int(max_tokens) > 128:
+            return int(max_tokens)
+    return 2048
+
+
+def _b12x_mxfp8_warmup_token_counts(
+    *,
+    max_tokens: int,
+    cudagraph_capture_sizes: Iterable[int] = (),
+) -> tuple[int, ...]:
+    """Representative live-M values for the B12X MXFP8 dense GEMM regimes."""
+    counts = {1, 64}
+    counts.update(int(size) for size in cudagraph_capture_sizes if int(size) > 0)
+    if int(max_tokens) > 0:
+        counts.add(int(max_tokens))
+    return tuple(sorted(counts))
+
+
 def _missing_b12x_mxfp8_api(mxfp8: Any) -> str | None:
     for name in ("pack_mxfp8_linear_weight", "mxfp8_linear"):
         if not callable(getattr(mxfp8, name, None)):
@@ -116,9 +151,79 @@ def _apply_b12x_mxfp8_packed_linear(
         input_2d,
         packed_weight,
         bias=bias,
-        expected_m=int(input_2d.shape[0]),
+        expected_m=_b12x_mxfp8_expected_m(int(input_2d.shape[0])),
     )
     return output.view(*output_shape)
+
+
+def _iter_b12x_mxfp8_linear_layers(
+    model: torch.nn.Module,
+) -> Iterable[torch.nn.Module]:
+    for module in model.modules():
+        if getattr(module, "b12x_mxfp8_packed_weight", None) is not None:
+            yield module
+
+
+def warmup_b12x_mxfp8_linear(
+    model: torch.nn.Module,
+    *,
+    max_tokens: int,
+    cudagraph_capture_sizes: Iterable[int] = (),
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> int:
+    if not _b12x_mxfp8_enabled():
+        return 0
+    if not current_platform.is_cuda():
+        return 0
+    if not current_platform.is_device_capability_family(120):
+        return 0
+    if output_dtype not in (torch.bfloat16, torch.float16):
+        output_dtype = torch.bfloat16
+
+    mxfp8 = _import_b12x_mxfp8()
+    if mxfp8 is None or not callable(getattr(mxfp8, "mxfp8_linear", None)):
+        return 0
+
+    token_counts = _b12x_mxfp8_warmup_token_counts(
+        max_tokens=max_tokens,
+        cudagraph_capture_sizes=cudagraph_capture_sizes,
+    )
+    seen_signatures: set[tuple[int, int, int, torch.dtype]] = set()
+    warmed = 0
+    last_device: torch.device | None = None
+
+    with torch.inference_mode():
+        for layer in _iter_b12x_mxfp8_linear_layers(model):
+            packed_weight = layer.b12x_mxfp8_packed_weight
+            signature = (
+                int(packed_weight.in_features),
+                int(packed_weight.padded_in_features),
+                int(packed_weight.out_features),
+                output_dtype,
+            )
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+
+            device = torch.device(packed_weight.weight.values.device)
+            last_device = device
+            for tokens in token_counts:
+                source = torch.zeros(
+                    (tokens, int(packed_weight.in_features)),
+                    dtype=output_dtype,
+                    device=device,
+                )
+                mxfp8.mxfp8_linear(
+                    source,
+                    packed_weight,
+                    expected_m=_b12x_mxfp8_expected_m(tokens),
+                )
+                warmed += 1
+
+        if warmed > 0 and last_device is not None and last_device.type == "cuda":
+            torch.cuda.synchronize(last_device)
+
+    return warmed
 
 
 def _b12x_mxfp8_linear(

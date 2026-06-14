@@ -16,6 +16,7 @@ from torch import nn
 import vllm.envs as envs
 from vllm.compilation.caching import aot_compile_hash_factors
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.mxfp8.b12x import warmup_b12x_mxfp8_linear
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
     deepseek_v4_mhc_warmup,
@@ -166,6 +167,21 @@ def kernel_warmup(worker: "Worker"):
         model = worker.get_model()
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
+
+    warmed_mxfp8 = warmup_b12x_mxfp8_linear(
+        worker.get_model(),
+        max_tokens=worker.scheduler_config.max_num_batched_tokens,
+        cudagraph_capture_sizes=(
+            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
+        ),
+        output_dtype=getattr(
+            getattr(worker, "model_config", None),
+            "dtype",
+            torch.bfloat16,
+        ),
+    )
+    if warmed_mxfp8:
+        logger.info("Warmed up %d B12X MXFP8 linear GEMM signatures.", warmed_mxfp8)
 
     minimax_m3_msa_warmup(worker)
 
