@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN="${SCRIPT_DIR}/.venv/bin/python"
+PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
 MODEL_PATH="/models/MiniMax-M3-MXFP8-NVFP4"
 SERVED_MODEL_NAME="MiniMax-M3-MXFP8-NVFP4"
 HOST="${HOST:-0.0.0.0}"
@@ -142,9 +142,12 @@ while (($#)); do
       ;;
     --served-model-name|--served-model-name=*|--tokenizer|--tokenizer=*|\
     --hf-config-path|--hf-config-path=*|--quantization|--quantization=*|\
-    --linear-backend|--linear-backend=*|--moe-backend|--moe-backend=*)
+    --attention-backend|--attention-backend=*|--kv-cache-dtype|\
+    --kv-cache-dtype=*|--linear-backend|--linear-backend=*|\
+    --moe-backend|--moe-backend=*|--block-size|--block-size=*|\
+    -cc.mode|-cc.mode=*|-cc.cudagraph_mode|-cc.cudagraph_mode=*)
       echo "ERROR: this launcher is pinned to ${MODEL_PATH} as ${SERVED_MODEL_NAME}." >&2
-      echo "Do not override model identity, quantization, linear, or MoE backend here." >&2
+      echo "Do not override model identity, quantization, backend, or graph settings here." >&2
       exit 1
       ;;
     *)
