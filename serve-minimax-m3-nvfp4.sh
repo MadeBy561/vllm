@@ -3,6 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${SCRIPT_DIR}/.venv/bin/python"
+MODEL_PATH="/models/MiniMax-M3-NVFP4"
+SERVED_MODEL_NAME="MiniMax-M3-NVFP4"
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8000}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Python interpreter not found or not executable: ${PYTHON_BIN}" >&2
@@ -10,11 +14,137 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   exit 1
 fi
 
+MODEL_PATH="${MODEL_PATH}" "${PYTHON_BIN}" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+model_path = Path(os.environ["MODEL_PATH"])
+config_path = model_path / "config.json"
+if not config_path.is_file():
+    raise SystemExit(f"ERROR: missing model config: {config_path}")
+
+config = json.loads(config_path.read_text())
+hq_path = model_path / "hf_quant_config.json"
+hf_quant_config = json.loads(hq_path.read_text()) if hq_path.is_file() else {}
+quant_config = config.get("quantization_config") or {}
+quant_algo = str(
+    quant_config.get("quant_algo") or hf_quant_config.get("quant_algo") or ""
+).upper()
+quant_method = str(
+    quant_config.get("quant_method") or hf_quant_config.get("quant_method") or ""
+).lower()
+config_text = json.dumps(
+    {"config": config, "hf_quant_config": hf_quant_config}
+).upper()
+
+if quant_algo != "NVFP4" or quant_method != "modelopt":
+    raise SystemExit(
+        "ERROR: this diagnostic launcher requires the ModelOpt NVFP4 "
+        f"checkpoint, got quant_algo={quant_algo!r}, "
+        f"quant_method={quant_method!r}."
+    )
+if "MXFP8" in config_text or "MXFP8" in str(model_path).upper():
+    raise SystemExit("ERROR: MXFP8 checkpoint/config detected; use NVFP4 here.")
+
+text_config = config.get("text_config") or {}
+print(
+    f"Verified non-MXFP8 model config: {model_path} "
+    f"(quant_algo={quant_algo}, quant_method={quant_method}, "
+    f"text_model_type={text_config.get('model_type')}, "
+    f"hidden_size={text_config.get('hidden_size')}, "
+    f"layers={text_config.get('num_hidden_layers')})",
+    flush=True,
+)
+PY
+
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export SAFETENSORS_FAST_GPU=1
+export VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-1}"
 export CUTE_DSL_ARCH=sm_120a
-export VLLM_USE_B12X_MOE=1
-export VLLM_USE_B12X_MINIMAX_M3_MSA=1
+export VLLM_USE_B12X_MOE="${VLLM_USE_B12X_MOE:-1}"
+export VLLM_USE_B12X_MINIMAX_M3_MSA="${VLLM_USE_B12X_MINIMAX_M3_MSA:-1}"
+export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
+export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-b12x}"
+export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE="${VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE:-64KB}"
+export USES_B12X="${USES_B12X:-True}"
+export VLLM_USE_B12X_SPARSE_INDEXER="${VLLM_USE_B12X_SPARSE_INDEXER:-1}"
+export B12X_DYNAMIC_DETERMINISTIC_OUTPUT="${B12X_DYNAMIC_DETERMINISTIC_OUTPUT:-0}"
+
+case "${VLLM_USE_BREAKABLE_CUDAGRAPH}" in
+  1|true|True|TRUE|yes|Yes|YES|on|On|ON)
+    export VLLM_USE_BREAKABLE_CUDAGRAPH=1
+    ;;
+  *)
+    echo "ERROR: this NVFP4 diagnostic launcher requires breakable graph capture." >&2
+    echo "Do not set VLLM_USE_BREAKABLE_CUDAGRAPH=0 for this run." >&2
+    exit 1
+    ;;
+esac
+
+case "${VLLM_USE_B12X_FP8_GEMM:-0}" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF|"")
+    export VLLM_USE_B12X_FP8_GEMM=0
+    ;;
+  *)
+    echo "ERROR: this NVFP4 diagnostic launcher keeps B12X FP8 GEMM disabled." >&2
+    echo "Unset VLLM_USE_B12X_FP8_GEMM or set it to 0 for this run." >&2
+    exit 1
+    ;;
+esac
+
+case "${VLLM_USE_AOT_COMPILE:-0}" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF|"")
+    export VLLM_USE_AOT_COMPILE=0
+    ;;
+  *)
+    echo "ERROR: this NVFP4 diagnostic launcher keeps AOT compile disabled." >&2
+    echo "Use the breakable graph-capture path while isolating this model." >&2
+    exit 1
+    ;;
+esac
+
+EXTRA_ARGS=()
+while (($#)); do
+  arg="$1"
+  case "${arg}" in
+    --host)
+      if (($# < 2)); then
+        echo "ERROR: --host requires a value." >&2
+        exit 1
+      fi
+      HOST="$2"
+      shift 2
+      ;;
+    --host=*)
+      HOST="${arg#--host=}"
+      shift
+      ;;
+    --port)
+      if (($# < 2)); then
+        echo "ERROR: --port requires a value." >&2
+        exit 1
+      fi
+      PORT="$2"
+      shift 2
+      ;;
+    --port=*)
+      PORT="${arg#--port=}"
+      shift
+      ;;
+    --served-model-name|--served-model-name=*|--tokenizer|--tokenizer=*|\
+    --hf-config-path|--hf-config-path=*|--quantization|--quantization=*|\
+    mxfp8|modelopt_mxfp8|*MiniMax-M3-MXFP8*)
+      echo "ERROR: this launcher is pinned to ${MODEL_PATH} as ${SERVED_MODEL_NAME}." >&2
+      echo "Do not override model identity, quantization, or use MXFP8 identifiers here." >&2
+      exit 1
+      ;;
+    *)
+      EXTRA_ARGS+=("${arg}")
+      shift
+      ;;
+  esac
+done
 
 M3_PROFILE="${M3_PROFILE:-}"
 PROFILER_ARGS=()
@@ -55,16 +185,17 @@ case "${M3_PROFILE,,}" in
 esac
 
 cd "${SCRIPT_DIR}"
-exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve /models/MiniMax-M3-NVFP4 \
-  --served-model-name MiniMax-M3-NVFP4 \
+echo "Launching ${MODEL_PATH} as ${SERVED_MODEL_NAME}" >&2
+exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}" \
+  --served-model-name "${SERVED_MODEL_NAME}" \
   --trust-remote-code \
-  --host 0.0.0.0 \
-  --port 8000 \
+  --host "${HOST}" \
+  --port "${PORT}" \
   --tensor-parallel-size 4 \
-  --gpu-memory-utilization 0.95 \
-  --max-model-len 131072 \
-  --max-num-batched-tokens 4096 \
-  --max-num-seqs 16 \
+  --gpu-memory-utilization 0.98 \
+  --max-num-batched-tokens 2048 \
+  --max-model-len 256000 \
+  --max-num-seqs 4 \
   --quantization modelopt_fp4 \
   --kv-cache-dtype fp8_e4m3 \
   --attention-backend TRITON_ATTN \
@@ -72,8 +203,9 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve /models/MiniMax-M3-NVFP4
   --load-format fastsafetensors \
   --enable-chunked-prefill \
   --enable-prefix-caching \
+  --skip-mm-profiling \
   --reasoning-parser minimax_m3 \
   --enable-auto-tool-choice \
   --tool-call-parser minimax_m3 \
   "${PROFILER_ARGS[@]}" \
-  "$@"
+  "${EXTRA_ARGS[@]}"
