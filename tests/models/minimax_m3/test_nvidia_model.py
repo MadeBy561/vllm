@@ -180,6 +180,35 @@ def test_minimax_m3_norm_uses_vllm_gemma_semantics(default_vllm_config) -> None:
 
 
 @torch.inference_mode()
+def test_minimax_m3_norm_traces_as_fullgraph(default_vllm_config) -> None:
+    layer = MiniMAXGemmaRMSNorm(16, eps=1e-6)
+    layer.weight.data.normal_(mean=0.0, std=0.1)
+    x = torch.randn(4, 16)
+    residual = torch.randn_like(x)
+
+    def fn(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return layer(hidden_states, residual)
+
+    compiled = torch.compile(
+        fn,
+        fullgraph=True,
+        dynamic=False,
+        backend="eager",
+    )
+    out, new_residual = compiled(x, residual)
+    ref_residual = x + residual
+
+    torch.testing.assert_close(new_residual, ref_residual)
+    torch.testing.assert_close(
+        out,
+        _gemma_rms_norm_ref(ref_residual, layer.weight, layer.variance_epsilon),
+    )
+
+
+@torch.inference_mode()
 def test_fused_allreduce_norm_compile_path_skips_flashinfer_probe(
     default_vllm_config,
     monkeypatch,
