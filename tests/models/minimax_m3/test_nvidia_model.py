@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -20,6 +21,7 @@ from vllm.model_executor.layers.linear import (
     MinimaxM3QKVParallelLinearWithIndexer,
 )
 from vllm.model_executor.parameter import ModelWeightParameter
+from vllm.models.minimax_m3.common.indexer import _get_minimax_m3_indexer_num_heads
 from vllm.models.minimax_m3.nvidia import sparse_attention_b12x
 from vllm.models.minimax_m3.nvidia.model import (
     MiniMAXGemmaRMSNorm,
@@ -699,6 +701,35 @@ def _fake_current_config_with_virtual_tp_plan():
     text_config = SimpleNamespace()
     setattr(text_config, VIRTUAL_TP_PLAN_ATTR, _MINIMAX_M3_TP3_VIRTUAL_TP_PLAN)
     return SimpleNamespace(model_config=SimpleNamespace(hf_text_config=text_config))
+
+
+def _fake_vllm_config_for_indexer(virtual_tp_plan: dict | None = None):
+    text_config = SimpleNamespace()
+    if virtual_tp_plan is not None:
+        setattr(text_config, VIRTUAL_TP_PLAN_ATTR, virtual_tp_plan)
+    hf_config = SimpleNamespace(text_config=text_config)
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=hf_config,
+            hf_text_config=text_config,
+        )
+    )
+
+
+def test_minimax_m3_indexer_metadata_uses_virtual_tp3_index_heads() -> None:
+    vllm_config = _fake_vllm_config_for_indexer(_MINIMAX_M3_TP3_VIRTUAL_TP_PLAN)
+
+    assert _get_minimax_m3_indexer_num_heads(vllm_config, 4, 3) == 2
+
+
+def test_minimax_m3_indexer_metadata_keeps_regular_tp_head_counts() -> None:
+    vllm_config = _fake_vllm_config_for_indexer()
+
+    assert _get_minimax_m3_indexer_num_heads(vllm_config, 4, 2) == 2
+    assert _get_minimax_m3_indexer_num_heads(vllm_config, 4, 4) == 1
+    assert _get_minimax_m3_indexer_num_heads(vllm_config, 4, 8) == 1
+    with pytest.raises(AssertionError):
+        _get_minimax_m3_indexer_num_heads(vllm_config, 4, 3)
 
 
 def _fake_qkv_layer(
