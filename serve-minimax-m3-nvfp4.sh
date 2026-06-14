@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN="${SCRIPT_DIR}/.venv/bin/python"
+PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
 MODEL_PATH="/models/MiniMax-M3-NVFP4"
 SERVED_MODEL_NAME="MiniMax-M3-NVFP4"
 HOST="${HOST:-0.0.0.0}"
@@ -60,8 +60,11 @@ PY
 
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export SAFETENSORS_FAST_GPU=1
-export VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-1}"
-export CUTE_DSL_ARCH=sm_120a
+export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
+export VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE="${VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE:-1}"
+export VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
+export VLLM_USE_AOT_COMPILE="${VLLM_USE_AOT_COMPILE:-1}"
+export VLLM_USE_B12X_FP8_GEMM="${VLLM_USE_B12X_FP8_GEMM:-0}"
 export VLLM_USE_B12X_MOE="${VLLM_USE_B12X_MOE:-1}"
 export VLLM_USE_B12X_MINIMAX_M3_MSA="${VLLM_USE_B12X_MINIMAX_M3_MSA:-1}"
 export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
@@ -69,36 +72,48 @@ export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE="${VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE:-64KB}"
 export VLLM_USE_B12X_SPARSE_INDEXER="${VLLM_USE_B12X_SPARSE_INDEXER:-1}"
 export B12X_DYNAMIC_DETERMINISTIC_OUTPUT="${B12X_DYNAMIC_DETERMINISTIC_OUTPUT:-0}"
+export B12X_LOG_CUTE_COMPILES_AFTER_ENGINE_START="${B12X_LOG_CUTE_COMPILES_AFTER_ENGINE_START:-1}"
 
-case "${VLLM_USE_BREAKABLE_CUDAGRAPH}" in
+case "${VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE}" in
   1|true|True|TRUE|yes|Yes|YES|on|On|ON)
-    export VLLM_USE_BREAKABLE_CUDAGRAPH=1
+    export VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE=1
     ;;
   *)
-    echo "ERROR: this NVFP4 diagnostic launcher requires breakable graph capture." >&2
-    echo "Do not set VLLM_USE_BREAKABLE_CUDAGRAPH=0 for this run." >&2
+    echo "ERROR: this MiniMax M3 launcher requires full graph compilation." >&2
+    echo "Do not set VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE=0 for this run." >&2
     exit 1
     ;;
 esac
 
-case "${VLLM_USE_B12X_FP8_GEMM:-0}" in
+case "${VLLM_USE_BREAKABLE_CUDAGRAPH}" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF|"")
+    export VLLM_USE_BREAKABLE_CUDAGRAPH=0
+    ;;
+  *)
+    echo "ERROR: this MiniMax M3 launcher is for full, unbroken graphs." >&2
+    echo "Do not set VLLM_USE_BREAKABLE_CUDAGRAPH=1 for this run." >&2
+    exit 1
+    ;;
+esac
+
+case "${VLLM_USE_AOT_COMPILE}" in
+  1|true|True|TRUE|yes|Yes|YES|on|On|ON)
+    export VLLM_USE_AOT_COMPILE=1
+    ;;
+  *)
+    echo "ERROR: this MiniMax M3 launcher requires AOT compile." >&2
+    echo "Do not set VLLM_USE_AOT_COMPILE=0 for this run." >&2
+    exit 1
+    ;;
+esac
+
+case "${VLLM_USE_B12X_FP8_GEMM}" in
   0|false|False|FALSE|no|No|NO|off|Off|OFF|"")
     export VLLM_USE_B12X_FP8_GEMM=0
     ;;
   *)
     echo "ERROR: this NVFP4 diagnostic launcher keeps B12X FP8 GEMM disabled." >&2
     echo "Unset VLLM_USE_B12X_FP8_GEMM or set it to 0 for this run." >&2
-    exit 1
-    ;;
-esac
-
-case "${VLLM_USE_AOT_COMPILE:-0}" in
-  0|false|False|FALSE|no|No|NO|off|Off|OFF|"")
-    export VLLM_USE_AOT_COMPILE=0
-    ;;
-  *)
-    echo "ERROR: this NVFP4 diagnostic launcher keeps AOT compile disabled." >&2
-    echo "Use the breakable graph-capture path while isolating this model." >&2
     exit 1
     ;;
 esac
@@ -133,9 +148,12 @@ while (($#)); do
       ;;
     --served-model-name|--served-model-name=*|--tokenizer|--tokenizer=*|\
     --hf-config-path|--hf-config-path=*|--quantization|--quantization=*|\
-    mxfp8|modelopt_mxfp8|*MiniMax-M3-MXFP8*)
+    --attention-backend|--attention-backend=*|--kv-cache-dtype|\
+    --kv-cache-dtype=*|--moe-backend|--moe-backend=*|--block-size|\
+    --block-size=*|-cc.mode|-cc.mode=*|-cc.cudagraph_mode|\
+    -cc.cudagraph_mode=*|mxfp8|modelopt_mxfp8|*MiniMax-M3-MXFP8*)
       echo "ERROR: this launcher is pinned to ${MODEL_PATH} as ${SERVED_MODEL_NAME}." >&2
-      echo "Do not override model identity, quantization, or use MXFP8 identifiers here." >&2
+      echo "Do not override model identity, quantization, backend, or graph settings here." >&2
       exit 1
       ;;
     *)
@@ -145,7 +163,7 @@ while (($#)); do
   esac
 done
 
-M3_PROFILE="${M3_PROFILE:-}"
+M3_PROFILE="${M3_PROFILE:-torch}"
 PROFILER_ARGS=()
 case "${M3_PROFILE,,}" in
   0|false|no|off|"")
@@ -197,7 +215,10 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}" \
   --max-num-seqs 4 \
   --quantization modelopt_fp4 \
   --kv-cache-dtype fp8_e4m3 \
-  --attention-backend TRITON_ATTN \
+  --attention-backend B12X_ATTN \
+  --moe-backend b12x \
+  -cc.mode=VLLM_COMPILE \
+  -cc.cudagraph_mode=FULL_AND_PIECEWISE \
   --block-size 128 \
   --load-format fastsafetensors \
   --enable-chunked-prefill \
