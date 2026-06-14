@@ -55,7 +55,8 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
-_B12X_PAGE_SIZE = 64
+_B12X_SUPPORTED_PAGE_SIZES = (64, 128)
+_B12X_PREFERRED_PAGE_SIZE = 128
 _MIN_PAGED_TILE_Q = 16
 _B12X_FP8_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")
 _B12X_SUPPORTED_KV_CACHE_DTYPES = (
@@ -326,15 +327,17 @@ class B12XPagedAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [_B12X_PAGE_SIZE]
+        return list(_B12X_SUPPORTED_PAGE_SIZES)
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
-        return block_size is None or int(block_size) == _B12X_PAGE_SIZE
+        return block_size is None or int(block_size) in _B12X_SUPPORTED_PAGE_SIZES
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
-        return _B12X_PAGE_SIZE
+        if int(default_block_size) in _B12X_SUPPORTED_PAGE_SIZES:
+            return int(default_block_size)
+        return _B12X_PREFERRED_PAGE_SIZE
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -401,9 +404,10 @@ class B12XPagedAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        if block_size != _B12X_PAGE_SIZE:
+        if block_size not in _B12X_SUPPORTED_PAGE_SIZES:
             raise ValueError(
-                f"B12X_ATTN requires block_size={_B12X_PAGE_SIZE}, got {block_size}."
+                "B12X_ATTN requires block_size in "
+                f"{_B12X_SUPPORTED_PAGE_SIZES}, got {block_size}."
             )
         if cache_dtype_str not in _B12X_SUPPORTED_KV_CACHE_DTYPES:
             raise ValueError(
@@ -596,9 +600,11 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
         scheduler_config = vllm_config.scheduler_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
-        if int(cache_config.block_size) != _B12X_PAGE_SIZE:
+        self.block_size = int(cache_config.block_size)
+        if self.block_size not in _B12X_SUPPORTED_PAGE_SIZES:
             raise ValueError(
-                f"B12X_ATTN requires --block-size={_B12X_PAGE_SIZE}, got "
+                "B12X_ATTN requires --block-size in "
+                f"{_B12X_SUPPORTED_PAGE_SIZES}, got "
                 f"{cache_config.block_size}."
             )
 
@@ -611,7 +617,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
         max_batched = int(scheduler_config.max_num_batched_tokens)
         max_num_seqs = int(scheduler_config.max_num_seqs)
         max_model_len = int(model_config.max_model_len)
-        max_page_table_width = max(cdiv(max(max_model_len, 1), _B12X_PAGE_SIZE), 1)
+        max_page_table_width = max(cdiv(max(max_model_len, 1), self.block_size), 1)
         gqa_tiles = max(cdiv(self.num_queries_per_kv, _MIN_PAGED_TILE_Q), 1)
         extend_q_tiles = cdiv(max_batched * self.num_queries_per_kv, _MIN_PAGED_TILE_Q)
 
@@ -672,7 +678,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
                     num_kv_heads=self.num_kv_heads,
                     head_dim_qk=self.head_size,
                     head_dim_vo=self.head_size_v,
-                    page_size=_B12X_PAGE_SIZE,
+                    page_size=self.block_size,
                     max_total_q=max_total_q,
                     max_batch=max_batch,
                     max_page_table_width=max_page_table_width,
@@ -1116,7 +1122,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             V_CACHE_STRIDE_1=value_cache.stride(1),
             V_CACHE_STRIDE_2=value_cache.stride(2),
             V_CACHE_STRIDE_3=value_cache.stride(3),
-            PAGE_SIZE=_B12X_PAGE_SIZE,
+            PAGE_SIZE=self.block_size,
             NUM_KV_HEADS=self.num_kv_heads,
             HEAD_DIM=self.head_size,
             KV_WINDOW=self._contig_max_kv_window,

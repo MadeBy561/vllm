@@ -30,6 +30,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseMetadata,
 )
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -40,9 +41,16 @@ _B12X_MINIMAX_MSA_TOPK = 16
 _B12X_MINIMAX_MSA_PAGE_SIZE = 128
 _B12X_FP8_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")
 _B12X_MSA_COMPARE_TRITON = "VLLM_B12X_MINIMAX_M3_MSA_COMPARE_TRITON"
+_B12X_MSA_COMPARE_AFTER_ENGINE_START = (
+    "VLLM_B12X_MINIMAX_M3_MSA_COMPARE_AFTER_ENGINE_START"
+)
+_B12X_MSA_COMPARE_LOG_ALL = "VLLM_B12X_MINIMAX_M3_MSA_COMPARE_LOG_ALL"
+_B12X_MSA_COMPARE_MAX_REPORTS = "VLLM_B12X_MINIMAX_M3_MSA_COMPARE_MAX_REPORTS"
+_B12X_MSA_COMPARE_ATOL = "VLLM_B12X_MINIMAX_M3_MSA_COMPARE_ATOL"
 _B12X_MSA_DUMP_DIR = "VLLM_B12X_MINIMAX_M3_MSA_DUMP_DIR"
 _B12X_MSA_SYNC_AFTER = "VLLM_B12X_MINIMAX_M3_MSA_SYNC_AFTER"
 _B12X_MSA_ZERO_OUTPUT_BEFORE = "VLLM_B12X_MINIMAX_M3_MSA_ZERO_OUTPUT_BEFORE"
+_B12X_MSA_TRITON_COMPARE_REPORTS = 0
 
 
 def _debug_rank_label() -> str:
@@ -65,6 +73,40 @@ def _ranges_overlap(lhs: tuple[int, int], rhs: tuple[int, int]) -> bool:
 
 def _is_b12x_fp8_kv_cache(kv_cache_dtype: str) -> bool:
     return kv_cache_dtype in _B12X_FP8_KV_CACHE_DTYPES
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %d", name, value, default)
+        return default
+    if parsed <= 0:
+        logger.warning("Ignoring non-positive %s=%r; using %d", name, value, default)
+        return default
+    return parsed
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %.6g", name, value, default)
+        return default
+
+
+def _claim_triton_compare_report(max_reports: int) -> bool:
+    global _B12X_MSA_TRITON_COMPARE_REPORTS
+    if max_reports <= _B12X_MSA_TRITON_COMPARE_REPORTS:
+        return False
+    _B12X_MSA_TRITON_COMPARE_REPORTS += 1
+    return True
 
 
 def _capture_alloc_forbidden() -> bool:
@@ -147,8 +189,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
         )
         if self.head_size != 128:
             raise NotImplementedError(
-                "B12X MiniMax M3 MSA requires head_size=128, "
-                f"got {self.head_size}."
+                f"B12X MiniMax M3 MSA requires head_size=128, got {self.head_size}."
             )
         if self.block_size != _B12X_MINIMAX_MSA_PAGE_SIZE:
             raise NotImplementedError(
@@ -190,9 +231,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
             )
 
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        self._unit_fp8_descale = torch.ones(
-            (), dtype=torch.float32, device=self.device
-        )
+        self._unit_fp8_descale = torch.ones((), dtype=torch.float32, device=self.device)
 
         from vllm.v1.attention.backends.b12x_attn import (
             _disable_cutlass_memory_debug_snapshot_if_off,
@@ -201,28 +240,71 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
         _disable_cutlass_memory_debug_snapshot_if_off()
 
         from b12x.attention.paged.api import paged_attention_forward
-        from b12x.attention.paged.planner import create_paged_plan
         from b12x.integration.paged_attention_scratch import (
             B12XPagedAttentionScratchCaps,
             plan_paged_attention_scratch,
         )
 
         self._paged_attention_forward = paged_attention_forward
-        self._create_paged_plan = create_paged_plan
         self._scratch_caps_type = B12XPagedAttentionScratchCaps
         self._plan_paged_attention_scratch = plan_paged_attention_scratch
+
+        vllm_config = get_current_vllm_config()
+        scheduler_config = vllm_config.scheduler_config
+        model_config = vllm_config.model_config
+        self.dtype = torch.get_default_dtype()
+        if self.dtype not in (torch.float16, torch.bfloat16):
+            self.dtype = model_config.dtype
+        max_batched = int(scheduler_config.max_num_batched_tokens)
+        max_num_seqs = int(scheduler_config.max_num_seqs)
+        max_model_len = int(model_config.max_model_len)
+        max_page_table_width = max(
+            cdiv(max(max_model_len, 1), _B12X_MINIMAX_MSA_PAGE_SIZE),
+            1,
+        )
+        extend_q_tiles = cdiv(max_batched, 8)
+        extend_work_items = _env_int(
+            "VLLM_B12X_MINIMAX_M3_MSA_EXTEND_MAX_WORK_ITEMS",
+            extend_q_tiles + max_num_seqs,
+        )
+        self._extend_scratch_plan = self._plan_paged_attention_scratch(
+            self._scratch_caps_type(
+                device=self.device,
+                mode="extend",
+                dtype=self.dtype,
+                kv_dtype=self.kv_torch_dtype,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_size,
+                head_dim_vo=self.head_size,
+                page_size=_B12X_MINIMAX_MSA_PAGE_SIZE,
+                max_total_q=max_batched,
+                max_batch=max_num_seqs,
+                max_page_table_width=max_page_table_width,
+                max_work_items=extend_work_items,
+                max_partial_rows=0,
+                num_cache_pages=1,
+                use_cuda_graph=False,
+                msa_block_sparse=True,
+            )
+        )
         self._decode_graph_scratch_plans: dict[tuple[Any, ...], Any] = {}
         self._triton_compare_reports = 0
         self._triton_compare_dumps = 0
         self._debug_reports = 0
 
+        current_workspace_manager().get_simultaneous(
+            ((int(self._extend_scratch_plan.layout.nbytes),), torch.uint8),
+        )
+
         logger.info_once(
             "Using B12X MiniMax M3 MSA attention: heads=%d kv_heads=%d "
-            "head_dim=%d kv_dtype=%s",
+            "head_dim=%d kv_dtype=%s extend_work_items=%d",
             self.num_heads,
             self.num_kv_heads,
             self.head_size,
             self.kv_torch_dtype,
+            extend_work_items,
         )
 
     def _kv_cache_views(
@@ -391,8 +473,6 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         mode: Literal["decode", "extend"],
-        max_work_items: int,
-        max_partial_rows: int,
     ) -> Any:
         if mode == "decode":
             return self._prepare_decode_graph_scratch_plan(
@@ -401,18 +481,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
                 page_table=page_table,
                 cache_seqlens=cache_seqlens,
             )
-        return self._plan_paged_attention_scratch(
-            self._make_scratch_caps(
-                q=q,
-                key_cache=key_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                mode=mode,
-                max_work_items=max_work_items,
-                max_partial_rows=max_partial_rows,
-                use_cuda_graph=False,
-            )
-        )
+        return self._extend_scratch_plan
 
     def _run_b12x_slice(
         self,
@@ -430,14 +499,12 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
         prefix_lens: torch.Tensor | None = None,
         max_query_len: int | None = None,
         layer_name: str,
-    ) -> None:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         total_q_capacity = int(q.shape[0])
         if total_q_capacity <= 0:
-            return
+            return output, None
         if q.dtype not in (torch.float16, torch.bfloat16):
-            raise TypeError(
-                f"B12X MiniMax M3 MSA does not support q dtype {q.dtype}."
-            )
+            raise TypeError(f"B12X MiniMax M3 MSA does not support q dtype {q.dtype}.")
         if output.dtype != q.dtype:
             raise TypeError(
                 "B12X MiniMax M3 MSA expects output dtype to match q dtype, "
@@ -464,7 +531,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
             if total_q < total_q_capacity:
                 output[total_q:].zero_()
                 if total_q == 0:
-                    return
+                    return output, None
                 q = q[:total_q]
                 output = output[:total_q]
         else:
@@ -472,43 +539,29 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
 
         self._validate_q2k_indices(q2k_indices, total_q)
 
-        if mode == "decode":
-            max_work_items = 1
-            max_partial_rows = 0
-        else:
-            plan = self._create_paged_plan(
-                q,
-                key_cache,
-                value_cache,
-                page_table,
-                cache_seqlens,
-                cu_seqlens_q,
-                mode=mode,
-                msa_block_sparse=True,
-            )
-            max_work_items = max(
-                int(plan.new_batch_size),
-                int(plan.padded_batch_size),
-                1,
-            )
-            max_partial_rows = max(int(plan.total_num_partial_rows), 0)
         scratch_plan = self._select_scratch_plan(
             q=q,
             key_cache=key_cache,
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             mode=mode,
-            max_work_items=max_work_items,
-            max_partial_rows=max_partial_rows,
         )
         (scratch_storage,) = current_workspace_manager().get_simultaneous(
             ((int(scratch_plan.layout.nbytes),), torch.uint8),
         )
         num_reqs = int(cache_seqlens.shape[0])
-        compare_triton = (
+        compare_after_engine_start = (
+            os.getenv(_B12X_MSA_COMPARE_AFTER_ENGINE_START, "0") == "1"
+        )
+        engine_started = os.getenv("B12X_VLLM_ENGINE_STARTED", "0") == "1"
+        compare_max_reports = _env_int(_B12X_MSA_COMPARE_MAX_REPORTS, 8)
+        compare_requested = (
             os.getenv(_B12X_MSA_COMPARE_TRITON, "0") == "1"
             and not capturing
-            and self._triton_compare_reports < 8
+            and (not compare_after_engine_start or engine_started)
+        )
+        compare_triton = compare_requested and _claim_triton_compare_report(
+            compare_max_reports
         )
         triton_f32_cpu: torch.Tensor | None = None
         q_finite_before: bool | None = None
@@ -575,7 +628,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
             )
             self._debug_reports += 1
         k_descale, v_descale = self._prepare_fp8_descales(num_reqs, q.device)
-        if mode == "decode" and not capturing:
+        if not capturing:
             scratch_plan._q2k_indices_data_ptr = None
         binding = scratch_plan.bind(
             scratch=scratch_storage,
@@ -603,8 +656,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
             and self._debug_reports < 12
         ):
             logger.warning(
-                "B12X MiniMax M3 MSA bound layer=%s mode=%s rank=%s "
-                "plan=%s scratch=%s",
+                "B12X MiniMax M3 MSA bound layer=%s mode=%s rank=%s plan=%s scratch=%s",
                 layer_name,
                 mode,
                 _debug_rank_label(),
@@ -614,10 +666,10 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
             self._debug_reports += 1
         if os.getenv(_B12X_MSA_ZERO_OUTPUT_BEFORE, "0") == "1":
             output.zero_()
-        returned_output, _ = self._paged_attention_forward(binding=binding)
+        returned_output, returned_lse = self._paged_attention_forward(binding=binding)
         if os.getenv(_B12X_MSA_SYNC_AFTER, "0") == "1":
             torch.cuda.synchronize()
-        if mode == "decode" and not capturing:
+        if not capturing:
             scratch_plan._q2k_indices_data_ptr = None
         if compare_triton:
             assert triton_f32_cpu is not None
@@ -647,6 +699,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
                 layer_name=layer_name,
             )
             self._triton_compare_reports += 1
+        return returned_output, returned_lse
 
     def _plan_debug_dict(
         self,
@@ -821,57 +874,61 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
                 b12x_f32.reshape(-1), triton_f32.reshape(-1), dim=0
             ).item()
         )
-        logger.warning(
-            "B12X MiniMax M3 MSA compare layer=%s mode=%s q=%s reqs=%d "
-            "q2k=%s finite=%s/%s q_finite=%s/%s q2k_range=%s/%s "
-            "max_abs=%.6g mean_abs=%.6g cos=%.8f "
-            "absmax b12x/triton/q/k/v=%.6g/%.6g/%.6g/%.6g/%.6g "
-            "mut q/k/v=%.6g/%.6g/%.6g "
-            "stride q/out/ret/k/v=%s/%s/%s/%s/%s active_pages=%d "
-            "descale_stride=%s/%s alias q/out/ret/q2k/scratch=%s/%s/%s/%s "
-            "overlap q/out/ret/q2k/scratch=%s/%s/%s/%s "
-            "plan=%s scratch=%s",
-            layer_name,
-            mode,
-            tuple(q.shape),
-            num_reqs,
-            tuple(q2k_indices.shape),
-            finite_b12x,
-            finite_triton,
-            q_finite_before,
-            q_finite_after,
-            q2k_range_before,
-            q2k_range_after,
-            max_abs,
-            mean_abs,
-            cos,
-            b12x_absmax,
-            triton_absmax,
-            q_absmax,
-            active_k_absmax,
-            active_v_absmax,
-            q_mut_max,
-            k_mut_max,
-            v_mut_max,
-            tuple(q.stride()),
-            tuple(b12x_output.stride()),
-            tuple(returned_output.stride()),
-            tuple(key_cache.stride()),
-            tuple(value_cache.stride()),
-            int(active_page_ids_cpu.numel()),
-            None if k_descale is None else tuple(k_descale.stride()),
-            None if v_descale is None else tuple(v_descale.stride()),
-            q_storage_ptr == scratch_storage_ptr,
-            out_storage_ptr == scratch_storage_ptr,
-            returned_out_storage_ptr == scratch_storage_ptr,
-            q2k_storage_ptr == scratch_storage_ptr,
-            _ranges_overlap(_tensor_addr_range(q), scratch_range),
-            _ranges_overlap(_tensor_addr_range(b12x_output), scratch_range),
-            _ranges_overlap(_tensor_addr_range(returned_output), scratch_range),
-            _ranges_overlap(_tensor_addr_range(q2k_indices), scratch_range),
-            plan_debug["plan"],
-            plan_debug["scratch"],
-        )
+        compare_atol = _env_float(_B12X_MSA_COMPARE_ATOL, 1e-2)
+        log_all = os.getenv(_B12X_MSA_COMPARE_LOG_ALL, "0") == "1"
+        mismatch = (not finite_b12x) or (not finite_triton) or max_abs > compare_atol
+        if mismatch or log_all:
+            logger.warning(
+                "B12X MiniMax M3 MSA compare layer=%s mode=%s q=%s reqs=%d "
+                "q2k=%s finite=%s/%s q_finite=%s/%s q2k_range=%s/%s "
+                "max_abs=%.6g mean_abs=%.6g cos=%.8f "
+                "absmax b12x/triton/q/k/v=%.6g/%.6g/%.6g/%.6g/%.6g "
+                "mut q/k/v=%.6g/%.6g/%.6g "
+                "stride q/out/ret/k/v=%s/%s/%s/%s/%s active_pages=%d "
+                "descale_stride=%s/%s alias q/out/ret/q2k/scratch=%s/%s/%s/%s "
+                "overlap q/out/ret/q2k/scratch=%s/%s/%s/%s "
+                "plan=%s scratch=%s",
+                layer_name,
+                mode,
+                tuple(q.shape),
+                num_reqs,
+                tuple(q2k_indices.shape),
+                finite_b12x,
+                finite_triton,
+                q_finite_before,
+                q_finite_after,
+                q2k_range_before,
+                q2k_range_after,
+                max_abs,
+                mean_abs,
+                cos,
+                b12x_absmax,
+                triton_absmax,
+                q_absmax,
+                active_k_absmax,
+                active_v_absmax,
+                q_mut_max,
+                k_mut_max,
+                v_mut_max,
+                tuple(q.stride()),
+                tuple(b12x_output.stride()),
+                tuple(returned_output.stride()),
+                tuple(key_cache.stride()),
+                tuple(value_cache.stride()),
+                int(active_page_ids_cpu.numel()),
+                None if k_descale is None else tuple(k_descale.stride()),
+                None if v_descale is None else tuple(v_descale.stride()),
+                q_storage_ptr == scratch_storage_ptr,
+                out_storage_ptr == scratch_storage_ptr,
+                returned_out_storage_ptr == scratch_storage_ptr,
+                q2k_storage_ptr == scratch_storage_ptr,
+                _ranges_overlap(_tensor_addr_range(q), scratch_range),
+                _ranges_overlap(_tensor_addr_range(b12x_output), scratch_range),
+                _ranges_overlap(_tensor_addr_range(returned_output), scratch_range),
+                _ranges_overlap(_tensor_addr_range(q2k_indices), scratch_range),
+                plan_debug["plan"],
+                plan_debug["scratch"],
+            )
         self._dump_first_mismatch(
             q=q,
             key_cache=key_cache,
@@ -894,6 +951,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
             layer_name=layer_name,
             mode=mode,
             max_abs=max_abs,
+            compare_atol=compare_atol,
             finite_b12x=finite_b12x,
             finite_triton=finite_triton,
             plan_debug=plan_debug,
@@ -978,6 +1036,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
         layer_name: str,
         mode: Literal["decode", "extend"],
         max_abs: float,
+        compare_atol: float,
         finite_b12x: bool,
         finite_triton: bool,
         plan_debug: dict[str, Any],
@@ -985,7 +1044,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
         dump_dir = os.getenv(_B12X_MSA_DUMP_DIR)
         if not dump_dir or self._triton_compare_dumps > 0:
             return
-        if finite_b12x and finite_triton and max_abs <= 1e-2:
+        if finite_b12x and finite_triton and max_abs <= compare_atol:
             return
         os.makedirs(dump_dir, exist_ok=True)
         active_page_ids = active_page_ids_cpu.to(
