@@ -33,7 +33,13 @@ _B12X_PAGED_INDEX_PAGE_WIDTH = _B12X_PAGED_INDEX_PAGE_SIZE * (
     _B12X_PAGED_INDEX_HEAD_DIM + _B12X_PAGED_INDEX_SCALE_BYTES
 )
 _B12X_PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
+_B12X_PAGED_INDEX_TILE_BLOCK_Q = 32
 _B12X_PAGED_INDEX_TILE_BLOCK_K = 512
+_B12X_CONTIGUOUS_PREFILL_BLOCK_K = 256
+_B12X_CONTIGUOUS_PREFILL512_BLOCK_K = 512
+_B12X_CONTIGUOUS_PREFILL512_MIN_Q_ROWS = 1024
+_B12X_CONTIGUOUS_PREFILL512_MIN_K_ROWS = 4096
+_B12X_CONTIGUOUS_PREFILL512_SUPPORTED_HEADS = (32, 64)
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 _B12X_PREFILL_PAGED_ROUTE = "packed_contiguous"
@@ -70,6 +76,51 @@ def _get_b12x_paged_indexer_profile_q_rows(q_rows: int) -> int:
     tile_k = _get_b12x_indexer_paged_supertile_k()
     max_q_rows = max(1, max_logits_elems // max(1, tile_k))
     return min(max(1, int(q_rows)), max_q_rows)
+
+
+def _get_b12x_paged_indexer_profile_k_rows(
+    max_model_len: int,
+    total_seq_lens: int,
+) -> int:
+    known_k_rows = max(int(max_model_len), int(total_seq_lens), 0)
+    if known_k_rows > 0:
+        return known_k_rows
+    return _get_b12x_indexer_paged_supertile_k()
+
+
+def _b12x_profile_rows_or_empty(tensor: torch.Tensor, rows: int) -> torch.Tensor:
+    rows = max(1, int(rows))
+    if int(tensor.shape[0]) >= rows:
+        return tensor[:rows].contiguous()
+    return torch.empty(
+        (rows, *tuple(tensor.shape[1:])),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+
+
+def _b12x_profile_weights_2d(
+    weights: torch.Tensor,
+    *,
+    q_rows: int,
+    num_q_heads: int,
+    device: torch.device,
+) -> torch.Tensor:
+    q_rows = max(1, int(q_rows))
+    num_q_heads = int(num_q_heads)
+    if (
+        weights.ndim == 2
+        and int(weights.shape[0]) >= q_rows
+        and int(weights.shape[1]) == num_q_heads
+        and weights.dtype == torch.float32
+        and weights.device == device
+    ):
+        return weights[:q_rows].contiguous()
+    return torch.empty(
+        (q_rows, num_q_heads),
+        dtype=torch.float32,
+        device=device,
+    )
 
 
 def _b12x_sparse_indexer_requested(enabled: bool | None = None) -> bool:
@@ -260,6 +311,177 @@ def _run_b12x_paged_topk(
     )
 
 
+def _prewarm_b12x_paged_indexer_prefill(
+    *,
+    q_quant: torch.Tensor,
+    weights: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_tokens: int,
+    profile_q_rows: int,
+    profile_k_rows: int,
+) -> None:
+    if int(kv_cache.shape[0]) <= 0:
+        return
+
+    q_rows = max(1, int(profile_q_rows))
+    k_rows = max(1, int(profile_k_rows))
+    num_q_heads = int(q_quant.shape[1])
+    page_table_width = max(
+        1,
+        (k_rows + _B12X_PAGED_INDEX_PAGE_SIZE - 1)
+        // _B12X_PAGED_INDEX_PAGE_SIZE,
+    )
+    q_warm = _b12x_profile_rows_or_empty(q_quant, q_rows)
+    weights_warm = _b12x_profile_weights_2d(
+        weights,
+        q_rows=q_rows,
+        num_q_heads=num_q_heads,
+        device=q_quant.device,
+    )
+    seq_lens = torch.full(
+        (q_rows,),
+        k_rows,
+        dtype=torch.int32,
+        device=q_quant.device,
+    )
+    block_table = torch.zeros(
+        (1, page_table_width),
+        dtype=torch.int32,
+        device=q_quant.device,
+    ).expand(q_rows, page_table_width)
+    topk_indices = torch.empty(
+        (q_rows, int(topk_tokens)),
+        dtype=torch.int32,
+        device=q_quant.device,
+    )
+    _run_b12x_paged_topk(
+        q_fp8=q_warm,
+        weights=weights_warm,
+        kv_cache=kv_cache,
+        seq_lens=seq_lens,
+        block_table=block_table,
+        schedule_metadata=None,
+        topk_indices=topk_indices,
+        topk_tokens=int(topk_tokens),
+        shared_page_table=True,
+    )
+
+
+def _prewarm_b12x_contiguous_prefill_variants(
+    *,
+    q_quant: torch.Tensor,
+    weights: torch.Tensor,
+    topk_tokens: int,
+    profile_q_rows: int,
+) -> None:
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None or q_quant.dtype != fp8_dtype:
+        return
+    if q_quant.device.type != "cuda":
+        return
+    if q_quant.ndim != 3 or int(q_quant.shape[2]) != _B12X_PAGED_INDEX_HEAD_DIM:
+        return
+
+    try:
+        from b12x.attention.indexer.contiguous_kernel import (
+            run_contiguous_logits_kernel,
+        )
+        from b12x.attention.indexer.tiled_topk import run_tiled_topk
+    except (AttributeError, ImportError, ModuleNotFoundError):
+        return
+
+    q_rows = max(1, int(profile_q_rows))
+    num_q_heads = int(q_quant.shape[1])
+    topk = int(topk_tokens)
+    q_warm = _b12x_profile_rows_or_empty(q_quant, q_rows)
+    weights_warm = _b12x_profile_weights_2d(
+        weights,
+        q_rows=q_rows,
+        num_q_heads=num_q_heads,
+        device=q_quant.device,
+    )
+
+    for block_k in (
+        _B12X_CONTIGUOUS_PREFILL_BLOCK_K,
+        _B12X_CONTIGUOUS_PREFILL512_BLOCK_K,
+    ):
+        if (
+            block_k == _B12X_CONTIGUOUS_PREFILL512_BLOCK_K
+            and (
+                q_rows < _B12X_CONTIGUOUS_PREFILL512_MIN_Q_ROWS
+                or num_q_heads not in _B12X_CONTIGUOUS_PREFILL512_SUPPORTED_HEADS
+            )
+        ):
+            continue
+        k_rows = max(block_k, topk, 1)
+        if block_k == _B12X_CONTIGUOUS_PREFILL512_BLOCK_K:
+            k_rows = max(k_rows, _B12X_CONTIGUOUS_PREFILL512_MIN_K_ROWS)
+        k_rows = (k_rows + block_k - 1) // block_k * block_k
+        k_quant = torch.empty(
+            (k_rows, _B12X_PAGED_INDEX_HEAD_DIM),
+            dtype=fp8_dtype,
+            device=q_quant.device,
+        )
+        k_scale = torch.empty((k_rows,), dtype=torch.float32, device=q_quant.device)
+        k_start = torch.zeros((q_rows,), dtype=torch.int32, device=q_quant.device)
+        k_end = torch.full(
+            (q_rows,),
+            k_rows,
+            dtype=torch.int32,
+            device=q_quant.device,
+        )
+        num_q_tiles = (
+            q_rows + _B12X_PAGED_INDEX_TILE_BLOCK_Q - 1
+        ) // _B12X_PAGED_INDEX_TILE_BLOCK_Q
+        num_k_tiles = (k_rows + block_k - 1) // block_k
+        tile_logits = torch.empty(
+            (
+                num_q_tiles
+                * num_k_tiles
+                * _B12X_PAGED_INDEX_TILE_BLOCK_Q
+                * block_k,
+            ),
+            dtype=torch.float32,
+            device=q_quant.device,
+        )
+        output_values = torch.empty(
+            (q_rows, topk),
+            dtype=torch.float32,
+            device=q_quant.device,
+        )
+        output_indices = torch.empty(
+            (q_rows, topk),
+            dtype=torch.int32,
+            device=q_quant.device,
+        )
+        run_contiguous_logits_kernel(
+            q_fp8=q_warm,
+            weights=weights_warm,
+            k_quant=k_quant,
+            k_scale=k_scale,
+            k_start=k_start,
+            k_end=k_end,
+            preinitialize_invalid_logits=True,
+            tile_logits=tile_logits,
+            tile_k_offset=0,
+            tile_num_k_tiles=num_k_tiles,
+            prefill_block_k=block_k,
+        )
+        run_tiled_topk(
+            tile_logits=tile_logits,
+            k_start=None,
+            lengths=k_end,
+            topk=topk,
+            block_q=_B12X_PAGED_INDEX_TILE_BLOCK_Q,
+            block_k=block_k,
+            output_values=output_values,
+            output_indices=output_indices,
+            num_k_tiles=num_k_tiles,
+            input_extent=k_rows,
+            zero_row_start=True,
+        )
+
+
 def _reserve_b12x_paged_indexer_scratch(
     *,
     q_rows: int,
@@ -332,11 +554,15 @@ def sparse_attn_indexer(
             profile_q_rows = _get_b12x_paged_indexer_profile_q_rows(
                 int(q_quant.shape[0])
             )
+            profile_k_rows = _get_b12x_paged_indexer_profile_k_rows(
+                max_model_len=max_model_len,
+                total_seq_lens=total_seq_lens,
+            )
             _reserve_b12x_paged_indexer_scratch(
                 q_rows=profile_q_rows,
                 num_q_heads=int(q_quant.shape[1]),
                 topk_tokens=int(topk_tokens),
-                total_k_rows=total_seq_lens,
+                total_k_rows=profile_k_rows,
                 device=q_quant.device,
                 shared_page_table=False,
             )
@@ -344,9 +570,23 @@ def sparse_attn_indexer(
                 q_rows=profile_q_rows,
                 num_q_heads=int(q_quant.shape[1]),
                 topk_tokens=int(topk_tokens),
-                total_k_rows=total_seq_lens,
+                total_k_rows=profile_k_rows,
                 device=q_quant.device,
                 shared_page_table=True,
+            )
+            _prewarm_b12x_paged_indexer_prefill(
+                q_quant=q_quant,
+                weights=weights,
+                kv_cache=kv_cache,
+                topk_tokens=int(topk_tokens),
+                profile_q_rows=profile_q_rows,
+                profile_k_rows=profile_k_rows,
+            )
+            _prewarm_b12x_contiguous_prefill_variants(
+                q_quant=q_quant,
+                weights=weights,
+                topk_tokens=int(topk_tokens),
+                profile_q_rows=profile_q_rows,
             )
         else:
             # Reserve workspace for indexer during profiling run.
