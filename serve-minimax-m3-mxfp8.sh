@@ -203,7 +203,7 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}" \
   --trust-remote-code \
   --host "${HOST}" \
   --port "${PORT}" \
-  --tensor-parallel-size 3 \
+  --tensor-parallel-size 4 \
   --mm-encoder-tp-mode data \
   --gpu-memory-utilization 0.98 \
   --max-num-batched-tokens 2048 \
