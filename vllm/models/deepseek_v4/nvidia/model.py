@@ -1061,12 +1061,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         from b12x.integration.residual import B12XMHCScratchCaps, plan_mhc_scratch
 
         tokens = int(x.shape[0])
-        expected_m = int(expected_m)
+        del expected_m
         plan = plan_mhc_scratch(
             B12XMHCScratchCaps(
                 device=x.device,
                 dtype=x.dtype,
-                max_tokens=max(1, tokens, expected_m),
+                max_tokens=max(1, tokens),
                 hidden_size=self.hidden_size,
                 split_k=self._b12x_mhc_split_k,
             )
@@ -1079,7 +1079,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             post=post,
             comb=comb,
             out=out,
-            expected_m=expected_m,
         )
 
     def _run_b12x_mhc_pre(
@@ -1158,7 +1157,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         from b12x.integration.residual import b12x_mhc_post_pre
 
         norm_weight = self._require_b12x_mhc_norm_weight(norm_weight)
-        expected_m = self._b12x_mhc_expected_m(int(residual.shape[0]))
         if torch.compiler.is_compiling():
             return b12x_mhc_post_pre(
                 x,
@@ -1175,7 +1173,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=norm_eps,
                 split_k=self._b12x_mhc_split_k,
                 block_k=self._b12x_mhc_block_k,
-                expected_m=expected_m,
             )
 
         tokens, hc_mult, hidden_size = residual.shape
@@ -1191,7 +1188,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         binding = self._get_b12x_mhc_binding(
             residual,
-            expected_m=expected_m,
+            expected_m=self._b12x_mhc_expected_m(int(residual.shape[0])),
             y=y_out,
             post=post_out,
             comb=comb_out,
@@ -1212,7 +1209,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_eps=norm_eps,
             binding=binding,
             block_k=self._b12x_mhc_block_k,
-            expected_m=expected_m,
         )
 
     def hc_pre(
