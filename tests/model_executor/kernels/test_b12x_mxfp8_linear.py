@@ -25,6 +25,10 @@ from vllm.model_executor.kernels.linear.mxfp8.b12x import (
 from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
     Mxfp8LinearLayerConfig,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
+    B12xFp8BlockScaledMMKernel,
+    _b12x_fp8_block_scaled_linear,
+)
 from vllm.platforms import PlatformEnum
 
 
@@ -114,45 +118,22 @@ def test_b12x_mxfp8_can_implement_requires_opt_in(monkeypatch) -> None:
     assert reason is None
 
 
-def test_b12x_mxfp8_expected_m_uses_stable_serving_regimes(
-    monkeypatch,
-) -> None:
-    import vllm.model_executor.kernels.linear.mxfp8.b12x as b12x_mod
-
-    monkeypatch.setattr(b12x_mod, "get_current_vllm_config_or_none", lambda: None)
-
+def test_b12x_mxfp8_expected_m_uses_live_m() -> None:
     assert _b12x_mxfp8_expected_m(0) == 1
     assert _b12x_mxfp8_expected_m(1) == 1
     assert _b12x_mxfp8_expected_m(2) == 2
     assert _b12x_mxfp8_expected_m(8) == 8
-    assert _b12x_mxfp8_expected_m(9) == 64
-    assert _b12x_mxfp8_expected_m(128) == 64
-    assert _b12x_mxfp8_expected_m(129) == 2048
-    assert _b12x_mxfp8_expected_m(191) == 2048
-
-
-def test_b12x_mxfp8_expected_m_uses_scheduler_prefill_regime(
-    monkeypatch,
-) -> None:
-    import vllm.model_executor.kernels.linear.mxfp8.b12x as b12x_mod
-
-    vllm_config = VllmConfig()
-    vllm_config.scheduler_config.max_num_batched_tokens = 4096
-    monkeypatch.setattr(
-        b12x_mod,
-        "get_current_vllm_config_or_none",
-        lambda: vllm_config,
-    )
-
-    assert _b12x_mxfp8_expected_m(129) == 4096
-    assert _b12x_mxfp8_expected_m(2048) == 4096
+    assert _b12x_mxfp8_expected_m(9) == 9
+    assert _b12x_mxfp8_expected_m(128) == 128
+    assert _b12x_mxfp8_expected_m(129) == 129
+    assert _b12x_mxfp8_expected_m(2048) == 2048
 
 
 def test_b12x_mxfp8_warmup_token_counts_cover_serving_regimes() -> None:
     assert _b12x_mxfp8_warmup_token_counts(
         max_tokens=2048,
         cudagraph_capture_sizes=[1, 2, 4, 8],
-    ) == (1, 2, 4, 8, 64, 2048)
+    ) == (1, 2, 4, 8, 2048)
 
 
 def test_warmup_b12x_mxfp8_linear_dedupes_weight_signatures(
@@ -168,7 +149,9 @@ def test_warmup_b12x_mxfp8_linear_dedupes_weight_signatures(
         *,
         bias: torch.Tensor | None = None,
         expected_m: int | None = None,
+        stream: object = None,
     ) -> torch.Tensor:
+        del stream
         calls.append((source.shape, packed_weight, bias, expected_m))
         return source.new_empty((source.shape[0], packed_weight.out_features))
 
@@ -208,21 +191,19 @@ def test_warmup_b12x_mxfp8_linear_dedupes_weight_signatures(
         cudagraph_capture_sizes=[1, 2],
     )
 
-    assert warmed == 8
+    assert warmed == 6
     assert [call[0] for call in calls] == [
         torch.Size([1, 128]),
         torch.Size([2, 128]),
-        torch.Size([64, 128]),
         torch.Size([2048, 128]),
         torch.Size([1, 128]),
         torch.Size([2, 128]),
-        torch.Size([64, 128]),
         torch.Size([2048, 128]),
     ]
-    assert [call[3] for call in calls[:4]] == [1, 2, 64, 2048]
-    assert [call[3] for call in calls[4:]] == [1, 2, 64, 2048]
+    assert [call[3] for call in calls[:3]] == [1, 2, 2048]
+    assert [call[3] for call in calls[3:]] == [1, 2, 2048]
     assert calls[0][1] is packed_a
-    assert calls[4][1] is packed_b
+    assert calls[3][1] is packed_b
 
 
 def test_b12x_mxfp8_disabled_support_check_skips_import(monkeypatch) -> None:
@@ -322,7 +303,9 @@ def test_b12x_mxfp8_apply_uses_packed_weight(monkeypatch) -> None:
         *,
         bias: torch.Tensor | None = None,
         expected_m: int | None = None,
+        stream: object = None,
     ) -> torch.Tensor:
+        del stream
         calls.append((source, packed_weight, bias, expected_m))
         return source.new_full((source.shape[0], packed_weight.out_features), 3.0)
 
@@ -400,7 +383,9 @@ def test_b12x_mxfp8_custom_op_body_uses_forward_context(monkeypatch) -> None:
         *,
         bias: torch.Tensor | None = None,
         expected_m: int | None = None,
+        stream: object = None,
     ) -> torch.Tensor:
+        del stream
         calls.append((source, packed_weight, bias, expected_m))
         return source.new_full((source.shape[0], packed_weight.out_features), 11.0)
 
@@ -430,3 +415,81 @@ def test_b12x_mxfp8_custom_op_body_uses_forward_context(monkeypatch) -> None:
     assert called_bias is bias
     assert expected_m == 6
     torch.testing.assert_close(output, torch.full_like(output, 11.0))
+
+
+def test_b12x_block_fp8_compile_path_uses_forward_context_custom_op(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def op(
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+        layer_name: str,
+        out_features: int,
+    ) -> torch.Tensor:
+        calls.append((x, bias, layer_name, out_features))
+        return x.new_full((*x.shape[:-1], out_features), 13.0)
+
+    monkeypatch.setattr(torch.ops.vllm, "b12x_fp8_block_scaled_linear", op)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+
+    layer = torch.nn.Module()
+    layer.prefix = "model.layers.3.mlp.down_proj"
+    packed = types.SimpleNamespace(out_features=24)
+    layer.b12x_packed_weight = packed
+    x = torch.empty((2, 3, 128), dtype=torch.bfloat16)
+    bias = torch.empty((24,), dtype=torch.bfloat16)
+    kernel = object.__new__(B12xFp8BlockScaledMMKernel)
+    kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
+
+    output = kernel.apply_weights(layer, x, bias)
+
+    assert output.shape == (2, 3, 24)
+    assert output.dtype == x.dtype
+    assert len(calls) == 1
+    source, called_bias, layer_name, out_features = calls[0]
+    assert source is x
+    assert called_bias is bias
+    assert getattr(layer_name, "value", layer_name) == layer.prefix
+    assert out_features == 24
+    torch.testing.assert_close(output, torch.full_like(output, 13.0))
+
+
+def test_b12x_block_fp8_custom_op_body_uses_forward_context(monkeypatch) -> None:
+    import vllm.model_executor.kernels.linear.scaled_mm.b12x as b12x_mod
+
+    calls = []
+
+    def run(
+        input_2d: torch.Tensor,
+        packed_weight,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        calls.append((input_2d, packed_weight, bias))
+        return input_2d.new_full(
+            (input_2d.shape[0], packed_weight.out_features),
+            17.0,
+        )
+
+    monkeypatch.setattr(b12x_mod, "_run_b12x_fp8_block_scaled_linear", run)
+
+    layer = torch.nn.Module()
+    layer.prefix = "model.layers.4.mlp.gate_up_proj"
+    packed = types.SimpleNamespace(out_features=40)
+    layer.b12x_packed_weight = packed
+    x = torch.empty((2, 3, 128), dtype=torch.bfloat16)
+    bias = torch.empty((40,), dtype=torch.bfloat16)
+    vllm_config = VllmConfig()
+    vllm_config.compilation_config.static_forward_context[layer.prefix] = layer
+
+    with set_forward_context({}, vllm_config):
+        output = _b12x_fp8_block_scaled_linear(x, bias, layer.prefix, 40)
+
+    assert output.shape == (2, 3, 40)
+    assert len(calls) == 1
+    source, called_packed, called_bias = calls[0]
+    assert source.shape == (6, 128)
+    assert called_packed is packed
+    assert called_bias is bias
+    torch.testing.assert_close(output, torch.full_like(output, 17.0))
