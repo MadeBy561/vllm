@@ -127,7 +127,9 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionType,
+    CommonAttentionBatchTopology,
     CommonAttentionMetadata,
+    exact_attention_metadata_cache_key,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
@@ -2327,6 +2329,14 @@ class GPUModelRunner(
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
+            batch_topology=CommonAttentionBatchTopology(
+                query_start_loc_np=self.query_start_loc.cpu[
+                    : num_reqs_padded + 1
+                ].numpy(),
+                num_reqs=num_reqs_padded,
+                max_query_len=max_query_len,
+                max_seq_len_upper_bound=max_seq_len,
+            ),
         )
 
         if self.dcp_world_size > 1:
@@ -2358,6 +2368,7 @@ class GPUModelRunner(
         cached_attn_metadata: dict[
             tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
         ] = {}
+        exact_cached_attn_metadata: dict[tuple[Any, ...], AttentionMetadata] = {}
 
         def _build_attn_group_metadata(
             kv_cache_gid: int,
@@ -2371,11 +2382,16 @@ class GPUModelRunner(
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
             cache_key = (kv_cache_spec, type(builder))
-
             cascade_attn_prefix_len = (
                 cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
                 if cascade_attn_prefix_lens
                 else 0
+            )
+            exact_cache_key = exact_attention_metadata_cache_key(
+                kv_cache_spec,
+                type(builder),
+                cascade_attn_prefix_len,
+                common_attn_metadata,
             )
 
             extra_attn_metadata_args = {}
@@ -2402,6 +2418,11 @@ class GPUModelRunner(
                     common_attn_metadata
                 )
             elif (
+                builder.supports_exact_metadata_reuse
+                and exact_cache_key in exact_cached_attn_metadata
+            ):
+                attn_metadata_i = exact_cached_attn_metadata[exact_cache_key]
+            elif (
                 cache_key in cached_attn_metadata
                 and builder.supports_update_block_table
             ):
@@ -2418,6 +2439,8 @@ class GPUModelRunner(
                 )
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
+                if builder.supports_exact_metadata_reuse:
+                    exact_cached_attn_metadata[exact_cache_key] = attn_metadata_i
 
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
