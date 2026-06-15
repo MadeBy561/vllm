@@ -28,7 +28,6 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_post_tilelang,
 )
-from vllm.model_executor.kernels.mhc.triton import hc_head_fused_kernel_triton
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -253,26 +252,14 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         hidden_states = hidden_states.view(
             -1, mtp_layer.hc_mult, mtp_layer.config.hidden_size
         )
-        if torch.compiler.is_compiling() or (
-            mtp_layer.mtp_block._should_run_b12x_mhc(int(hidden_states.shape[0]))
-        ):
-            hidden_states = hc_head_fused_kernel_triton(
-                hidden_states,
-                mtp_layer.hc_head_fn,
-                mtp_layer.hc_head_scale,
-                mtp_layer.hc_head_base,
-                mtp_layer.rms_norm_eps,
-                mtp_layer.hc_eps,
-            )
-        else:
-            hidden_states = hc_head_fused_kernel_tilelang(
-                hidden_states,
-                mtp_layer.hc_head_fn,
-                mtp_layer.hc_head_scale,
-                mtp_layer.hc_head_base,
-                mtp_layer.rms_norm_eps,
-                mtp_layer.hc_eps,
-            )
+        hidden_states = hc_head_fused_kernel_tilelang(
+            hidden_states,
+            mtp_layer.hc_head_fn,
+            mtp_layer.hc_head_scale,
+            mtp_layer.hc_head_base,
+            mtp_layer.rms_norm_eps,
+            mtp_layer.hc_eps,
+        )
         hidden_states = mtp_shared_head_rmsnorm(
             hidden_states,
             mtp_layer.shared_head.norm.weight.data,
