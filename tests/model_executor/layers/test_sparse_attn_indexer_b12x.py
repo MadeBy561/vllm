@@ -570,6 +570,145 @@ def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
             topk,
             "packed_contiguous",
         ),
+        (
+            "indexer_plan",
+            "paged",
+            "prefill",
+            True,
+            q_rows,
+            total_seq_lens // 64,
+            topk,
+            "packed_contiguous",
+        ),
+        (
+            "paged_bind",
+            (q_rows, total_seq_lens // 64),
+            (q_rows,),
+            1,
+            True,
+            False,
+        ),
+        (
+            "paged_index_topk",
+            tuple(q_quant.shape),
+            (1, 64 * 132),
+            (64 * 132, 1),
+            64,
+            1,
+        ),
+    ]
+
+
+def test_b12x_profile_uses_max_model_len_for_paged_prefill_warm(monkeypatch):
+    calls: list[tuple] = []
+    _install_fake_b12x_indexer(monkeypatch, calls)
+    workspace_manager = _FakeWorkspaceManager()
+    monkeypatch.setattr(
+        indexer_mod, "current_workspace_manager", lambda: workspace_manager
+    )
+    monkeypatch.setattr(
+        indexer_mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(attn_metadata=None),
+    )
+    monkeypatch.setattr(
+        indexer_mod,
+        "_ensure_b12x_sparse_indexer_supported",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        indexer_mod.current_platform,
+        "fp8_dtype",
+        lambda: torch.uint8,
+        raising=False,
+    )
+    monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
+
+    q_rows = 8192
+    profile_q_rows = 4096
+    topk = 4
+    total_seq_lens = 1024
+    max_model_len = 32768
+    page_table_width = max_model_len // 64
+    hidden_states = torch.empty((q_rows, 128), dtype=torch.bfloat16)
+    kv_cache = torch.empty((1, 64, 132), dtype=torch.uint8)
+    q_quant = torch.empty((q_rows, 1, 128), dtype=torch.uint8)
+    k = torch.empty((total_seq_lens, 128), dtype=torch.uint8)
+    weights = torch.empty((q_rows, 1), dtype=torch.float32)
+    topk_indices_buffer = torch.empty((q_rows, topk), dtype=torch.int32)
+
+    result = indexer_mod.sparse_attn_indexer(
+        hidden_states,
+        "layers.0.attn",
+        kv_cache,
+        q_quant,
+        None,
+        k,
+        weights,
+        128,
+        None,
+        topk_tokens=topk,
+        head_dim=128,
+        max_model_len=max_model_len,
+        total_seq_lens=total_seq_lens,
+        topk_indices_buffer=topk_indices_buffer,
+        skip_k_cache_insert=False,
+        use_fp4_cache=False,
+        use_b12x_sparse_indexer=True,
+    )
+
+    assert result is topk_indices_buffer
+    assert workspace_manager.specs == (
+        ((profile_q_rows, topk), torch.int32),
+        ((profile_q_rows,), torch.int32),
+    )
+    assert calls == [
+        (
+            "indexer_plan",
+            "paged",
+            "decode",
+            False,
+            profile_q_rows,
+            page_table_width,
+            topk,
+            "paged_fused",
+        ),
+        (
+            "indexer_plan",
+            "paged",
+            "prefill",
+            True,
+            profile_q_rows,
+            page_table_width,
+            topk,
+            "packed_contiguous",
+        ),
+        (
+            "indexer_plan",
+            "paged",
+            "prefill",
+            True,
+            profile_q_rows,
+            page_table_width,
+            topk,
+            "packed_contiguous",
+        ),
+        (
+            "paged_bind",
+            (profile_q_rows, page_table_width),
+            (profile_q_rows,),
+            1,
+            True,
+            False,
+        ),
+        (
+            "paged_index_topk",
+            (profile_q_rows, 1, 128),
+            (1, 64 * 132),
+            (64 * 132, 1),
+            64,
+            1,
+        ),
     ]
 
 
