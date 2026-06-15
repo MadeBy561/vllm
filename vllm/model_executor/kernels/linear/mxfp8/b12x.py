@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
     LayerName,
     _encode_layer_name,
+    current_stream,
     direct_register_custom_op,
 )
 
@@ -152,6 +153,7 @@ def _apply_b12x_mxfp8_packed_linear(
         packed_weight,
         bias=bias,
         expected_m=_b12x_mxfp8_expected_m(int(input_2d.shape[0])),
+        stream=current_stream().cuda_stream,
     )
     return output.view(*output_shape)
 
@@ -217,6 +219,7 @@ def warmup_b12x_mxfp8_linear(
                     source,
                     packed_weight,
                     expected_m=_b12x_mxfp8_expected_m(tokens),
+                    stream=current_stream().cuda_stream,
                 )
                 warmed += 1
 
