@@ -865,6 +865,22 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
+        self.register_buffer(
+            "hc_attn_fn_bf16",
+            torch.empty(
+                (mix_hc, hc_dim),
+                dtype=torch.bfloat16,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "hc_ffn_fn_bf16",
+            torch.empty(
+                (mix_hc, hc_dim),
+                dtype=torch.bfloat16,
+            ),
+            persistent=False,
+        )
         self.hc_attn_base = nn.Parameter(
             torch.empty(
                 mix_hc,
@@ -940,6 +956,12 @@ class DeepseekV4DecoderLayer(nn.Module):
     def _should_run_b12x_mhc(self, tokens: int) -> bool:
         del tokens
         return self._use_b12x_mhc
+
+    def refresh_b12x_mhc_bf16_weights(self) -> None:
+        if not self._use_b12x_mhc:
+            return
+        self.hc_attn_fn_bf16.copy_(self.hc_attn_fn.detach().to(torch.bfloat16))
+        self.hc_ffn_fn_bf16.copy_(self.hc_ffn_fn.detach().to(torch.bfloat16))
 
     def _require_b12x_mhc_norm_weight(
         self, norm_weight: torch.Tensor | None
@@ -1056,6 +1078,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor,
         norm_eps: float,
+        hc_fn_bf16: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         from b12x.integration.residual import b12x_mhc_post_pre
 
@@ -1078,6 +1101,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 split_k=self._b12x_mhc_split_k,
                 block_k=self._b12x_mhc_block_k,
                 expected_m=expected_m,
+                fn_bf16=hc_fn_bf16,
             )
 
         tokens, hc_mult, hidden_size = residual.shape
@@ -1115,6 +1139,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             binding=binding,
             block_k=self._b12x_mhc_block_k,
             expected_m=expected_m,
+            fn_bf16=hc_fn_bf16,
         )
 
     def hc_pre(
@@ -1162,6 +1187,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor,
         norm_eps: float,
+        hc_fn_bf16: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._should_run_b12x_mhc(int(residual.shape[0])):
             return self._run_b12x_mhc_post_pre(
@@ -1174,6 +1200,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hc_base,
                 norm_weight,
                 norm_eps,
+                hc_fn_bf16=hc_fn_bf16,
             )
 
         return mhc_fused_post_pre_tilelang(
@@ -1246,6 +1273,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_ffn_base,
                 norm_weight=ffn_norm_weight,
                 norm_eps=ffn_norm_eps,
+                hc_fn_bf16=self.hc_ffn_fn_bf16,
             )
             x = self.ffn(x, input_ids)
             return x, residual, post_mix, res_mix
@@ -1608,6 +1636,9 @@ class DeepseekV4Model(nn.Module):
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
                     continue
+
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            layer.refresh_b12x_mhc_bf16_weights()
 
         return loaded_params
 
