@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from enum import Enum
 
 import torch
@@ -56,6 +57,13 @@ FLASHINFER_NVFP4_MOE_BACKENDS = [
     NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
     NvFp4MoeBackend.FLASHINFER_B12X,
 ]
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def is_global_sf_supported_for_nvfp4_backend(backend: NvFp4MoeBackend) -> bool:
@@ -324,6 +332,7 @@ def convert_to_nvfp4_moe_kernel_format(
     w2_scale_2: torch.Tensor,
     a2_scale: torch.Tensor | None,
     is_act_and_mul: bool,
+    use_a16: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -335,26 +344,50 @@ def convert_to_nvfp4_moe_kernel_format(
     torch.Tensor,
 ]:
     if nvfp4_backend == NvFp4MoeBackend.B12X:
-        (
-            w13,
-            w13_scale,
-            w13_scale_2,
-            a13_scale,
-            w2,
-            w2_scale,
-            w2_scale_2,
-            a2_scale,
-        ) = prepare_nvfp4_moe_layer_for_b12x(
-            w13=w13,
-            w13_scale=w13_scale,
-            w13_scale_2=w13_scale_2,
-            a13_scale=a13_scale,
-            w2=w2,
-            w2_scale=w2_scale,
-            w2_scale_2=w2_scale_2,
-            a2_scale=a2_scale,
-            is_act_and_mul=is_act_and_mul,
-        )
+        if use_a16 or _env_flag("B12X_MOE_FORCE_A16"):
+            (
+                w13,
+                w13_scale,
+                w13_scale_2,
+                a13_scale,
+                w2,
+                w2_scale,
+                w2_scale_2,
+                a2_scale,
+            ) = prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+                backend=NvFp4MoeBackend.FLASHINFER_B12X,
+                layer=layer,
+                w13=w13,
+                w13_scale=w13_scale,
+                w13_scale_2=w13_scale_2,
+                a13_scale=a13_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                w2_scale_2=w2_scale_2,
+                a2_scale=a2_scale,
+                is_act_and_mul=is_act_and_mul,
+            )
+        else:
+            (
+                w13,
+                w13_scale,
+                w13_scale_2,
+                a13_scale,
+                w2,
+                w2_scale,
+                w2_scale_2,
+                a2_scale,
+            ) = prepare_nvfp4_moe_layer_for_b12x(
+                w13=w13,
+                w13_scale=w13_scale,
+                w13_scale_2=w13_scale_2,
+                a13_scale=a13_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                w2_scale_2=w2_scale_2,
+                a2_scale=a2_scale,
+                is_act_and_mul=is_act_and_mul,
+            )
     elif nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
         (
             w13,
