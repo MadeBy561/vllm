@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable, MutableSequence, Sequence
 from itertools import islice
@@ -127,6 +128,16 @@ def _use_b12x_mhc() -> bool:
     if not current_platform.is_device_capability_family(120):
         raise RuntimeError("VLLM_USE_B12X_MHC currently requires an SM120 GPU.")
     return True
+
+
+def _b12x_mhc_max_tokens() -> int:
+    raw = os.environ.get("B12X_MHC_MAX_TOKENS", "16")
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"B12X_MHC_MAX_TOKENS must be an integer, got {raw!r}"
+        ) from exc
 
 
 def _b12x_mhc_decode_expected_m(
@@ -859,6 +870,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_config
         self.layer_name = prefix
         self._use_b12x_mhc = _use_b12x_mhc()
+        self._b12x_mhc_max_tokens = _b12x_mhc_max_tokens() if self._use_b12x_mhc else 0
         self._b12x_mhc_max_num_batched_tokens = int(
             vllm_config.scheduler_config.max_num_batched_tokens
         )
@@ -874,6 +886,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             if prefix in compilation_config.static_forward_context:
                 raise ValueError(f"Duplicate layer name: {prefix}")
             compilation_config.static_forward_context[prefix] = self
+
+            if self._b12x_mhc_max_tokens <= 0:
+                logger.info_once("DeepSeek V4 b12x mHC enabled for all token counts.")
+            else:
+                logger.info_once(
+                    "DeepSeek V4 b12x mHC enabled for token counts <= %d; "
+                    "using TileLang mHC above that.",
+                    self._b12x_mhc_max_tokens,
+                )
 
             logger.info_once("DeepSeek V4 b12x mHC enabled.")
 
@@ -983,8 +1004,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             self._b12x_mhc_split_k = 0
 
     def _should_run_b12x_mhc(self, tokens: int) -> bool:
-        del tokens
-        return self._use_b12x_mhc
+        if not self._use_b12x_mhc:
+            return False
+        max_tokens = self._b12x_mhc_max_tokens
+        tokens = int(tokens)
+        if max_tokens > 0 and tokens > max_tokens:
+            # Large prefill chunks are faster through TileLang mHC. Keep b12x
+            # mHC on decode-sized batches where it is the fast path.
+            return False
+        return True
 
     def _b12x_mhc_prefill_state(self) -> bool | None:
         if not is_forward_context_available():
@@ -1230,7 +1258,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps,
             )
 
-        post_mix, res_mix, layer_input = mhc_pre_tilelang(
+        post_mix, res_mix, layer_input = torch.ops.vllm.mhc_pre_tilelang(
             x,
             hc_fn,
             hc_scale,
@@ -1270,7 +1298,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps,
             )
 
-        return mhc_fused_post_pre_tilelang(
+        return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,
             residual,
             post,
@@ -1349,7 +1377,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if residual is None:
             # Run standalone mhc_pre on first layer
             residual = x
-            post_mix, res_mix, x = mhc_pre_tilelang(
+            post_mix, res_mix, x = torch.ops.vllm.mhc_pre_tilelang(
                 x,
                 self.hc_attn_fn,
                 self.hc_attn_scale,
@@ -1363,7 +1391,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=attn_norm_eps,
             )
         else:
-            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+            residual, post_mix, res_mix, x = torch.ops.vllm.mhc_fused_post_pre_tilelang(
                 x,
                 residual,
                 post_mix,
@@ -1387,7 +1415,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
-        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+        residual, post_mix, res_mix, x = torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,
             residual,
             post_mix,
@@ -1584,7 +1612,7 @@ class DeepseekV4Model(nn.Module):
                     res_mix,
                 )
             else:
-                hidden_states = mhc_post_tilelang(
+                hidden_states = torch.ops.vllm.mhc_post_tilelang(
                     hidden_states, residual, post_mix, res_mix
                 )
 
@@ -1595,7 +1623,7 @@ class DeepseekV4Model(nn.Module):
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = hc_head_fused_kernel_tilelang(
+        hidden_states = torch.ops.vllm.hc_head_fused_kernel_tilelang(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,
