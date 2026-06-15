@@ -29,7 +29,6 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_post_tilelang,
     mhc_pre_tilelang,
 )
-from vllm.model_executor.kernels.mhc.triton import hc_head_fused_kernel_triton
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -1604,27 +1603,14 @@ class DeepseekV4Model(nn.Module):
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        if torch.compiler.is_compiling() or (
-            layer is not None
-            and layer._should_run_b12x_mhc(int(hidden_states.shape[0]))
-        ):
-            hidden_states = hc_head_fused_kernel_triton(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_scale,
-                self.hc_head_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-            )
-        else:
-            hidden_states = hc_head_fused_kernel_tilelang(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_scale,
-                self.hc_head_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-            )
+        hidden_states = hc_head_fused_kernel_tilelang(
+            hidden_states,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+        )
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
