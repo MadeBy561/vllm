@@ -44,7 +44,7 @@ gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.88}"
 max_model_len="${MAX_MODEL_LEN:-200000}"
 max_num_seqs="${MAX_NUM_SEQS:-4}"
 max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-4096}"
-max_cudagraph_capture_size="${MAX_CUDAGRAPH_CAPTURE_SIZE:-128}"
+max_cudagraph_capture_size="${MAX_CUDAGRAPH_CAPTURE_SIZE:-256}"
 load_format="${LOAD_FORMAT:-instanttensor}"
 enable_flashinfer_autotune="${ENABLE_FLASHINFER_AUTOTUNE:-1}"
 
