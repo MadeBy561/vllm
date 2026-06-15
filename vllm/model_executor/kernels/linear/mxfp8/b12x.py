@@ -65,24 +65,7 @@ def _b12x_mxfp8_enabled() -> bool:
 
 
 def _b12x_mxfp8_expected_m(tokens: int) -> int:
-    tokens = int(tokens)
-    if tokens <= 1:
-        return 1
-    if tokens <= 8:
-        return tokens
-    if tokens <= 128:
-        return 64
-
-    vllm_config = get_current_vllm_config_or_none()
-    if vllm_config is not None:
-        max_tokens = getattr(
-            vllm_config.scheduler_config,
-            "max_num_batched_tokens",
-            None,
-        )
-        if max_tokens is not None and int(max_tokens) > 128:
-            return int(max_tokens)
-    return 2048
+    return max(1, int(tokens))
 
 
 def _b12x_mxfp8_warmup_token_counts(
@@ -90,8 +73,8 @@ def _b12x_mxfp8_warmup_token_counts(
     max_tokens: int,
     cudagraph_capture_sizes: Iterable[int] = (),
 ) -> tuple[int, ...]:
-    """Representative live-M values for the B12X MXFP8 dense GEMM regimes."""
-    counts = {1, 64}
+    """Live-M values used to warm B12X MXFP8 dense GEMM."""
+    counts = {1}
     counts.update(int(size) for size in cudagraph_capture_sizes if int(size) > 0)
     if int(max_tokens) > 0:
         counts.add(int(max_tokens))
