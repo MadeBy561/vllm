@@ -55,9 +55,10 @@ def _make_fake_b12x_experts() -> b12x_moe.B12xExperts:
             w1_runtime_alphas=torch.ones(num_experts, dtype=torch.float32),
             w2_runtime_alphas=torch.ones(num_experts, dtype=torch.float32),
             w4a16=None,
+            w4a8_tier=None,
         )
     }
-    experts._released_w4a16_source_scales = False
+    experts._source_params_compacted = False
     experts._unit_scale_by_device = {}
     return experts
 
@@ -160,6 +161,72 @@ def test_b12x_moe_warmup_uses_minimax_swiglu_params(monkeypatch) -> None:
     assert run_calls[0]["scratch"].dtype == torch.uint8
     assert run_calls[0]["scratch"].numel() == 64
     assert run_calls[0]["input_scales_are_reciprocal"] is True
+
+
+def test_b12x_force_a16_nvfp4_selects_w4a16(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+
+    experts = _make_fake_b12x_experts()
+
+    assert experts._quant_mode() == "w4a16"
+
+
+def test_b12x_force_a8_mxfp4_prepares_w4a8_tier(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    monkeypatch.setenv("B12X_FORCE_MOE_A8", "1")
+
+    calls = []
+    w4a8_tier = SimpleNamespace(
+        num_experts=8,
+        hidden_size=256,
+        intermediate_size=128,
+        params_dtype=torch.bfloat16,
+        w13_rp=torch.empty((1,), dtype=torch.uint8),
+    )
+
+    def fake_prepare(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            source_format=kwargs["source_format"],
+            w13_layout=kwargs["w13_layout"],
+            w1_runtime_alphas=None,
+            w2_runtime_alphas=None,
+            w4a16=None,
+            w4a8_tier=w4a8_tier,
+        )
+
+    monkeypatch.setattr(b12x_moe, "_prepare_b12x_fp4_moe_weights", fake_prepare)
+
+    experts = _make_fake_b12x_experts()
+    experts.quant_config.quant_dtype = "mxfp4"
+    experts.quant_config.weight_quant_dtype = "mxfp4"
+    experts.quant_config.g1_alphas = None
+    experts.quant_config.g2_alphas = None
+    experts.quant_config.a1_gscale = None
+    experts.quant_config.a2_gscale = None
+    experts.quant_config.w1_scale = torch.empty((8, 256, 8), dtype=torch.uint8)
+    experts.quant_config.w2_scale = torch.empty((8, 256, 4), dtype=torch.uint8)
+    w1 = torch.empty((8, 256, 128), dtype=torch.uint8)
+    w2 = torch.empty((8, 256, 64), dtype=torch.uint8)
+
+    prepared = experts._get_or_prepare_fp4_moe_weights(
+        w1=w1,
+        w2=w2,
+        activation=MoEActivation.SILU,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert experts._quant_mode() == "w4a8_mx"
+    assert prepared.w4a8_tier is w4a8_tier
+    assert len(calls) == 1
+    assert calls[0]["source_format"] == "fp4_e8m0_k32"
+    assert calls[0]["w13_layout"] == "w31"
+    assert calls[0]["prepare_runtime_alphas"] is False
+    assert calls[0]["prepare_w4a16"] is False
+    assert calls[0]["prepare_w4a8_tier"] is True
+    assert calls[0]["reuse_input_storage"] is True
+    assert torch.equal(calls[0]["w1_global_scale"], torch.ones(8))
+    assert torch.equal(calls[0]["w2_global_scale"], torch.ones(8))
 
 
 def test_warmup_b12x_moe_dynamic_dedupes_signatures(monkeypatch) -> None:
