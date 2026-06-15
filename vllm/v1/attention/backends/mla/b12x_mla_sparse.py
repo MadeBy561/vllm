@@ -302,6 +302,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
     """Builder for B12X_MLA_SPARSE attention metadata."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_exact_metadata_reuse: bool = True
 
     def __init__(
         self,
@@ -369,9 +370,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         # Per-token causal KV length. Hot path (pure decode, one token per req)
         # stays entirely on device and uses stable preallocated buffers.
         if cm.max_query_len <= 1 and num_tokens == cm.num_reqs:
-            self.req_id_per_token_buffer[:num_tokens].copy_(
-                self.req_ids_arange[:num_tokens]
-            )
+            req_id_per_token_tensor = self.req_ids_arange[:num_tokens]
             self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
                 seq_lens_for_req[:num_tokens], non_blocking=True
             )
@@ -457,8 +456,8 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             self.cache_seq_lens_per_req_buffer[: cm.num_reqs].copy_(
                 seq_lens_for_req[: cm.num_reqs], non_blocking=True
             )
+            req_id_per_token_tensor = self.req_id_per_token_buffer[:num_tokens]
 
-        req_id_per_token_tensor = self.req_id_per_token_buffer[:num_tokens]
         cache_seq_lens_per_token = self.cache_seq_lens_per_token_buffer[:num_tokens]
         cache_seq_lens_per_req = self.cache_seq_lens_per_req_buffer[: cm.num_reqs]
 
