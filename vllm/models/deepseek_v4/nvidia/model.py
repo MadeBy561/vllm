@@ -12,7 +12,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 from vllm.distributed import (
     get_ep_group,
@@ -133,13 +133,8 @@ def _b12x_mhc_decode_expected_m(
     tokens: int,
     cudagraph_capture_sizes: Iterable[int],
 ) -> int:
+    del cudagraph_capture_sizes
     tokens = max(1, int(tokens))
-    capture_sizes = sorted(
-        {int(size) for size in cudagraph_capture_sizes if int(size) > 0}
-    )
-    for size in capture_sizes:
-        if tokens <= size:
-            return size
     return tokens
 
 
@@ -152,7 +147,9 @@ def _b12x_mhc_expected_m(
 ) -> int:
     tokens = max(1, int(tokens))
 
-    if is_prefill is True:
+    if tokens < _B12X_MHC_PREFILL_MIN_TOKENS:
+        expected_m = _b12x_mhc_decode_expected_m(tokens, cudagraph_capture_sizes)
+    elif is_prefill is True:
         expected_m = max(tokens, int(max_num_batched_tokens))
     elif is_prefill is False:
         expected_m = _b12x_mhc_decode_expected_m(tokens, cudagraph_capture_sizes)
@@ -1024,6 +1021,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         return None
 
     def _b12x_mhc_expected_m(self, tokens: int) -> int:
+        tokens = max(1, int(tokens))
+        if is_forward_context_available():
+            forward_context = get_forward_context()
+            batch_descriptor = forward_context.batch_descriptor
+            if (
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and batch_descriptor is not None
+                and bool(getattr(batch_descriptor, "uniform", False))
+            ):
+                return tokens
+
         return _b12x_mhc_expected_m(
             tokens,
             is_prefill=self._b12x_mhc_prefill_state(),
