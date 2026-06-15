@@ -12,6 +12,7 @@ import vllm.envs as envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import current_stream
 
 from .BlockScaledMMLinearKernel import (
     Fp8BlockScaledMMLinearKernel,
@@ -65,6 +66,7 @@ def _run_b12x_fp8_block_scaled_linear(
         packed_weight=packed_weight,
         bias=bias,
         expected_m=tokens,
+        stream=current_stream().cuda_stream,
     )
 
 
