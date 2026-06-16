@@ -312,6 +312,44 @@ class Parser:
         """
 
 
+def _merge_tool_delta_messages(acc, step):
+    """Merge streaming DeltaMessages produced by draining an incremental tool
+    parser within one delta into a single DeltaMessage. Tool calls merge by
+    index (name/id/type set once, arguments concatenated); content concatenates.
+    """
+    if step is None:
+        return acc
+    if acc is None:
+        return step
+    if getattr(step, "content", None):
+        acc.content = (acc.content or "") + step.content
+    if getattr(step, "tool_calls", None):
+        if acc.tool_calls is None:
+            acc.tool_calls = []
+        by_index = {tc.index: tc for tc in acc.tool_calls}
+        for tc in step.tool_calls:
+            existing = by_index.get(tc.index)
+            if existing is None:
+                acc.tool_calls.append(tc)
+                by_index[tc.index] = tc
+                continue
+            if tc.id is not None:
+                existing.id = tc.id
+            if getattr(tc, "type", None) is not None:
+                existing.type = tc.type
+            if tc.function is not None:
+                if existing.function is None:
+                    existing.function = tc.function
+                else:
+                    if tc.function.name is not None:
+                        existing.function.name = tc.function.name
+                    if tc.function.arguments:
+                        existing.function.arguments = (
+                            existing.function.arguments or ""
+                        ) + tc.function.arguments
+    return acc
+
+
 class DelegatingParser(Parser):
     """
     A Parser implementation that delegates to separate ReasoningParser and
@@ -750,31 +788,59 @@ class DelegatingParser(Parser):
             # A boundary delta may carry both reasoning and tool call,
             # save it before the tool parser overwrites delta_message.
             reasoning = delta_message.reasoning if delta_message else None
-            delta_message, state.function_name_returned = (
-                self._extract_tool_calls_streaming(
-                    previous_text=state.previous_text,
-                    current_text=current_text,
-                    delta_text=delta_text,
-                    previous_token_ids=state.previous_token_ids,
-                    current_token_ids=current_token_ids,
-                    delta_token_ids=delta_token_ids,
-                    request=request,  # type: ignore[arg-type]
-                    tool_call_idx=state.history_tool_call_cnt,
-                    tool_call_id_type=state.tool_call_id_type,
-                    function_name_returned=state.function_name_returned,
+            # DRAIN (spec-decode fix): a burst delta can carry several
+            # incremental-parser steps of tool-call text at once. The tool
+            # parser advances one step per call, so call it repeatedly until it
+            # stops making progress, merging emitted argument fragments. A
+            # non-empty previous_text after the first call stops the tool parser
+            # re-resetting its per-message state; we de-dup the content the
+            # passthrough path re-returns each call and stop on no progress.
+            merged_tool_msg = None
+            prev_text_for_call = state.previous_text
+            last_content = None
+            for _drain_i in range(64):
+                step_msg, state.function_name_returned = (
+                    self._extract_tool_calls_streaming(
+                        previous_text=prev_text_for_call,
+                        current_text=current_text,
+                        delta_text=delta_text,
+                        previous_token_ids=state.previous_token_ids,
+                        current_token_ids=current_token_ids,
+                        delta_token_ids=delta_token_ids,
+                        request=request,  # type: ignore[arg-type]
+                        tool_call_idx=state.history_tool_call_cnt,
+                        tool_call_id_type=state.tool_call_id_type,
+                        function_name_returned=state.function_name_returned,
+                    )
                 )
-            )
+                prev_text_for_call = current_text
+                if step_msg is None:
+                    break
+                step_tcs = list(step_msg.tool_calls or [])
+                new_content = (
+                    step_msg.content
+                    if (step_msg.content and step_msg.content != last_content)
+                    else None
+                )
+                if step_msg.content:
+                    last_content = step_msg.content
+                if step_tcs and step_tcs[0].id is not None:
+                    state.history_tool_call_cnt += 1
+                if step_tcs or new_content is not None:
+                    piece = DeltaMessage(content=new_content)
+                    if step_tcs:
+                        piece.tool_calls = step_tcs
+                    merged_tool_msg = _merge_tool_delta_messages(
+                        merged_tool_msg, piece
+                    )
+                if not step_tcs and new_content is None:
+                    break
+            delta_message = merged_tool_msg
+
             if reasoning:
                 if not delta_message:
                     delta_message = DeltaMessage()
                 delta_message.reasoning = reasoning
-
-            if (
-                delta_message
-                and delta_message.tool_calls
-                and delta_message.tool_calls[0].id is not None
-            ):
-                state.history_tool_call_cnt += 1
 
         # No phase active: pass through as content
         if (

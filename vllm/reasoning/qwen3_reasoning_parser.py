@@ -72,6 +72,13 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
                 # Found <think> before </think> or <tool_call>
                 return False
             if token_id == end_token_id:
+                # An empty, adjacent <think></think> pair is a chat-template
+                # example (e.g. the tool-use note "do not call functions inside
+                # <think></think> tags"), not a real end of generated reasoning.
+                # Treating it as a reasoning-end makes the serving layer skip the
+                # reasoning parser and leak the model's reasoning into content.
+                if i > 0 and input_ids[i - 1] == start_token_id:
+                    continue
                 return True
             if tool_call_token_id is not None and token_id == tool_call_token_id:
                 # Only treat as implicit reasoning end if this <tool_call>
