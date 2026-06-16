@@ -16,6 +16,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_attn_backend,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     AttentionStatePair,
     BatchExecutionDescriptor,
@@ -194,6 +195,20 @@ class DraftModelSpeculator(BaseSpeculator):
             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
         ]
         slot_mappings = self.block_tables.slot_mappings[:, :num_tokens_padded]
+        seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+        dcp_local_seq_lens = None
+        if self.block_tables.cp_size > 1:
+            prepare_dcp_local_seq_lens(
+                self.input_buffers.dcp_local_seq_lens,
+                self.input_buffers.seq_lens,
+                num_reqs,
+                self.block_tables.cp_size,
+                self.block_tables.cp_rank,
+                self.block_tables.cp_interleave,
+            )
+            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[
+                :num_reqs_padded
+            ]
         with record_function_or_nullcontext(
             "vllm:v2/speculator/build_attn_metadata"
         ):
@@ -206,12 +221,13 @@ class DraftModelSpeculator(BaseSpeculator):
                 ],
                 query_start_loc_cpu=query_start_loc_cpu,
                 max_query_len=num_query_per_req,
-                seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
+                seq_lens=seq_lens,
                 max_seq_len=self.draft_max_seq_len,
                 block_tables=block_tables,
                 slot_mappings=slot_mappings,
                 kv_cache_config=self.kv_cache_config,
                 causal=causal,
+                dcp_local_seq_lens=dcp_local_seq_lens,
             )
         return attn_metadata
 
