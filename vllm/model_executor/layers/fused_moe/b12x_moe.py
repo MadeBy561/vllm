@@ -3,6 +3,8 @@
 """B12X modular fused-MoE backend for FP4 weights."""
 
 import os
+import re
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -32,6 +34,7 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 _moe_repeat_check_reports = 0
+_activation_amax_save_step = 0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -52,6 +55,14 @@ def _env_int(name: str, default: int) -> int:
             "Ignoring invalid integer environment value %s=%r", name, value
         )
         return default
+
+
+def _env_first(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return value
+    return None
 
 
 def _moe_repeat_check_enabled() -> bool:
@@ -80,6 +91,32 @@ def _moe_force_a16_enabled() -> bool:
     return _env_flag("B12X_MOE_FORCE_A16")
 
 
+def _moe_activation_amax_enabled() -> bool:
+    return _env_flag("VLLM_B12X_MOE_ACTIVATION_AMAX")
+
+
+def _moe_activation_amax_save_every() -> int:
+    value = _env_first(
+        "VLLM_B12X_MOE_ACTIVATION_AMAX_SAVE_EVERY",
+    )
+    if value is None:
+        return 0
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        logger.warning_once(
+            "Ignoring invalid B12X MoE activation-amax save interval %r",
+            value,
+        )
+        return 0
+
+
+def _moe_activation_amax_file() -> str | None:
+    return _env_first(
+        "VLLM_B12X_MOE_ACTIVATION_AMAX_FILE",
+    )
+
+
 def _is_w4a8_quant_mode(quant_mode: str) -> bool:
     return quant_mode in ("w4a8_mx", "w4a8_nvfp4")
 
@@ -100,6 +137,264 @@ def _ceil_div(a: int, b: int) -> int:
     return (int(a) + int(b) - 1) // int(b)
 
 
+_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+class _B12XMoeActivationAmaxState:
+    def __init__(
+        self,
+        *,
+        model_tag: str,
+        device: torch.device,
+        num_experts: int,
+    ) -> None:
+        self.model_tag = model_tag
+        self.device = device
+        self.num_experts = int(num_experts)
+        self.tensor = torch.zeros(
+            (0, self.num_experts, 2),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.owner_slots: dict[int, int] = {}
+        self.layers: dict[int, dict[str, Any]] = {}
+        self.used = False
+
+    def _next_free_slot(self) -> int:
+        slot = 0
+        while slot in self.layers:
+            slot += 1
+        return slot
+
+    def _grow_to(self, rows: int) -> None:
+        rows = int(rows)
+        if rows <= int(self.tensor.shape[0]):
+            return
+        if self.used or _is_current_stream_capturing():
+            raise RuntimeError(
+                "B12X MoE activation-amax tensor would reallocate after use. "
+                "All calibrated W4A16 MoE layers must be registered before "
+                "CUDA graph capture or first launch."
+            )
+        grown = torch.zeros(
+            (rows, self.num_experts, 2),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if self.tensor.numel():
+            grown[: self.tensor.shape[0]].copy_(self.tensor)
+        self.tensor = grown
+
+    def register(
+        self,
+        *,
+        owner: object,
+        prefix: str,
+        external_layer_idx: int | None,
+        slot_hint: int | None,
+    ) -> int:
+        owner_id = id(owner)
+        existing = self.owner_slots.get(owner_id)
+        if existing is not None:
+            return existing
+
+        slot = int(slot_hint) if slot_hint is not None else self._next_free_slot()
+        if slot < 0:
+            raise ValueError(
+                f"B12X MoE activation-amax slot must be non-negative: {slot}"
+            )
+
+        occupant = self.layers.get(slot)
+        if occupant is not None and occupant.get("owner_id") != owner_id:
+            raise RuntimeError(
+                "B12X MoE activation-amax slot collision for "
+                f"{self.model_tag!r} slot {slot}: {prefix!r} conflicts with "
+                f"{occupant.get('prefix')!r}."
+            )
+
+        self._grow_to(slot + 1)
+        self.owner_slots[owner_id] = slot
+        self.layers[slot] = {
+            "owner_id": owner_id,
+            "slot": slot,
+            "prefix": prefix,
+            "external_layer_idx": external_layer_idx,
+        }
+        return slot
+
+    def mark_used(self) -> None:
+        self.used = True
+
+    def payload(self, step: int) -> dict[str, Any]:
+        layers = [
+            {
+                key: value
+                for key, value in self.layers.get(slot, {"slot": slot}).items()
+                if key != "owner_id"
+            }
+            for slot in range(int(self.tensor.shape[0]))
+        ]
+        return {
+            "step": int(step),
+            "model": self.model_tag,
+            "device": str(self.device),
+            "num_experts": self.num_experts,
+            "columns": ("fc1", "fc2"),
+            "layers": layers,
+            "activation_amax": self.tensor.detach().cpu(),
+        }
+
+
+_activation_amax_states: dict[
+    tuple[str, str, int], _B12XMoeActivationAmaxState
+] = {}
+
+
+def _parse_layer_index(prefix: str) -> int | None:
+    match = _LAYER_INDEX_RE.search(prefix)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _current_config_num_hidden_layers() -> int | None:
+    try:
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+    except Exception:
+        return None
+
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+    if num_hidden_layers is None:
+        return None
+    return int(num_hidden_layers)
+
+
+def _activation_amax_model_tag(
+    prefix: str,
+    external_layer_idx: int | None,
+    base_num_layers: int | None,
+) -> str:
+    prefix_lower = prefix.lower()
+    if (
+        "mtp" in prefix_lower
+        or "draft_model" in prefix_lower
+        or (
+            base_num_layers is not None
+            and external_layer_idx is not None
+            and external_layer_idx >= base_num_layers
+        )
+    ):
+        return "mtp"
+    return "main"
+
+
+def _activation_amax_slot_hint(
+    *,
+    model_tag: str,
+    external_layer_idx: int | None,
+    base_num_layers: int | None,
+) -> int | None:
+    if external_layer_idx is None:
+        return None
+    if model_tag == "mtp" and base_num_layers is not None:
+        return max(int(external_layer_idx) - int(base_num_layers), 0)
+    return int(external_layer_idx)
+
+
+def _activation_amax_state_key(
+    *,
+    model_tag: str,
+    device: torch.device,
+    num_experts: int,
+) -> tuple[str, str, int]:
+    return (model_tag, str(device), int(num_experts))
+
+
+def _get_activation_amax_state(
+    *,
+    model_tag: str,
+    device: torch.device,
+    num_experts: int,
+) -> _B12XMoeActivationAmaxState:
+    key = _activation_amax_state_key(
+        model_tag=model_tag,
+        device=device,
+        num_experts=num_experts,
+    )
+    state = _activation_amax_states.get(key)
+    if state is None:
+        state = _B12XMoeActivationAmaxState(
+            model_tag=model_tag,
+            device=device,
+            num_experts=num_experts,
+        )
+        _activation_amax_states[key] = state
+    return state
+
+
+def _distributed_rank() -> int:
+    dist = getattr(torch, "distributed", None)
+    if dist is not None and dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank())
+    for env_name in ("RANK", "LOCAL_RANK"):
+        value = os.getenv(env_name)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            continue
+    return 0
+
+
+def _activation_amax_output_path(
+    base_path: str,
+    state: _B12XMoeActivationAmaxState,
+) -> Path:
+    base = Path(base_path).expanduser()
+    rank = _distributed_rank()
+    device = str(state.device).replace(":", "")
+    suffix = f"{state.model_tag}.rank{rank}.{device}.e{state.num_experts}"
+    if base.suffix:
+        return base.with_name(f"{base.stem}.{suffix}{base.suffix}")
+    return base / f"b12x_moe_activation_amax.{suffix}.pt"
+
+
+def maybe_save_b12x_moe_activation_amax() -> None:
+    """Persist vLLM-owned W4A16 MoE activation calibration state."""
+    global _activation_amax_save_step
+
+    if not _activation_amax_states or _is_current_stream_capturing():
+        return
+
+    every = _moe_activation_amax_save_every()
+    base_path = _moe_activation_amax_file()
+    if every <= 0 or base_path is None:
+        return
+
+    _activation_amax_save_step += 1
+    if _activation_amax_save_step % every != 0:
+        return
+
+    for state in _activation_amax_states.values():
+        path = _activation_amax_output_path(base_path, state)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f"{path.name}.tmp")
+        torch.save(state.payload(_activation_amax_save_step), tmp_path)
+        os.replace(tmp_path, path)
+
+
+def _reset_b12x_moe_activation_amax_for_tests() -> None:
+    global _activation_amax_save_step
+
+    _activation_amax_save_step = 0
+    _activation_amax_states.clear()
+
+
 def _plan_b12x_moe_fp4_scratch(
     *,
     tokens: int,
@@ -118,6 +413,7 @@ def _plan_b12x_moe_fp4_scratch(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    collect_activation_amax: bool = False,
 ):
     from b12x.integration.tp_moe import TPMoEScratchCaps, plan_tp_moe_scratch
 
@@ -148,6 +444,7 @@ def _plan_b12x_moe_fp4_scratch(
             w13_layout=w13_layout,
             w4a16_weight_layout=w4a16_weight_layout,
             w4a16_scale_format=w4a16_scale_format,
+            collect_activation_amax=bool(collect_activation_amax),
             frozen=True,
         )
     )
@@ -238,6 +535,8 @@ def _run_b12x_moe_fp4(
     swiglu_beta: float | None,
     plan: Any,
     scratch: torch.Tensor,
+    activation_amax: torch.Tensor | None = None,
+    layer_idx: int | None = None,
 ) -> None:
     """Call b12x MoE with caller-owned live scratch."""
     from b12x.integration.tp_moe import b12x_moe_fp4
@@ -276,6 +575,8 @@ def _run_b12x_moe_fp4(
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        activation_amax=activation_amax,
+        layer_idx=layer_idx,
     )
     b12x_moe_fp4(binding=binding)
 
@@ -576,6 +877,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._prepared_fp4_moe_by_dtype: dict[torch.dtype, Any] = {}
         self._source_params_compacted = False
         self._unit_scale_by_device: dict[torch.device, torch.Tensor] = {}
+        self._activation_amax_enabled = _moe_activation_amax_enabled()
+        self._activation_amax_base_num_layers = _current_config_num_hidden_layers()
+        self._activation_amax_state_key: tuple[str, str, int] | None = None
+        self._activation_amax_layer_idx: int | None = None
 
     def _quant_mode(self) -> str:
         source_format = self._source_format()
@@ -627,6 +932,91 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             scale = torch.ones(num_experts, dtype=torch.float32, device=device)
             self._unit_scale_by_device[device] = scale
         return scale
+
+    def _activation_amax_enabled_for_layer(self) -> bool:
+        enabled = getattr(self, "_activation_amax_enabled", None)
+        if enabled is None:
+            return _moe_activation_amax_enabled()
+        return bool(enabled)
+
+    def _register_activation_amax(
+        self,
+        *,
+        layer: torch.nn.Module,
+        device: torch.device,
+        num_experts: int,
+    ) -> None:
+        if (
+            not self._activation_amax_enabled_for_layer()
+            or self._quant_mode() != "w4a16"
+        ):
+            return
+
+        prefix = str(getattr(layer, "layer_name", ""))
+        external_layer_idx = _parse_layer_index(prefix)
+        base_num_layers = getattr(
+            self,
+            "_activation_amax_base_num_layers",
+            None,
+        )
+        model_tag = _activation_amax_model_tag(
+            prefix,
+            external_layer_idx,
+            base_num_layers,
+        )
+        state = _get_activation_amax_state(
+            model_tag=model_tag,
+            device=device,
+            num_experts=num_experts,
+        )
+        slot = state.register(
+            owner=self,
+            prefix=prefix,
+            external_layer_idx=external_layer_idx,
+            slot_hint=_activation_amax_slot_hint(
+                model_tag=model_tag,
+                external_layer_idx=external_layer_idx,
+                base_num_layers=base_num_layers,
+            ),
+        )
+        self._activation_amax_state_key = _activation_amax_state_key(
+            model_tag=model_tag,
+            device=device,
+            num_experts=num_experts,
+        )
+        self._activation_amax_layer_idx = slot
+
+    def _activation_amax_args(
+        self,
+        *,
+        device: torch.device,
+        num_experts: int,
+    ) -> tuple[torch.Tensor | None, int | None]:
+        if (
+            not self._activation_amax_enabled_for_layer()
+            or self._quant_mode() != "w4a16"
+        ):
+            return None, None
+
+        key = getattr(self, "_activation_amax_state_key", None)
+        layer_idx = getattr(self, "_activation_amax_layer_idx", None)
+        if key is None or layer_idx is None:
+            raise RuntimeError(
+                "B12X MoE activation-amax was enabled but this W4A16 layer "
+                "was not registered before launch."
+            )
+
+        state = _activation_amax_states.get(key)
+        if state is None:
+            raise RuntimeError("B12X MoE activation-amax state was cleared.")
+        if state.device != device or state.num_experts != int(num_experts):
+            raise RuntimeError(
+                "B12X MoE activation-amax state does not match the live "
+                f"layer: state device={state.device}, experts={state.num_experts}; "
+                f"live device={device}, experts={num_experts}."
+            )
+        state.mark_used()
+        return state.tensor, int(layer_idx)
 
     def _weight_global_scale(
         self,
@@ -684,12 +1074,24 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             activation = getattr(moe_config, "activation", MoEActivation.SILU)
         activation = cast(MoEActivation, activation)
 
-        self._get_or_prepare_fp4_moe_weights(
+        prepared = self._get_or_prepare_fp4_moe_weights(
             w1=layer.w13_weight,
             w2=layer.w2_weight,
             activation=activation,
             params_dtype=params_dtype,
         )
+        if self._quant_mode() == "w4a16":
+            prepared_w4a16 = getattr(prepared, "w4a16", None)
+            num_experts = (
+                int(prepared_w4a16.num_experts)
+                if prepared_w4a16 is not None
+                else int(layer.w13_weight.shape[0])
+            )
+            self._register_activation_amax(
+                layer=layer,
+                device=device,
+                num_experts=num_experts,
+            )
         if self._quant_mode() in ("w4a16", "w4a8_mx"):
             self._compact_source_scales(layer)
             self._compact_source_weights(layer)
@@ -941,9 +1343,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         prepared_w4a8 = (
             self._lookup_prepared_w4a8() if quant_mode == "w4a8_mx" else None
         )
-        if w1.numel() == 0 or w2.numel() == 0:
-            if prepared_w4a16 is None and prepared_w4a8 is None:
-                return None
+        if (
+            (w1.numel() == 0 or w2.numel() == 0)
+            and prepared_w4a16 is None
+            and prepared_w4a8 is None
+        ):
+            return None
 
         if prepared_w4a8 is not None:
             num_experts = int(prepared_w4a8.num_experts)
@@ -991,6 +1396,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
+            collect_activation_amax=(
+                self._activation_amax_enabled_for_layer() and quant_mode == "w4a16"
+            ),
         )
 
     def warmup_dynamic_signature(
@@ -1017,6 +1425,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             meta.swiglu_limit,
             meta.swiglu_alpha,
             meta.swiglu_beta,
+            meta.collect_activation_amax,
         )
 
     @torch.inference_mode()
@@ -1094,6 +1503,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             input_scales_static = True
             unit_scale_contract = False
 
+        activation_amax, activation_layer_idx = (None, None)
+        if meta.collect_activation_amax:
+            activation_amax, activation_layer_idx = self._activation_amax_args(
+                device=meta.device,
+                num_experts=num_experts,
+            )
+
         assert self.w1_scale is not None and self.w2_scale is not None, (
             "w1_scale and w2_scale must not be None for B12xExperts"
         )
@@ -1134,6 +1550,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             swiglu_limit=meta.swiglu_limit,
             swiglu_alpha=meta.swiglu_alpha,
             swiglu_beta=meta.swiglu_beta,
+            collect_activation_amax=meta.collect_activation_amax,
         )
         scratch = torch.empty(
             (_b12x_scratch_nbytes(plan),),
@@ -1168,6 +1585,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             swiglu_beta=meta.swiglu_beta,
             plan=plan,
             scratch=scratch,
+            activation_amax=activation_amax,
+            layer_idx=activation_layer_idx,
         )
 
     def _compact_source_scales(self, layer: torch.nn.Module) -> None:
@@ -1283,6 +1702,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
+            collect_activation_amax=(
+                self._activation_amax_enabled_for_layer() and quant_mode == "w4a16"
+            ),
         )
         scratch_elements = max(
             1,
@@ -1372,6 +1794,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             w2_alphas = prepared.w2_runtime_alphas
             input_scales_static = True
             unit_scale_contract = False
+        activation_amax, activation_layer_idx = (None, None)
+        if quant_mode == "w4a16" and self._activation_amax_enabled_for_layer():
+            activation_amax, activation_layer_idx = self._activation_amax_args(
+                device=hidden_states.device,
+                num_experts=num_experts,
+            )
         swiglu_limit, swiglu_alpha, swiglu_beta = self._b12x_swiglu_params(
             activation
         )
@@ -1403,6 +1831,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
+            collect_activation_amax=activation_amax is not None,
         )
         scratch = _workspace2_as_b12x_scratch(workspace2, plan)
 
@@ -1438,40 +1867,43 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             swiglu_beta=swiglu_beta,
             plan=plan,
             scratch=scratch,
+            activation_amax=activation_amax,
+            layer_idx=activation_layer_idx,
         )
-        _maybe_repeat_check_b12x_moe(
-            original_output=output,
-            a=hidden_states,
-            a1_gscale=a1_gscale,
-            w1_fp4=w1,
-            w1_blockscale=self.w1_scale,
-            w1_alphas=w1_alphas,
-            a2_gscale=a2_gscale,
-            w2_fp4=w2,
-            w2_blockscale=self.w2_scale,
-            w2_alphas=w2_alphas,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            apply_router_weight_on_input=(
-                apply_router_weight_on_input
-                if apply_router_weight_on_input is not None
-                else False
-            ),
-            input_scales_are_reciprocal=True,
-            input_scales_static=input_scales_static,
-            activation=_b12x_activation_name(activation),
-            quant_mode=quant_mode,
-            unit_scale_contract=unit_scale_contract,
-            source_format=self._source_format(),
-            w13_layout=self._w13_layout(),
-            prepared_w4a16=prepared_w4a16,
-            prepared_w4a8=prepared_w4a8,
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            plan=plan,
-            scratch=scratch,
-        )
+        if activation_amax is None:
+            _maybe_repeat_check_b12x_moe(
+                original_output=output,
+                a=hidden_states,
+                a1_gscale=a1_gscale,
+                w1_fp4=w1,
+                w1_blockscale=self.w1_scale,
+                w1_alphas=w1_alphas,
+                a2_gscale=a2_gscale,
+                w2_fp4=w2,
+                w2_blockscale=self.w2_scale,
+                w2_alphas=w2_alphas,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                apply_router_weight_on_input=(
+                    apply_router_weight_on_input
+                    if apply_router_weight_on_input is not None
+                    else False
+                ),
+                input_scales_are_reciprocal=True,
+                input_scales_static=input_scales_static,
+                activation=_b12x_activation_name(activation),
+                quant_mode=quant_mode,
+                unit_scale_contract=unit_scale_contract,
+                source_format=self._source_format(),
+                w13_layout=self._w13_layout(),
+                prepared_w4a16=prepared_w4a16,
+                prepared_w4a8=prepared_w4a8,
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                plan=plan,
+                scratch=scratch,
+            )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         raise NotImplementedError("LoRA is not supported for B12xExperts")
