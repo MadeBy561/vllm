@@ -191,7 +191,8 @@ class B12xMLASparseBackend(AttentionBackend):
         "auto",
         "bfloat16",
         "fp8_ds_mla",
-        "fp8",  # alias for fp8_ds_mla on this backend (auto-converted by MLAAttention)
+        "fp8",  # aliases for fp8_ds_mla on this backend
+        "fp8_e4m3",
     ]
 
     @staticmethod
