@@ -589,11 +589,18 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        layer_id = extract_layer_index(self.prefix)
+        num_hidden_layers = getattr(vllm_config.model_config.hf_config,
+                                    "num_hidden_layers", None)
+        dcp_replicated = (layer_id is not None
+                          and num_hidden_layers is not None
+                          and int(layer_id) >= int(num_hidden_layers))
         return MLAAttentionSpec(  # Only has one vector instead of K + V
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
+            dcp_replicated=dcp_replicated,
         )
 
     def forward(self): ...
