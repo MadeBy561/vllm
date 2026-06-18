@@ -188,6 +188,7 @@ return curr_o @ W_O
 """
 
 import functools
+import re
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -1055,12 +1056,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)",
+                                self.layer_name)
+        layer_id = int(layer_match.group(1)) if layer_match is not None else None
+        num_hidden_layers = getattr(vllm_config.model_config.hf_config,
+                                    "num_hidden_layers", None)
+        dcp_replicated = (layer_id is not None
+                          and num_hidden_layers is not None
+                          and layer_id >= int(num_hidden_layers))
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
             cache_dtype_str=self.kv_cache_dtype,
+            dcp_replicated=dcp_replicated,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
