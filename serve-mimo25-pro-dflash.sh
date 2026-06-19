@@ -48,14 +48,14 @@ json_bool() {
 MODEL="${MODEL:-${HOME}/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.5-Pro-FP4-DFlash/snapshots/b754e6c86008bdb5cc901308dda5a38173ec7276}"
 MODEL="$(expand_user_path "${MODEL}")"
 MODEL="${MODEL%/}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-mimo-v25-pro}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Mimo-2.5-Pro}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 TP_SIZE="${TP_SIZE:-8}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.92}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
-MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-64}"
+MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-256}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-TRITON_ATTN}"
 DRAFT_ATTENTION_BACKEND="${DRAFT_ATTENTION_BACKEND:-TRITON_ATTN}"
 MOE_BACKEND="${MOE_BACKEND:-b12x}"
@@ -168,7 +168,6 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve --model "${MODEL}" \
   --attention-backend "${ATTENTION_BACKEND}" \
   --kernel-config.moe_backend "${MOE_BACKEND}" \
   --kernel-config.linear_backend "${LINEAR_BACKEND}" \
-  --load-format fastsafetensors \
   --reasoning-parser mimo \
   --enable-auto-tool-choice \
   --tool-call-parser mimo \

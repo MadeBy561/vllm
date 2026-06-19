@@ -60,8 +60,8 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 DCP_SIZE="${DCP_SIZE:-1}"
 TP_SIZE="${TP_SIZE:-8}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.96}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.92}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 MAX_CUDAGRAPH_CAPTURE_SIZE=128
 
@@ -96,6 +96,7 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --enable-prefix-caching \
   --load-format fastsafetensors \
   --async-scheduling \
+  --no-scheduler-reserve-full-isl \
   -cc.pass_config.fuse_allreduce_rms=True \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
