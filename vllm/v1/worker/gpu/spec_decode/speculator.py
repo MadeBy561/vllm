@@ -192,14 +192,45 @@ class DraftModelSpeculator(BaseSpeculator):
         causal: bool = True,
         seq_lens_cpu_upper_bound: torch.Tensor | None = None,
         max_seq_len_upper_bound: int | None = None,
+        query_start_loc_cpu: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
-        # Uniform query: query_start_loc[i] = min(i, num_reqs) * num_query_per_req.
-        # Clamp keeps the series non-decreasing past num_reqs, which some
-        # attention backends require.
-        query_start_loc_cpu = (
-            torch.clamp(self.arange[: num_reqs_padded + 1], max=num_reqs)
-            * num_query_per_req
-        )
+        if query_start_loc_cpu is None:
+            # Uniform query: query_start_loc[i] =
+            # min(i, num_reqs) * num_query_per_req. Clamp keeps the series
+            # non-decreasing past num_reqs, which some attention backends require.
+            query_start_loc_cpu = (
+                torch.clamp(self.arange[: num_reqs_padded + 1], max=num_reqs)
+                * num_query_per_req
+            )
+            max_query_len = num_query_per_req
+        else:
+            # Draft prefill intentionally keeps the target query layout,
+            # including rejected-token padding. When rebuilding metadata for a
+            # different draft KV layout, preserve that layout instead of
+            # synthesizing a uniform one.
+            if query_start_loc_cpu.device.type != "cpu":
+                query_start_loc_cpu = query_start_loc_cpu.cpu()
+            required_len = num_reqs_padded + 1
+            if query_start_loc_cpu.numel() < required_len:
+                padded_query_start_loc_cpu = query_start_loc_cpu.new_empty(
+                    required_len
+                )
+                padded_query_start_loc_cpu[: query_start_loc_cpu.numel()] = (
+                    query_start_loc_cpu
+                )
+                padded_query_start_loc_cpu[query_start_loc_cpu.numel() :] = (
+                    query_start_loc_cpu[-1]
+                )
+                query_start_loc_cpu = padded_query_start_loc_cpu
+            else:
+                query_start_loc_cpu = query_start_loc_cpu[:required_len]
+            if num_reqs > 0:
+                max_query_len = int(
+                    (query_start_loc_cpu[1 : num_reqs + 1]
+                     - query_start_loc_cpu[:num_reqs]).max().item()
+                )
+            else:
+                max_query_len = num_query_per_req
         block_tables = [
             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
         ]
@@ -229,7 +260,7 @@ class DraftModelSpeculator(BaseSpeculator):
                     : num_reqs_padded + 1
                 ],
                 query_start_loc_cpu=query_start_loc_cpu,
-                max_query_len=num_query_per_req,
+                max_query_len=max_query_len,
                 seq_lens=seq_lens,
                 max_seq_len=self.draft_max_seq_len,
                 block_tables=block_tables,
