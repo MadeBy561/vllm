@@ -45,6 +45,17 @@ def _get_b12x_paged_indexer_supertile_k() -> int:
     )
 
 
+def _use_b12x_sparse_indexer_metadata() -> bool:
+    if os.environ.get("VLLM_DCP_GLOBAL_TOPK", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False
+    return envs.VLLM_USE_B12X_SPARSE_INDEXER
+
+
 @triton.jit
 def _prepare_uniform_decode_kernel(
     seq_lens_ptr,
@@ -216,6 +227,7 @@ class DeepSeekV32IndexerDecodeMetadata:
     #   - native MTP path: 2D (B, next_n) where [b,j] = L_b - next_n + j + 1
     # Both fp8_fp4_paged_mqa_logits and the topk kernels accept both shapes.
     seq_lens: torch.Tensor
+    max_seq_len: int
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor | None
@@ -244,6 +256,9 @@ class DeepseekV32IndexerMetadata:
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
+    dcp_world_size: int = 1
+    dcp_rank: int = 0
+    cp_interleave_size: int = 1
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
@@ -410,7 +425,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         num_decode_tokens: int,
         requires_padding: bool,
     ) -> torch.Tensor | None:
-        if not envs.VLLM_USE_B12X_SPARSE_INDEXER or requires_padding:
+        if not _use_b12x_sparse_indexer_metadata() or requires_padding:
             return None
 
         schedule_seq_lens = seq_lens
@@ -706,7 +721,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 num_decodes : num_decodes + num_prefills
             ]
             max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+            if _use_b12x_sparse_indexer_metadata():
                 chunk_specs = []
                 b12x_budget_seq_lens = np.array(
                     [_get_b12x_paged_indexer_supertile_k()],
@@ -868,8 +883,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # kernels see the same (B, next_n) layout as the MTP path.
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
+            decode_topk_max_seq_len = int(seq_lens.max().item())
 
-            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+            if _use_b12x_sparse_indexer_metadata():
                 schedule_metadata = self._maybe_build_b12x_schedule_metadata(
                     seq_lens,
                     block_table,
@@ -883,7 +899,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
 
             active_width = None
-            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+            if _use_b12x_sparse_indexer_metadata():
                 # Live scorer window in cache tokens. ceil(max_seq_len /
                 # compress_ratio) is an upper bound on the max compressed
                 # context across the batch, so windowing to it is top-k-identical
@@ -899,6 +915,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
                 seq_lens=seq_lens,
+                max_seq_len=decode_topk_max_seq_len,
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=schedule_metadata,
@@ -916,6 +933,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             num_prefill_tokens=num_prefill_tokens,
             prefill=prefill_metadata,
             decode=decode_metadata,
+            dcp_world_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_interleave_size=self.cp_kv_cache_interleave_size,
         )
 
         return attn_metadata

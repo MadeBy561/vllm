@@ -9,9 +9,11 @@ import torch
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -43,6 +45,314 @@ _B12X_CONTIGUOUS_PREFILL512_SUPPORTED_HEADS = (32, 64)
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 _B12X_PREFILL_PAGED_ROUTE = "packed_contiguous"
+
+
+def _dcp_global_topk_requested() -> bool:
+    raw = os.environ.get("VLLM_DCP_GLOBAL_TOPK", "0")
+    return raw.lower() in ("1", "true", "yes", "on")
+
+
+def _use_persistent_topk_decode(topk_tokens: int) -> bool:
+    """Return whether decode top-k should use the persistent CUDA kernel.
+
+    The caller must pass persistent_topk a max sequence length in the same
+    coordinate system as its seq_lens tensor. Under DCP this is rank-local, not
+    the global attention max.
+    """
+    return current_platform.is_cuda() and topk_tokens in (512, 1024, 2048)
+
+
+def _local_to_global_position(
+    local_idx: torch.Tensor, rank: int, world_size: int, interleave: int
+) -> torch.Tensor:
+    """Map a per-request local KV position on this rank to global position."""
+    return (
+        (local_idx // interleave) * (world_size * interleave)
+        + rank * interleave
+        + (local_idx % interleave)
+    )
+
+
+def _global_to_local_position(
+    global_idx: torch.Tensor, interleave: int, world_size: int
+) -> torch.Tensor:
+    """Map a global KV position to local index on the owning rank."""
+    big = interleave * world_size
+    return (global_idx // big) * interleave + (global_idx % interleave)
+
+
+@triton.jit
+def _dcp_pack_topk_candidates_kernel(
+    topk_indices_ptr,
+    logits_ptr,
+    row_starts_ptr,
+    packed_ptr,
+    topk_stride_0: tl.constexpr,
+    topk_stride_1: tl.constexpr,
+    logits_stride_0: tl.constexpr,
+    logits_stride_1: tl.constexpr,
+    packed_stride_0: tl.constexpr,
+    packed_stride_1: tl.constexpr,
+    packed_stride_2: tl.constexpr,
+    logits_width,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    TOPK_TOKENS: tl.constexpr,
+    HAS_LOGITS: tl.constexpr,
+    HAS_ROW_STARTS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_K)
+    mask = offsets < TOPK_TOKENS
+
+    idx = tl.load(
+        topk_indices_ptr + row * topk_stride_0 + offsets * topk_stride_1,
+        mask=mask,
+        other=-1,
+    )
+    invalid = idx < 0
+    idx_safe = tl.maximum(idx, 0)
+
+    scores = tl.full((BLOCK_K,), -float("inf"), tl.float32)
+    if HAS_LOGITS:
+        score_idx = idx_safe
+        if HAS_ROW_STARTS:
+            row_start = tl.load(row_starts_ptr + row)
+            score_idx += row_start
+        score_idx = tl.minimum(score_idx, logits_width - 1)
+        scores = tl.load(
+            logits_ptr + row * logits_stride_0 + score_idx * logits_stride_1,
+            mask=mask,
+            other=-float("inf"),
+        )
+        scores = tl.where(invalid, -float("inf"), scores)
+
+    global_pos = (
+        (idx_safe // INTERLEAVE) * (WORLD_SIZE * INTERLEAVE)
+        + RANK * INTERLEAVE
+        + (idx_safe % INTERLEAVE)
+    )
+    global_pos = tl.where(invalid, -1, global_pos)
+
+    packed_base = packed_ptr + row * packed_stride_0 + offsets * packed_stride_2
+    tl.store(packed_base, global_pos, mask=mask)
+    tl.store(
+        packed_base + packed_stride_1,
+        scores.to(tl.int32, bitcast=True),
+        mask=mask,
+    )
+
+
+@triton.jit
+def _dcp_finalize_topk_remap_kernel(
+    all_candidates_ptr,
+    selected_ptr,
+    topk_indices_ptr,
+    candidates_stride_0: tl.constexpr,
+    candidates_stride_1: tl.constexpr,
+    candidates_stride_2: tl.constexpr,
+    selected_stride_0: tl.constexpr,
+    selected_stride_1: tl.constexpr,
+    topk_stride_0: tl.constexpr,
+    topk_stride_1: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    TOPK_TOKENS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_K)
+    mask = offsets < TOPK_TOKENS
+
+    selected = tl.load(
+        selected_ptr + row * selected_stride_0 + offsets * selected_stride_1,
+        mask=mask,
+        other=0,
+    )
+    global_pos = tl.load(
+        all_candidates_ptr + row * candidates_stride_0 + selected * candidates_stride_2,
+        mask=mask,
+        other=-1,
+    )
+
+    owner = (global_pos // INTERLEAVE) % WORLD_SIZE
+    big = INTERLEAVE * WORLD_SIZE
+    local_pos = (global_pos // big) * INTERLEAVE + (global_pos % INTERLEAVE)
+    mine = (owner == RANK) & (global_pos >= 0)
+    final = tl.where(mine, local_pos, -1)
+
+    tl.store(
+        topk_indices_ptr + row * topk_stride_0 + offsets * topk_stride_1,
+        final,
+        mask=mask,
+    )
+
+
+def _use_triton_dcp_remap(topk_indices: torch.Tensor) -> bool:
+    return HAS_TRITON and current_platform.is_cuda() and topk_indices.is_cuda
+
+
+def _dcp_pack_topk_candidates(
+    topk_indices: torch.Tensor,
+    logits: torch.Tensor | None,
+    topk_tokens: int,
+    rank: int,
+    world_size: int,
+    interleave: int,
+    row_starts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pack local candidate global positions and score bits for one all-gather."""
+    packed = torch.empty(
+        (topk_indices.shape[0], 2, topk_tokens),
+        dtype=torch.int32,
+        device=topk_indices.device,
+    )
+    if topk_indices.numel() == 0:
+        return packed
+
+    if _use_triton_dcp_remap(topk_indices):
+        block_k = triton.next_power_of_2(topk_tokens)
+        num_warps = 4 if block_k <= 256 else 8
+        logits_arg = logits if logits is not None else topk_indices
+        row_starts_arg = row_starts if row_starts is not None else topk_indices
+        _dcp_pack_topk_candidates_kernel[(topk_indices.shape[0],)](
+            topk_indices,
+            logits_arg,
+            row_starts_arg,
+            packed,
+            topk_indices.stride(0),
+            topk_indices.stride(1),
+            logits.stride(0) if logits is not None else 0,
+            logits.stride(1) if logits is not None else 0,
+            packed.stride(0),
+            packed.stride(1),
+            packed.stride(2),
+            logits.shape[1] if logits is not None else 1,
+            RANK=rank,
+            WORLD_SIZE=world_size,
+            INTERLEAVE=interleave,
+            TOPK_TOKENS=topk_tokens,
+            HAS_LOGITS=logits is not None,
+            HAS_ROW_STARTS=row_starts is not None,
+            BLOCK_K=block_k,
+            num_warps=num_warps,
+        )
+        return packed
+
+    invalid = topk_indices < 0
+    idx_safe = torch.clamp(topk_indices, min=0)
+    if logits is None:
+        local_scores = torch.full(
+            topk_indices.shape,
+            float("-inf"),
+            dtype=torch.float32,
+            device=topk_indices.device,
+        )
+    else:
+        score_idx = idx_safe.to(torch.int64)
+        if row_starts is not None:
+            score_idx = score_idx + row_starts.to(
+                device=score_idx.device, dtype=score_idx.dtype
+            ).view(-1, 1)
+        score_idx = torch.clamp(score_idx, min=0, max=logits.shape[1] - 1)
+        local_scores = torch.gather(logits, 1, score_idx).to(torch.float32)
+    local_scores = local_scores.masked_fill(invalid, float("-inf"))
+
+    global_pos = _local_to_global_position(idx_safe, rank, world_size, interleave)
+    global_pos = torch.where(invalid, global_pos.new_full((), -1), global_pos)
+
+    packed[:, 0, :].copy_(global_pos.to(torch.int32))
+    packed[:, 1, :].copy_(local_scores.contiguous().view(torch.int32))
+    return packed
+
+
+def _dcp_finalize_topk_remap(
+    all_candidates: torch.Tensor,
+    selected: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+    rank: int,
+    world_size: int,
+    interleave: int,
+) -> None:
+    """Finalize selected global candidates into rank-local top-k indices."""
+    if topk_indices.numel() == 0:
+        return
+
+    if _use_triton_dcp_remap(topk_indices):
+        block_k = triton.next_power_of_2(topk_tokens)
+        num_warps = 4 if block_k <= 256 else 8
+        _dcp_finalize_topk_remap_kernel[(topk_indices.shape[0],)](
+            all_candidates,
+            selected,
+            topk_indices,
+            all_candidates.stride(0),
+            all_candidates.stride(1),
+            all_candidates.stride(2),
+            selected.stride(0),
+            selected.stride(1),
+            topk_indices.stride(0),
+            topk_indices.stride(1),
+            RANK=rank,
+            WORLD_SIZE=world_size,
+            INTERLEAVE=interleave,
+            TOPK_TOKENS=topk_tokens,
+            BLOCK_K=block_k,
+            num_warps=num_warps,
+        )
+        return
+
+    sel_global = torch.gather(all_candidates[:, 0, :], 1, selected.to(torch.int64))
+    owner = (sel_global // interleave) % world_size
+    local_of_g = _global_to_local_position(sel_global, interleave, world_size)
+    mine = (owner == rank) & (sel_global >= 0)
+    final = torch.where(mine, local_of_g, local_of_g.new_full((), -1))
+    topk_indices.copy_(final.to(topk_indices.dtype))
+
+
+def _dcp_global_topk_remap(
+    topk_indices: torch.Tensor,
+    logits: torch.Tensor | None,
+    topk_tokens: int,
+    interleave: int,
+    row_starts: torch.Tensor | None = None,
+) -> None:
+    """Convert local DCP top-k into exact global top-k in place.
+
+    Each DCP rank first selects top-k from its local KV shard. Without this
+    remap, LSE-merged sparse attention attends over the union of per-rank top-k
+    candidates instead of one shared global top-k set. This gathers candidate
+    scores, selects the global top-k rows, then keeps only entries owned by the
+    current rank and writes other entries as -1.
+    """
+    dcp_group = get_dcp_group()
+    rank = dcp_group.rank_in_group
+    world_size = dcp_group.world_size
+
+    candidates = _dcp_pack_topk_candidates(
+        topk_indices,
+        logits,
+        topk_tokens,
+        rank,
+        world_size,
+        interleave,
+        row_starts=row_starts,
+    )
+    all_candidates = dcp_group.all_gather(candidates.contiguous(), dim=2)
+    all_scores = all_candidates[:, 1, :].view(torch.float32)
+    _, selected = torch.topk(all_scores, topk_tokens, dim=1)
+    _dcp_finalize_topk_remap(
+        all_candidates,
+        selected,
+        topk_indices,
+        topk_tokens,
+        rank,
+        world_size,
+        interleave,
+    )
 
 
 def _assert_b12x_prefill_paged_route(obj: object, *, owner: str) -> None:
@@ -124,6 +434,12 @@ def _b12x_profile_weights_2d(
 
 
 def _b12x_sparse_indexer_requested(enabled: bool | None = None) -> bool:
+    # The exact DCP global-topk experiment needs local top-k scores. The current
+    # b12x paged indexer API returns only indices, so force the DeepGEMM indexer
+    # path when requested. B12X attention/MoE remain selected by their own flags.
+    if _dcp_global_topk_requested():
+        return False
+
     if enabled is not None:
         return bool(enabled)
 
@@ -624,6 +940,9 @@ def sparse_attn_indexer(
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
+    dcp_global_topk = (
+        _dcp_global_topk_requested() and attn_metadata_narrowed.dcp_world_size > 1
+    )
     slot_mapping = attn_metadata_narrowed.slot_mapping
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
@@ -691,6 +1010,13 @@ def sparse_attn_indexer(
             ]
             if chunk.total_seq_lens <= 0:
                 topk_indices.fill_(-1)
+                if dcp_global_topk:
+                    _dcp_global_topk_remap(
+                        topk_indices,
+                        None,
+                        topk_tokens,
+                        attn_metadata_narrowed.cp_interleave_size,
+                    )
                 continue
 
             if use_b12x_indexer:
@@ -778,6 +1104,14 @@ def sparse_attn_indexer(
                 logits.stride(1),
                 topk_tokens,
             )
+            if dcp_global_topk:
+                _dcp_global_topk_remap(
+                    topk_indices,
+                    logits,
+                    topk_tokens,
+                    attn_metadata_narrowed.cp_interleave_size,
+                    row_starts=chunk.cu_seqlen_ks,
+                )
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -925,7 +1259,7 @@ def sparse_attn_indexer(
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda() and topk_tokens in (512, 1024, 2048):
+        if _use_persistent_topk_decode(topk_tokens):
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
@@ -936,7 +1270,7 @@ def sparse_attn_indexer(
                 topk_indices,
                 topk_workspace,
                 topk_tokens,
-                attn_metadata_narrowed.max_seq_len,
+                decode_metadata.max_seq_len,
             )
         else:
             ops.top_k_per_row_decode(
@@ -948,6 +1282,14 @@ def sparse_attn_indexer(
                 logits.stride(0),
                 logits.stride(1),
                 topk_tokens,
+            )
+
+        if dcp_global_topk:
+            _dcp_global_topk_remap(
+                topk_indices,
+                logits,
+                topk_tokens,
+                attn_metadata_narrowed.cp_interleave_size,
             )
 
         if decode_metadata.requires_padding:
