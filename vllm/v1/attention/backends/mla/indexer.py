@@ -46,12 +46,13 @@ def _get_b12x_paged_indexer_supertile_k() -> int:
 
 
 def _use_b12x_sparse_indexer_metadata() -> bool:
-    if os.environ.get("VLLM_DCP_GLOBAL_TOPK", "0").lower() in (
+    dcp_global_topk = os.environ.get("VLLM_DCP_GLOBAL_TOPK", "1").lower() in (
         "1",
         "true",
         "yes",
         "on",
-    ):
+    )
+    if dcp_global_topk and get_total_cp_world_size() > 1:
         return False
     return envs.VLLM_USE_B12X_SPARSE_INDEXER
 

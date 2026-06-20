@@ -188,7 +188,6 @@ return curr_o @ W_O
 """
 
 import functools
-import re
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -240,6 +239,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import cdiv, round_down
@@ -1056,9 +1056,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
-        layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)",
-                                self.layer_name)
-        layer_id = int(layer_match.group(1)) if layer_match is not None else None
+        try:
+            layer_id = extract_layer_index(self.layer_name)
+        except ValueError:
+            layer_id = None
         num_hidden_layers = getattr(vllm_config.model_config.hf_config,
                                     "num_hidden_layers", None)
         import os as _os

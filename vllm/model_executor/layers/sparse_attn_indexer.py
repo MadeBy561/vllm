@@ -48,7 +48,7 @@ _B12X_PREFILL_PAGED_ROUTE = "packed_contiguous"
 
 
 def _dcp_global_topk_requested() -> bool:
-    raw = os.environ.get("VLLM_DCP_GLOBAL_TOPK", "0")
+    raw = os.environ.get("VLLM_DCP_GLOBAL_TOPK", "1")
     return raw.lower() in ("1", "true", "yes", "on")
 
 
