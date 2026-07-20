@@ -956,6 +956,22 @@ class SpeculativeConfig:
                     config_format=self.target_model_config.config_format,
                 )
 
+                # Dict hf_overrides stay target-only, so a target that shrinks
+                # max_position_embeddings leaves the draft on the checkpoint
+                # default, with rotary tables allocated for positions the
+                # engine can never schedule (128 MiB/GPU of duplicated bf16
+                # cos/sin at GLM-5.2 geometry). Positions are bounded by the
+                # target's limit, so the smaller value is exact for the draft.
+                target_mpe = getattr(
+                    self.target_model_config.hf_config,
+                    "max_position_embeddings", None)
+                draft_hf = self.draft_model_config.hf_config
+                draft_mpe = getattr(draft_hf, "max_position_embeddings", None)
+                if (target_mpe is not None and draft_mpe is not None
+                        and draft_hf is not self.target_model_config.hf_config
+                        and target_mpe < draft_mpe):
+                    draft_hf.max_position_embeddings = target_mpe
+
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # omit vocab_size in config.json, so MedusaConfig falls back to
                 # its default (32001). Align with the target model's vocab size

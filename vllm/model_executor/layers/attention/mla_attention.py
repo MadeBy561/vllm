@@ -1366,6 +1366,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # Convert from (L, N, P) to (N, P, L)
             replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
 
+        # With no MHA prefill backend every runtime path consumes the absorbed
+        # W_UK_T/W_UV pair, so kv_b_proj's quantized weight is only ever read
+        # by the dequant above and its pack is dead weight from here on
+        # (~290 MiB/GPU at GLM-5.2 TP4 geometry).
+        if self.prefill_backend is None:
+            kv_b = self.kv_b_proj
+            if getattr(kv_b, "b12x_mxfp8_packed_weight", None) is not None:
+                kv_b.b12x_mxfp8_packed_weight = None
+            for name in ("weight", "weight_scale"):
+                param = getattr(kv_b, name, None)
+                if (param is not None and param.data.numel() > 0
+                        and param.data.dtype != torch.bfloat16):
+                    param.data = param.data.new_empty((0,))
+
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
         # for more details.
