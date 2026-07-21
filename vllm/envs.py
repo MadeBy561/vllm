@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     VLLM_DCP_SHARD_DRAFT: str | None = None
     VLLM_DCP_GLOBAL_TOPK: bool = True
     VLLM_DCP_QUERY_SPLIT: bool = False
+    VLLM_B12X_ABSORB_QBMM: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
@@ -1163,6 +1164,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DCP_QUERY_SPLIT": lambda: (
         os.getenv("VLLM_DCP_QUERY_SPLIT", "0").lower() in ("1", "true", "yes", "on")
+    ),
+    "VLLM_B12X_ABSORB_QBMM": lambda: (
+        os.getenv("VLLM_B12X_ABSORB_QBMM", "0").lower() in ("1", "true", "yes", "on")
     ),
     "VLLM_B12X_MLA_CKV_GATHER": lambda: (
         os.getenv("VLLM_B12X_MLA_CKV_GATHER", "0").lower() in ("1", "true", "yes", "on")

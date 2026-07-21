@@ -283,6 +283,25 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
         _finalize_attention_layer(layer, info, model_config)
         info.reset()
 
+    # Precompile qbmm absorb kernels for every CUDA-graph-visible batch size
+    # before any capture (a compile miss during capture raises).
+    for _layer, _info in deferred_attn:
+        if getattr(_layer, "_use_qbmm_absorb", False):
+            from sparkinfer.gemm.qbmm_absorb import warmup_qbmm_absorb
+
+            nh, hs, p, v, lat = _layer._qbmm_geometry
+            warmup_qbmm_absorb(
+                _layer.kv_b_proj.weight,
+                _layer.kv_b_proj.weight_scale,
+                num_heads=nh,
+                head_stride=hs,
+                p_dim=p,
+                v_dim=v,
+                latent_dim=lat,
+            )
+            logger.info("qbmm_absorb: warmup precompile done")
+            break
+
     LOADING_LAYERS.clear()
 
 

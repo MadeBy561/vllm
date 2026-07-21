@@ -404,6 +404,21 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     return kv_cache_dtype
 
 
+@functools.cache
+def _qbmm_absorb_enabled() -> bool:
+    """Opt-in: serve the decode-path absorbed projections directly from the
+    kv_b mxfp8 pack via the sparkinfer qbmm_absorb kernel, eliding the
+    resident BF16 W_UK_T/W_UV pair and its load-time dequant churn
+    (~724 MiB/GPU measured at GLM-5.2 TP4 geometry)."""
+    if not envs.VLLM_B12X_ABSORB_QBMM:
+        return False
+    # Touching the symbol materializes the lazy op package and registers
+    # the torch.ops.sparkinfer.qbmm_absorb_* custom ops.
+    from sparkinfer.gemm.qbmm_absorb import qbmm_absorb_supported  # noqa: F401
+
+    return True
+
+
 class MLAAttention(nn.Module, AttentionLayerBase):
     """Multi-Head Latent Attention layer.
 
@@ -878,8 +893,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and self.impl.dcp_world_size > 1
             and is_sparse_impl
             and getattr(self.impl, "supports_dcp_project_before_merge", False)
-            and hasattr(self, "W_UV")
-            and self.W_UV.dtype == torch.bfloat16
+            and (
+                (hasattr(self, "W_UV") and self.W_UV.dtype == torch.bfloat16)
+                or getattr(self, "_use_qbmm_absorb", False)
+            )
         )
         project_before_merge_min_tokens = getattr(
             self,
@@ -961,7 +978,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 # Pads the head_dim if necessary (for the underlying kernel)
                 N, B, P = mqa_q_nope.shape
-                _, _, L = self.W_UK_T.shape
+                if getattr(self, "_use_qbmm_absorb", False):
+                    L = self.kv_lora_rank
+                else:
+                    _, _, L = self.W_UK_T.shape
 
                 if self.q_pad_num_heads is not None:
                     mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
@@ -970,7 +990,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
 
                 # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
+                if getattr(self, "_use_qbmm_absorb", False):
+                    if B <= 32:
+                        torch.ops.sparkinfer.qbmm_absorb_ukt(
+                            mqa_q_nope,
+                            self.kv_b_proj.weight,
+                            self.kv_b_proj.weight_scale,
+                            mqa_ql_nope,
+                            None,
+                            *self._qbmm_geometry,
+                        )
+                    else:
+                        # Eager batches beyond the kernel envelope (profiler
+                        # dummy runs): dequant the pair transiently.
+                        torch.bmm(
+                            mqa_q_nope,
+                            self._dequant_absorbed_pair()[0],
+                            out=mqa_ql_nope,
+                        )
+                else:
+                    torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
 
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
@@ -1123,7 +1162,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         raise RuntimeError(
                             "Projected DCP valid counts must be contiguous."
                         )
-                    local_w_uv = self.W_UV.contiguous()
+                    local_w_uv = (
+                        self._dequant_absorbed_pair()[1].contiguous()
+                        if getattr(self, "_use_qbmm_absorb", False)
+                        else self.W_UV.contiguous()
+                    )
                     w_uv_dcp = get_dcp_group().all_gather(local_w_uv, dim=0)
                     expected_shape = (
                         self.num_heads * get_dcp_group().world_size,
@@ -1277,94 +1320,164 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         return output_padded
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype):
-        # we currently do not have quantized bmm's which are needed for
-        # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
-        # the bmm's in 16-bit, the extra memory overhead of this is fairly low
-        kv_b_proj_weight = get_and_maybe_dequant_weights(
-            self.kv_b_proj, out_dtype=act_dtype
-        ).T
+    def _qbmm_absorb_supported(self) -> bool:
+        w = getattr(self.kv_b_proj, "weight", None)
+        s = getattr(self.kv_b_proj, "weight_scale", None)
+        head_stride = self.qk_nope_head_dim + self.v_head_dim
+        if (
+            w is None
+            or s is None
+            or w.dtype != torch.float8_e4m3fn
+            or tuple(w.shape) != (self.num_heads * head_stride, self.kv_lora_rank)
+        ):
+            logger.warning_once(
+                "VLLM_B12X_ABSORB_QBMM=1 but kv_b_proj does not hold an "
+                "mxfp8 pack; falling back to the BF16 absorbed pair."
+            )
+            return False
+        from sparkinfer.gemm.qbmm_absorb import qbmm_absorb_supported
 
-        assert kv_b_proj_weight.shape == (
+        if not qbmm_absorb_supported(
+            num_heads=self.num_heads,
+            head_stride=head_stride,
+            p_dim=self.qk_nope_head_dim,
+            v_dim=self.v_head_dim,
+            latent_dim=self.kv_lora_rank,
+        ):
+            logger.warning_once(
+                "VLLM_B12X_ABSORB_QBMM=1 but the MLA geometry is outside "
+                "the qbmm kernel envelope; falling back to the BF16 pair."
+            )
+            return False
+        # Arg order matches the torch.ops.sparkinfer.qbmm_absorb_* signatures.
+        self._qbmm_geometry = (
+            self.num_heads,
+            head_stride,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
             self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-        ), (
-            f"{kv_b_proj_weight.shape=}, "
-            f"{self.kv_lora_rank=}, "
-            f"{self.num_heads=}, "
-            f"{self.qk_nope_head_dim=}, "
-            f"{self.v_head_dim=}"
         )
-        kv_b_proj_weight = kv_b_proj_weight.view(
+        return True
+
+    def _dequant_absorbed_pair(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Transient BF16 (W_UK_T, W_UV) dequantized from the kv_b pack.
+
+        Serves eager batches beyond the qbmm kernel envelope (profiler dummy
+        runs) and the DCP gather lane; the dequant expression is bitwise
+        identical to the kernel's.  The e8m0 view is load-bearing: a raw
+        uint8 .to(bf16) converts exponent bytes as integers."""
+        w = self.kv_b_proj.weight
+        s = self.kv_b_proj.weight_scale
+        if s.dtype != torch.float8_e8m0fnu:
+            s = s.view(torch.float8_e8m0fnu)
+        wf = w.to(torch.bfloat16) * s.to(torch.bfloat16).repeat_interleave(
+            32, dim=1
+        )
+        kv_b = wf.T.view(
             self.kv_lora_rank,
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
-
-        W_UK, W_UV = kv_b_proj_weight.split(
+        w_uk, w_uv = kv_b.split(
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
+        return w_uk.permute(1, 2, 0), w_uv.transpose(0, 1)
 
-        # If kv_b_proj_weight is unquantized, quantize it to mxfp4 if supported
-        if self.is_aiter_triton_fp4_bmm_enabled:
-            from vllm.model_executor.layers.quantization.quark.utils import (
-                quark_quantize_weight_to_mxfp4,
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        # we currently do not have quantized bmm's which are needed for
+        # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
+        # the bmm's in 16-bit, the extra memory overhead of this is fairly low
+        # ...unless the sparkinfer qbmm path is enabled: then decode consumes
+        # the kv_b mxfp8 pack directly and the BF16 pair is never
+        # materialized.
+        self._use_qbmm_absorb = (
+            _qbmm_absorb_enabled() and self._qbmm_absorb_supported()
+        )
+        if not self._use_qbmm_absorb:
+            kv_b_proj_weight = get_and_maybe_dequant_weights(
+                self.kv_b_proj, out_dtype=act_dtype
+            ).T
+
+            assert kv_b_proj_weight.shape == (
+                self.kv_lora_rank,
+                self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            ), (
+                f"{kv_b_proj_weight.shape=}, "
+                f"{self.kv_lora_rank=}, "
+                f"{self.num_heads=}, "
+                f"{self.qk_nope_head_dim=}, "
+                f"{self.v_head_dim=}"
+            )
+            kv_b_proj_weight = kv_b_proj_weight.view(
+                self.kv_lora_rank,
+                self.num_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
             )
 
-            self.W_K, self.W_K_scale = quark_quantize_weight_to_mxfp4(W_UK)
-            # Convert from (L, N, P) to (N, L, P)
-            self.W_K = self.W_K.transpose(0, 1)
-            self.W_K_scale = self.W_K_scale.transpose(0, 1)
-
-            self.W_V, self.W_V_scale = quark_quantize_weight_to_mxfp4(
-                W_UV.permute(1, 2, 0)
-            )
-        elif self.is_aiter_triton_fp8_bmm_enabled:
-            W_K = W_UK.transpose(0, 1)  # 16 512 128
-            W_V = W_UV.permute(1, 2, 0)  # 16 128 512
-            self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
-                W_K, dtype=current_platform.fp8_dtype()
-            )
-            self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
-                W_V, dtype=current_platform.fp8_dtype()
+            W_UK, W_UV = kv_b_proj_weight.split(
+                [self.qk_nope_head_dim, self.v_head_dim], dim=-1
             )
 
-            # The kernel operates on non-padded inputs. Hence, pre-compiling
-            # triton kernel to avoid runtime compilation for unseen batch sizes
-            # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.
-            # On DS-R1, this step adds roughly 50s to the model loading time.
-            max_batch_size = 1024  # [ToDo] Find the optimal upper limit
-            pre_compilation_list = list(range(1, max_batch_size + 1))
-            if is_global_first_rank():
-                pre_compilation_list = tqdm(
-                    pre_compilation_list,
-                    desc="[Aiter Triton] Pre-compiling fp8 BMM kernel",
-                    total=max_batch_size,
+            # If kv_b_proj_weight is unquantized, quantize it to mxfp4 if supported
+            if self.is_aiter_triton_fp4_bmm_enabled:
+                from vllm.model_executor.layers.quantization.quark.utils import (
+                    quark_quantize_weight_to_mxfp4,
                 )
 
-            for m in pre_compilation_list:
-                x = torch.empty(
-                    (self.W_K.shape[0], m, self.W_K.shape[2]),
-                    dtype=torch.bfloat16,
-                    device=self.W_K.device,
+                self.W_K, self.W_K_scale = quark_quantize_weight_to_mxfp4(W_UK)
+                # Convert from (L, N, P) to (N, L, P)
+                self.W_K = self.W_K.transpose(0, 1)
+                self.W_K_scale = self.W_K_scale.transpose(0, 1)
+
+                self.W_V, self.W_V_scale = quark_quantize_weight_to_mxfp4(
+                    W_UV.permute(1, 2, 0)
                 )
-                rocm_aiter_ops.triton_fp8_bmm(
-                    x, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
+            elif self.is_aiter_triton_fp8_bmm_enabled:
+                W_K = W_UK.transpose(0, 1)  # 16 512 128
+                W_V = W_UV.permute(1, 2, 0)  # 16 128 512
+                self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
+                    W_K, dtype=current_platform.fp8_dtype()
+                )
+                self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
+                    W_V, dtype=current_platform.fp8_dtype()
                 )
 
-                x = torch.empty(
-                    (self.W_V.shape[0], m, self.W_V.shape[2]),
-                    dtype=torch.bfloat16,
-                    device=self.W_V.device,
-                )
-                rocm_aiter_ops.triton_fp8_bmm(
-                    x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
-                )
-        else:
-            # Convert from (L, N, V) to (N, L, V)
-            replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
-            # Convert from (L, N, P) to (N, P, L)
-            replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
+                # The kernel operates on non-padded inputs. Hence, pre-compiling
+                # triton kernel to avoid runtime compilation for unseen batch sizes
+                # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.
+                # On DS-R1, this step adds roughly 50s to the model loading time.
+                max_batch_size = 1024  # [ToDo] Find the optimal upper limit
+                pre_compilation_list = list(range(1, max_batch_size + 1))
+                if is_global_first_rank():
+                    pre_compilation_list = tqdm(
+                        pre_compilation_list,
+                        desc="[Aiter Triton] Pre-compiling fp8 BMM kernel",
+                        total=max_batch_size,
+                    )
+
+                for m in pre_compilation_list:
+                    x = torch.empty(
+                        (self.W_K.shape[0], m, self.W_K.shape[2]),
+                        dtype=torch.bfloat16,
+                        device=self.W_K.device,
+                    )
+                    rocm_aiter_ops.triton_fp8_bmm(
+                        x, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
+                    )
+
+                    x = torch.empty(
+                        (self.W_V.shape[0], m, self.W_V.shape[2]),
+                        dtype=torch.bfloat16,
+                        device=self.W_V.device,
+                    )
+                    rocm_aiter_ops.triton_fp8_bmm(
+                        x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
+                    )
+            else:
+                # Convert from (L, N, V) to (N, L, V)
+                replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
+                # Convert from (L, N, P) to (N, P, L)
+                replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
@@ -1473,7 +1586,24 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
-            torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+            if getattr(self, "_use_qbmm_absorb", False):
+                if x.shape[1] <= 32:
+                    torch.ops.sparkinfer.qbmm_absorb_uv(
+                        x,
+                        self.kv_b_proj.weight,
+                        self.kv_b_proj.weight_scale,
+                        out.transpose(0, 1),
+                        None,
+                        *self._qbmm_geometry,
+                    )
+                else:
+                    torch.bmm(
+                        x,
+                        self._dequant_absorbed_pair()[1],
+                        out=out.transpose(0, 1),
+                    )
+            else:
+                torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
 
     def _v_up_proj_bmm(
         self,
