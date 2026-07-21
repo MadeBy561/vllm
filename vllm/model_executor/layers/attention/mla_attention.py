@@ -1281,6 +1281,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # we currently do not have quantized bmm's which are needed for
         # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
         # the bmm's in 16-bit, the extra memory overhead of this is fairly low
+        # Allocate the absorbed pair before the dequant scratch churns so the
+        # long-lived tensors land in clean segments; the interleaved
+        # materialize-after-scratch order measurably fragments the allocator
+        # (~350 MiB/GPU reserved-but-unallocated at GLM-5.2 TP4 geometry).
+        pre_w_uv = torch.empty(
+            (self.num_heads, self.kv_lora_rank, self.v_head_dim),
+            dtype=act_dtype, device=self.kv_b_proj.weight.device)
+        pre_w_uk_t = torch.empty(
+            (self.num_heads, self.qk_nope_head_dim, self.kv_lora_rank),
+            dtype=act_dtype, device=self.kv_b_proj.weight.device)
         kv_b_proj_weight = get_and_maybe_dequant_weights(
             self.kv_b_proj, out_dtype=act_dtype
         ).T
@@ -1362,9 +1372,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
         else:
             # Convert from (L, N, V) to (N, L, V)
-            replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
+            pre_w_uv.copy_(W_UV.transpose(0, 1))
+            replace_parameter(self, "W_UV", pre_w_uv, prefer_copy=False)
             # Convert from (L, N, P) to (N, P, L)
-            replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
+            pre_w_uk_t.copy_(W_UK.permute(1, 2, 0))
+            replace_parameter(self, "W_UK_T", pre_w_uk_t, prefer_copy=False)
 
         # With no MHA prefill backend every runtime path consumes the absorbed
         # W_UK_T/W_UV pair, so kv_b_proj's quantized weight is only ever read
