@@ -30,6 +30,12 @@ from vllm.models.deepseek_v4.nvidia.flashmla import (
     DeepseekV4FlashMLABackend,
 )
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadata
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_c128a_topk_width,
+    get_compressed_mla_max_q_chunks,
+    get_compressed_mla_split_cap,
+    get_dspark_swa_index_width,
+)
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import (
     dcp_a2a_lse_reduce,
@@ -44,9 +50,6 @@ if TYPE_CHECKING:
 _DSV4_HEAD_DIM = 512
 _DSV4_V_HEAD_DIM = 512
 _DSV4_CACHE_BYTES_PER_TOKEN = 584
-_DSV4_CACHE_PAD_ALIGNMENT_BYTES = 576
-_DECODE_SPLIT_TILE = 64
-_C128A_TOPK_ALIGNMENT = 128
 _VALIDATE_DCP_INDICES_ENV = "VLLM_DSV4_DCP_VALIDATE_INDICES"
 
 
@@ -55,11 +58,20 @@ def _cdiv(x: int, y: int) -> int:
 
 
 def _dsv4_b12x_page_nbytes(page_size: int) -> int:
-    payload_nbytes = int(page_size) * _DSV4_CACHE_BYTES_PER_TOKEN
-    return (
-        _cdiv(payload_nbytes, _DSV4_CACHE_PAD_ALIGNMENT_BYTES)
-        * _DSV4_CACHE_PAD_ALIGNMENT_BYTES
-    )
+    """Return the logical DSV4 payload bytes in one cache page.
+
+    vLLM may place padding between physical pages, but the padding is not part
+    of the compressed-MLA payload.  Keeping it out of the exported view also
+    supports standalone contiguous allocations, whose physical page stride is
+    exactly ``page_size * 584`` bytes.
+
+    Args:
+        page_size: Number of tokens stored in one cache page.
+
+    Returns:
+        The logical compressed-MLA payload size in bytes.
+    """
+    return int(page_size) * _DSV4_CACHE_BYTES_PER_TOKEN
 
 
 def _b12x_cache_page_view(
@@ -67,7 +79,25 @@ def _b12x_cache_page_view(
     page_size: int,
     name: str,
 ) -> torch.Tensor:
-    """Return a uint8 ``[pages, padded_page_bytes]`` view for b12x kernels."""
+    """Return a uint8 ``[pages, payload_bytes]`` view for SparkInfer kernels.
+
+    Preserve the physical page stride so both padded packed allocations and
+    contiguous per-layer allocations follow the same runtime contract.
+
+    Args:
+        cache: Source paged cache tensor.
+        page_size: Number of tokens stored in one cache page.
+        name: Cache name used in validation errors.
+
+    Returns:
+        A logical byte view that preserves the source physical page stride.
+
+    Raises:
+        ValueError: If ``page_size`` is not positive.
+        RuntimeError: If the cache is not paged, a page cannot contain the
+            logical payload, pages overlap, or the payload within a page is
+            not contiguous.
+    """
     page_nbytes = _dsv4_b12x_page_nbytes(page_size)
     if page_nbytes <= 0:
         raise ValueError(f"{name} page_size must be positive, got {page_size}")
@@ -77,11 +107,19 @@ def _b12x_cache_page_view(
         if int(byte_cache.shape[1]) < page_nbytes:
             raise RuntimeError(
                 f"{name} page width {int(byte_cache.shape[1])} is smaller than "
-                f"DSV4 padded page width {page_nbytes}"
+                f"DSV4 payload width {page_nbytes}"
             )
-        if not byte_cache.is_contiguous():
-            raise RuntimeError(f"{name} page cache must be contiguous")
-        return byte_cache
+        if int(byte_cache.stride(1)) != 1:
+            raise RuntimeError(
+                f"{name} page payload must be contiguous, got stride "
+                f"{tuple(byte_cache.stride())}"
+            )
+        if int(byte_cache.stride(0)) < page_nbytes:
+            raise RuntimeError(
+                f"{name} page stride {int(byte_cache.stride(0))} is smaller than "
+                f"DSV4 page payload {page_nbytes}"
+            )
+        return byte_cache[:, :page_nbytes]
 
     if byte_cache.ndim < 2:
         raise RuntimeError(
@@ -93,13 +131,22 @@ def _b12x_cache_page_view(
     if page_stride_nbytes < page_nbytes:
         raise RuntimeError(
             f"{name} page stride {page_stride_nbytes} is smaller than DSV4 page "
-            f"width {page_nbytes}"
+            f"payload {page_nbytes}"
         )
 
+    expected_stride = 1
+    for dim in range(byte_cache.ndim - 1, 0, -1):
+        if int(byte_cache.stride(dim)) != expected_stride:
+            raise RuntimeError(
+                f"{name} page payload must be contiguous, got stride "
+                f"{tuple(byte_cache.stride())}"
+            )
+        expected_stride *= int(byte_cache.shape[dim])
+
     # Packed DS4 KV cache views have a storage offset for this layer and a
-    # larger per-block stride for the whole packed block. Expose only this
-    # layer's page payload while preserving stride(0), so B12X can use the
-    # packed block stride without materializing/copying.
+    # larger per-block stride for the whole packed block. Expose only the
+    # logical payload while preserving stride(0), so SparkInfer can use the
+    # physical block stride without materializing/copying.
     page_view = torch.as_strided(
         byte_cache,
         size=(pages, page_nbytes),
@@ -287,7 +334,7 @@ def _run_compressed_mla(
     width = int(swa_indices.shape[-1])
     if indexed_indices is not None:
         width += int(indexed_indices.shape[-1])
-    decode_split_cap = max(1, _cdiv(width, _DECODE_SPLIT_TILE))
+    decode_split_cap = get_compressed_mla_split_cap(width)
     # Keep the legacy 64-wide split cap for decode, but let the b12x contract
     # select the smaller batched-prefill split count when rows > decode max.
     num_splits_cap = compressed_mla_split_chunks_for_contract(
@@ -493,28 +540,53 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
             elif self.indexer is not None:
                 indexed_width = int(self.indexer.topk_tokens)
         elif self.compress_ratio > 1:
-            indexed_width = _cdiv(self.max_model_len, self.compress_ratio)
-            indexed_width = _cdiv(indexed_width, _C128A_TOPK_ALIGNMENT)
-            indexed_width *= _C128A_TOPK_ALIGNMENT
+            indexed_width = get_c128a_topk_width(
+                self.max_model_len,
+                self.compress_ratio,
+            )
 
-        width = max(int(self.window_size) + indexed_width, 1)
+        swa_width = int(self.window_size)
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.use_dspark():
+            swa_width = max(
+                swa_width,
+                get_dspark_swa_index_width(
+                    swa_width,
+                    speculative_config.num_speculative_tokens or 0,
+                ),
+            )
+
+        width = max(swa_width + indexed_width, 1)
         rows = max(int(self.max_num_batched_tokens), 1)
-        decode_split_cap = max(1, _cdiv(width, _DECODE_SPLIT_TILE))
+        decode_split_cap = get_compressed_mla_split_cap(width)
         num_splits_cap = compressed_mla_split_chunks_for_contract(
             rows=rows,
             width=width,
             max_chunks=decode_split_cap,
         )
+        max_q_chunks = get_compressed_mla_max_q_chunks(
+            rows,
+            width,
+            decode_split_cap,
+            compressed_mla_split_chunks_for_contract,
+        )
+        dcp_world_size = max(
+            int(self.vllm_config.parallel_config.decode_context_parallel_size),
+            1,
+        )
+        # max_q_rows covers final row-sized buffers; max_q_chunks covers split
+        # intermediates whose peak can occur below max_q_rows.
         plan = plan_compressed_mla_scratch(
             B12XCompressedMLAScratchCaps(
                 device=q.device,
-                num_q_heads=int(q.shape[1]),
+                num_q_heads=int(q.shape[1]) * dcp_world_size,
                 max_q_rows=rows,
                 max_width=width,
                 head_dim=_DSV4_HEAD_DIM,
                 v_head_dim=_DSV4_V_HEAD_DIM,
                 page_size=int(self.swa_cache_layer.block_size),
                 max_chunks_per_row=num_splits_cap,
+                max_q_chunks=max_q_chunks,
             )
         )
         current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
@@ -549,6 +621,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         if attn_metadata is None:
             # Warmup dummy run: no metadata, so reserve the largest compressed
             # MLA scratch this layer can request before vLLM locks workspace.
+            # Its config-derived geometry is identical on later dummy calls.
             output.zero_()
             self._reserve_dummy_compressed_mla_scratch(q)
             return
