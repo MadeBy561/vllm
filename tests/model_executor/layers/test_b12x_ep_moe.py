@@ -7,11 +7,16 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.fused_moe.b12x_ep_moe as b12x_ep_moe
+import vllm.model_executor.layers.fused_moe.oracle.nvfp4 as nvfp4_oracle
 import vllm.model_executor.layers.fused_moe.runner.moe_runner as moe_runner
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.b12x_moe import B12xExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kNvfp4Dynamic,
+    kNvfp4Static,
+)
 
 
 def _parallel_config(**overrides) -> FusedMoEParallelConfig:
@@ -109,6 +114,68 @@ def test_b12x_ep_oracles_prefer_ep_specialization_before_tp() -> None:
         b12x_ep_moe.B12xEPExperts,
         B12xExperts,
     ]
+
+
+@pytest.mark.parametrize(
+    "activation",
+    [MoEActivation.SILU, MoEActivation.SWIGLUOAI_UNINTERLEAVE],
+)
+def test_b12x_nvfp4_oracle_accepts_supported_clamps(
+    monkeypatch: pytest.MonkeyPatch,
+    activation: MoEActivation,
+) -> None:
+    class SupportedExperts:
+        @staticmethod
+        def is_supported_config(*_args, **_kwargs):
+            return True, None
+
+    monkeypatch.setattr(
+        nvfp4_oracle,
+        "backend_to_kernel_cls",
+        lambda _backend: [SupportedExperts],
+    )
+    config = SimpleNamespace(
+        activation=activation,
+        moe_backend="b12x",
+        moe_parallel_config=SimpleNamespace(use_batched_activation_format=False),
+        swiglu_limit=10.0,
+    )
+
+    selected, _ = nvfp4_oracle.select_nvfp4_moe_backend(
+        config,
+        weight_key=kNvfp4Static,
+        activation_key=kNvfp4Dynamic,
+    )
+
+    assert selected is nvfp4_oracle.NvFp4MoeBackend.B12X
+
+
+def test_b12x_nvfp4_oracle_rejects_unsupported_clamp_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SupportedExperts:
+        @staticmethod
+        def is_supported_config(*_args, **_kwargs):
+            return True, None
+
+    monkeypatch.setattr(
+        nvfp4_oracle,
+        "backend_to_kernel_cls",
+        lambda _backend: [SupportedExperts],
+    )
+    config = SimpleNamespace(
+        activation=MoEActivation.SITU,
+        moe_backend="b12x",
+        moe_parallel_config=SimpleNamespace(use_batched_activation_format=False),
+        swiglu_limit=10.0,
+    )
+
+    with pytest.raises(ValueError, match="does not apply the SwiGLU clamp"):
+        nvfp4_oracle.select_nvfp4_moe_backend(
+            config,
+            weight_key=kNvfp4Static,
+            activation_key=kNvfp4Dynamic,
+        )
 
 
 def test_b12x_ep_runner_uses_b12x_op_and_late_allreduce(

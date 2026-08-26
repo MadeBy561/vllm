@@ -221,7 +221,8 @@ def select_nvfp4_moe_backend(
             return True
         return backend == NvFp4MoeBackend.B12X and (
             activation_key is None
-            or config.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+            or config.activation
+            in (MoEActivation.SILU, MoEActivation.SWIGLUOAI_UNINTERLEAVE)
         )
 
     if config.swiglu_limit is not None:
