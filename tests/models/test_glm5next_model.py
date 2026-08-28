@@ -18,7 +18,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
 )
 from vllm.model_executor.models.glm4_1v import Glm4vForConditionalGeneration
-from vllm.model_executor.models.interfaces import supports_pp
+from vllm.model_executor.models.interfaces import supports_eagle3, supports_pp
 from vllm.models.glm5next.nvidia import attention as glm5next_attention
 from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
 from vllm.models.glm5next.nvidia.model import (
@@ -64,6 +64,43 @@ def test_glm5next_config_preserves_official_sparse_moe_fields() -> None:
     assert text_config.logit_scale == 0.5
     assert text_config.swiglu_limit == 10.0
     assert vision_config.swiglu_limit == 10.0
+
+
+def test_glm5next_exposes_aux_hidden_states_for_external_drafters() -> None:
+    assert supports_eagle3(Glm5NextForCausalLM)
+    assert supports_eagle3(Glm5NextForConditionalGeneration)
+
+
+def test_glm5next_uses_dflash_layer_boundaries_by_default() -> None:
+    expected = (6, 15, 25, 34, 43)
+    causal = Glm5NextForCausalLM.__new__(Glm5NextForCausalLM)
+    conditional = Glm5NextForConditionalGeneration.__new__(
+        Glm5NextForConditionalGeneration
+    )
+
+    assert causal.get_eagle3_default_aux_hidden_state_layers() == expected
+    assert conditional.get_eagle3_default_aux_hidden_state_layers() == expected
+
+
+def test_glm5next_aux_hidden_state_materializes_deferred_mhc() -> None:
+    hidden_states = torch.tensor([[[1.0, 3.0]]])
+    materialized = torch.tensor([[[2.0, 4.0], [6.0, 8.0]]])
+
+    class FakeLayer:
+        mhc = True
+        n = 2
+
+        def hc_post(self, hidden_states, residual, post, comb):
+            assert residual is not None
+            assert post is not None
+            assert comb is not None
+            return materialized
+
+    actual = Glm5NextModel._materialize_aux_hidden_state(
+        FakeLayer(), hidden_states, hidden_states, hidden_states, hidden_states
+    )
+
+    torch.testing.assert_close(actual, materialized.mean(dim=1))
 
 
 def test_glm5next_config_accepts_prebuilt_subconfigs() -> None:
