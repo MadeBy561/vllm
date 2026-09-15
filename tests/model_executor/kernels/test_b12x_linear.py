@@ -42,16 +42,29 @@ from vllm.utils.b12x import B12xWorkload, register_b12x_layer
 from vllm.utils.torch_utils import _encode_layer_name
 
 
-def _prepare(layer, *, device, counts, fixed=(), output_dtype=torch.bfloat16,
-             max_tokens=None, autotune=False, stage="weights"):
+def _prepare(
+    layer,
+    *,
+    device,
+    counts,
+    fixed=(),
+    output_dtype=torch.bfloat16,
+    max_tokens=None,
+    autotune=False,
+    stage="weights",
+):
     """Collect a layer's preparation units and fill their plans in place."""
     from b12x.preparation import PreparationSession
 
     max_tokens = max_tokens or max(counts)
     workload = B12xWorkload(
-        stage=stage, token_counts=tuple(sorted(set(counts))),
-        fixed_token_counts=tuple(sorted(set(fixed))), output_dtype=output_dtype,
-        max_tokens=max_tokens, max_seqs=1, max_model_len=max_tokens,
+        stage=stage,
+        token_counts=tuple(sorted(set(counts))),
+        fixed_token_counts=tuple(sorted(set(fixed))),
+        output_dtype=output_dtype,
+        max_tokens=max_tokens,
+        max_seqs=1,
+        max_model_len=max_tokens,
     )
     provider = layer.b12x_preparation_provider
     units = list(provider.get_b12x_preparation_units(layer, workload))
@@ -616,15 +629,17 @@ def test_b12x_nvfp4_declares_caller_workspace_capacity(
         def request(self, **kwargs):
             return types.SimpleNamespace(name=kwargs["name"])
 
+    def plan_regimes(query, **_kwargs):
+        queries.append(query)
+        return Declaration()
+
     api = types.SimpleNamespace(
         BlockscaledQuery=lambda **kwargs: kwargs,
-        plan_regimes=lambda query, **_kwargs: queries.append(query) or Declaration(),
+        plan_regimes=plan_regimes,
     )
     monkeypatch.setattr(blockscaled_mod, "get_b12x_blockscaled", lambda: api)
     if workspace_nbytes is None:
-        monkeypatch.delenv(
-            "VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES", raising=False
-        )
+        monkeypatch.delenv("VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES", raising=False)
         expected = 2_000_000_000
     else:
         monkeypatch.setenv(
@@ -644,8 +659,13 @@ def test_b12x_nvfp4_declares_caller_workspace_capacity(
         packed, recipe="nvfp4", activation_mode="a16", layer_name="layer"
     )
     workload = B12xWorkload(
-        stage="weights", token_counts=(65_536,), fixed_token_counts=(),
-        output_dtype=torch.bfloat16, max_tokens=65_536, max_seqs=1, max_model_len=65_536,
+        stage="weights",
+        token_counts=(65_536,),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=65_536,
+        max_seqs=1,
+        max_model_len=65_536,
     )
 
     holder.unit(workload, name="x")
@@ -742,8 +762,8 @@ def test_b12x_block_fp8_upcasts_e8m0_weight_scales(scale_dtype) -> None:
 def test_b12x_mxfp8_apply_delegates_to_layer_held_linear_holder(monkeypatch) -> None:
     """apply_weights reshapes the activation and hands it to the layer-held
     ``B12xBlockscaledLinear.run``, resolved through the layer-name op body."""
-    import vllm.utils.b12x as b12x_utils
     import vllm.model_executor.kernels.linear.mxfp8.b12x as b12x_mod
+    import vllm.utils.b12x as b12x_utils
 
     # The op is registered under this host's platform dispatch key (CUDA, even
     # with no visible device), so run the real op body directly rather than
@@ -960,18 +980,20 @@ def test_b12x_mxfp4_apply_calls_native_blockscaled_gemm(monkeypatch) -> None:
     assert kwargs == {"plan": plan, "out_dtype": torch.bfloat16}
 
 
-
-
 def test_b12x_w4a16_modelopt_vision_width_preserves_bf16_activations(monkeypatch):
     """The real 4304-wide vision MLP must not fall back or quantize activations."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (12, 0),
+        (12, 1),
+    ):
         pytest.skip("SM120/SM121 required")
-    from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
-    from vllm.model_executor.layers.quantization.modelopt import (
-        ModelOptNvFp4Config, ModelOptNvFp4W4A16LinearMethod,
-    )
     import vllm.model_executor.kernels.linear.nvfp4.b12x as native
     import vllm.model_executor.parameter as parameter
+    from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4Config,
+        ModelOptNvFp4W4A16LinearMethod,
+    )
     from vllm.v1.worker.workspace import (
         current_workspace_manager,
         init_workspace_manager,
@@ -982,27 +1004,38 @@ def test_b12x_w4a16_modelopt_vision_width_preserves_bf16_activations(monkeypatch
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
 
     monkeypatch.setenv("VLLM_B12X_NVFP4_ACTIVATION_MODE", "auto")
+
     def reject_activation_quantization(*args, **kwargs):
         raise AssertionError("W4A16 must not quantize BF16 activations")
+
     monkeypatch.setattr(native, "scaled_fp4_quant", reject_activation_quantization)
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     torch.manual_seed(3816)
     n, k = 1152, 4304
     config = VllmConfig(kernel_config=KernelConfig(linear_backend="b12x"))
     with set_current_vllm_config(config), torch.no_grad():
-        method = ModelOptNvFp4W4A16LinearMethod(ModelOptNvFp4Config(
-            quant_method="W4A16_NVFP4", is_checkpoint_nvfp4_serialized=True,
-        ))
+        method = ModelOptNvFp4W4A16LinearMethod(
+            ModelOptNvFp4Config(
+                quant_method="W4A16_NVFP4",
+                is_checkpoint_nvfp4_serialized=True,
+            )
+        )
         layer = torch.nn.Module()
         with torch.device(device):
             method.create_weights(
-                layer, input_size_per_partition=k, output_partition_sizes=[n],
-                input_size=k, output_size=n, params_dtype=torch.bfloat16,
+                layer,
+                input_size_per_partition=k,
+                output_partition_sizes=[n],
+                input_size=k,
+                output_size=n,
+                params_dtype=torch.bfloat16,
             )
         codes = torch.randint(0, 16, (n, k), dtype=torch.uint8, device=device)
         scales = (torch.rand(n, k // 16, device=device) + 0.125).to(torch.float8_e4m3fn)
-        table = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6],
-                             device=device)
+        table = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            device=device,
+        )
         decoded = table[codes.long()] * scales.float().repeat_interleave(16, 1) * 0.25
         layer.weight.copy_(codes[:, ::2] | codes[:, 1::2] << 4)
         layer.weight_scale.copy_(scales)
@@ -1013,11 +1046,17 @@ def test_b12x_w4a16_modelopt_vision_width_preserves_bf16_activations(monkeypatch
         method.process_weights_after_loading(layer)
         counts = (1, 2, 4, 8, 32)
         session, _ = _prepare(
-            layer, device=device, counts=counts, fixed=(1, 2, 4, 8), max_tokens=32,
+            layer,
+            device=device,
+            counts=counts,
+            fixed=(1, 2, 4, 8),
+            max_tokens=32,
         )
         try:
             for rows in reversed(counts):
-                source = torch.randn(rows, k, dtype=torch.bfloat16, device=device) * 0.125
+                source = (
+                    torch.randn(rows, k, dtype=torch.bfloat16, device=device) * 0.125
+                )
                 expected = (source.float() @ decoded.T).bfloat16()
                 actual = method.apply(layer, source)
                 torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.125)
@@ -1027,13 +1066,17 @@ def test_b12x_w4a16_modelopt_vision_width_preserves_bf16_activations(monkeypatch
                         with torch.cuda.graph(graph):
                             output = method.apply(layer, source)
                         source.mul_(-0.5)
-                        allocated = torch.cuda.memory_allocated(device)
+                        allocated = torch.accelerator.memory_allocated(device)
                         graph.replay()
-                        torch.cuda.synchronize(device)
-                        assert torch.cuda.memory_allocated(device) == allocated
+                        torch.accelerator.synchronize(device)
+                        assert torch.accelerator.memory_allocated(device) == allocated
                         expected = (source.float() @ decoded.T).bfloat16()
-                        torch.testing.assert_close(output, expected, rtol=0.02, atol=0.125)
-                        assert (output.float() - expected.float()).norm() / expected.float().norm() < 0.005
+                        torch.testing.assert_close(
+                            output, expected, rtol=0.02, atol=0.125
+                        )
+                        assert (
+                            output.float() - expected.float()
+                        ).norm() / expected.float().norm() < 0.005
                     finally:
                         graph.reset()
         finally:
@@ -1135,7 +1178,9 @@ def _serialized_probe_layer(name: str) -> torch.nn.Module:
     layer.b12x_bf16_input_supported = True
     layer.b12x_nvfp4_serialized_activations = True
     layer.b12x_nvfp4_packed_weight = types.SimpleNamespace(
-        in_features=256, padded_in_features=256, out_features=48,
+        in_features=256,
+        padded_in_features=256,
+        out_features=48,
         values=torch.empty(0, dtype=torch.uint8),
     )
     layer.b12x_layer_name = _encode_layer_name(name)
@@ -1145,10 +1190,16 @@ def _serialized_probe_layer(name: str) -> torch.nn.Module:
 
 def _serialized_query(rows: int, output_dtype: str) -> dict:
     return {
-        "recipe": "nvfp4", "call_kind": "serialized", "max_rows": rows,
-        "in_features": 256, "padded_in_features": 256, "out_features": 48,
-        "input_dtype": "uint8", "output_dtype": output_dtype,
-        "expected_m": rows, "alpha_mode": "tensor",
+        "recipe": "nvfp4",
+        "call_kind": "serialized",
+        "max_rows": rows,
+        "in_features": 256,
+        "padded_in_features": 256,
+        "out_features": 48,
+        "input_dtype": "uint8",
+        "output_dtype": output_dtype,
+        "expected_m": rows,
+        "alpha_mode": "tensor",
     }
 
 
@@ -1156,12 +1207,19 @@ def test_b12x_nvfp4_serialized_lookup_declares_an_unplanned_row_count_without_pr
     monkeypatch,
 ) -> None:
     import b12x.preparation as preparation
+
     import vllm.model_executor.kernels.linear.nvfp4.b12x as b12x_mod
 
     declared: list[_SerializedPlanProbe] = []
+
+    def declare(query):
+        plan = _SerializedPlanProbe(query)
+        declared.append(plan)
+        return plan
+
     api = types.SimpleNamespace(
         FixedBlockscaledQuery=lambda **kwargs: kwargs,
-        plan=lambda query: declared.append(_SerializedPlanProbe(query)) or declared[-1],
+        plan=declare,
     )
     monkeypatch.setattr(b12x_mod, "_import_b12x_blockscaled", lambda: api)
     prepared = []
@@ -1169,10 +1227,12 @@ def test_b12x_nvfp4_serialized_lookup_declares_an_unplanned_row_count_without_pr
         preparation, "prepare_default", lambda request: prepared.append(request)
     )
     calls = []
-    monkeypatch.setattr(
-        b12x_mod, "_serialized_call",
-        lambda layer, rows, out_dtype: calls.append((layer, rows, out_dtype)) or f"call:{rows}",
-    )
+
+    def record_call(layer, rows, out_dtype):
+        calls.append((layer, rows, out_dtype))
+        return f"call:{rows}"
+
+    monkeypatch.setattr(b12x_mod, "_serialized_call", record_call)
     layer = _serialized_probe_layer("nvfp4-serialized-lookup-probe")
     planned = _SerializedPlanProbe()
     layer.b12x_nvfp4_serialized_plans[6] = planned
@@ -1197,6 +1257,7 @@ def test_b12x_nvfp4_serialized_runtime_declaration_matches_the_startup_unit(
     """A row count declared at serving time gets the query the startup
     preparation unit would have declared for it."""
     import b12x.preparation as preparation
+
     import vllm.model_executor.kernels.linear.nvfp4.b12x as b12x_mod
 
     api = types.SimpleNamespace(
@@ -1206,13 +1267,19 @@ def test_b12x_nvfp4_serialized_runtime_declaration_matches_the_startup_unit(
     monkeypatch.setattr(b12x_mod, "_import_b12x_blockscaled", lambda: api)
     monkeypatch.setattr(preparation, "prepare_default", lambda request: None)
     monkeypatch.setattr(
-        b12x_mod, "_serialized_call",
+        b12x_mod,
+        "_serialized_call",
         lambda layer, rows, out_dtype: (layer.b12x_layer_name, rows, out_dtype),
     )
     kernel = object.__new__(B12xNvFp4LinearKernel)
     workload = B12xWorkload(
-        stage="weights", token_counts=(11,), fixed_token_counts=(),
-        output_dtype=torch.float16, max_tokens=11, max_seqs=1, max_model_len=11,
+        stage="weights",
+        token_counts=(11,),
+        fixed_token_counts=(),
+        output_dtype=torch.float16,
+        max_tokens=11,
+        max_seqs=1,
+        max_model_len=11,
     )
     startup_layer = _serialized_probe_layer("nvfp4-serialized-probe")
     (unit,) = kernel.get_b12x_preparation_units(startup_layer, workload)
@@ -1231,7 +1298,9 @@ def test_b12x_nvfp4_serialized_runtime_declaration_matches_the_startup_unit(
     assert runtime_plan.request_kwargs is None
 
 
-def test_b12x_nvfp4_serialized_prepare_call_primes_the_layer_weights(monkeypatch) -> None:
+def test_b12x_nvfp4_serialized_prepare_call_primes_the_layer_weights(
+    monkeypatch,
+) -> None:
     import vllm.model_executor.kernels.linear.nvfp4.b12x as b12x_mod
 
     quant_calls = []
@@ -1244,9 +1313,12 @@ def test_b12x_nvfp4_serialized_prepare_call_primes_the_layer_weights(monkeypatch
 
     monkeypatch.setattr(b12x_mod, "scaled_fp4_quant", quant)
     runs = []
-    state = types.SimpleNamespace(
-        run_serialized=lambda *args, **kwargs: runs.append((args, kwargs)) or "out",
-    )
+
+    def run_serialized(*args, **kwargs):
+        runs.append((args, kwargs))
+        return "out"
+
+    state = types.SimpleNamespace(run_serialized=run_serialized)
     layer = _serialized_probe_layer("nvfp4-serialized-call-probe")
 
     call = b12x_mod._serialized_call(layer, 3, torch.float16)(state)
@@ -1254,28 +1326,38 @@ def test_b12x_nvfp4_serialized_prepare_call_primes_the_layer_weights(monkeypatch
     assert call.run() == "out"
 
     assert call.owners == (
-        layer.weight, layer.weight_scale, layer.alpha, layer.input_global_scale_inv,
+        layer.weight,
+        layer.weight_scale,
+        layer.alpha,
+        layer.input_global_scale_inv,
     )
     ((source, scale, kwargs),) = quant_calls
     assert source.shape == (3, 256) and source.dtype == torch.float16
     assert scale is layer.input_global_scale_inv
     assert kwargs == {"is_sf_swizzled_layout": True}
-    assert runs == [(
-        (values, source_scales, layer.weight, layer.weight_scale, layer.alpha),
-        {
-            "ab_dtype": "float4_e2m1fn", "sf_dtype": "float8_e4m3fn",
-            "c_dtype": "float16", "sf_vec_size": 16, "block_fp8": False,
-            "stream": None,
-        },
-    )]
+    assert runs == [
+        (
+            (values, source_scales, layer.weight, layer.weight_scale, layer.alpha),
+            {
+                "ab_dtype": "float4_e2m1fn",
+                "sf_dtype": "float8_e4m3fn",
+                "c_dtype": "float16",
+                "sf_vec_size": 16,
+                "block_fp8": False,
+                "stream": None,
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize("mode", ["auto", "a16", "quantized"])
-def test_b12x_nvfp4_bf16_delegates_to_layer_held_linear_holder(monkeypatch, mode) -> None:
+def test_b12x_nvfp4_bf16_delegates_to_layer_held_linear_holder(
+    monkeypatch, mode
+) -> None:
     """The packed-BF16 path is chosen regardless of activation mode and
     delegates to the layer-held ``B12xBlockscaledLinear`` holder."""
-    import vllm.utils.b12x as b12x_utils
     import vllm.model_executor.kernels.linear.nvfp4.b12x as b12x_mod
+    import vllm.utils.b12x as b12x_utils
 
     # Bypass the CUDA-only op dispatch key (see the mxfp8 apply test above)
     # and run the real op body directly.
@@ -1364,12 +1446,12 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
     ):
         pytest.skip("SM120/SM121 required")
     blockscaled = pytest.importorskip("b12x.gemm.blockscaled")
-    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
-    from vllm._custom_ops import scaled_fp4_quant
     from tests.kernels.quantization.nvfp4_utils import dequantize_nvfp4_to_dtype
+    from vllm._custom_ops import scaled_fp4_quant
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         _mxfp8_e4m3_quantize_torch,
     )
+    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
     monkeypatch.setenv(f"VLLM_B12X_{recipe.upper()}_ACTIVATION_MODE", mode)
     torch.manual_seed(1234)
@@ -1388,7 +1470,7 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
         layer.input_global_scale_inv = torch.tensor([128.0], device="cuda")
         layer.alpha = layer.weight_global_scale / layer.input_global_scale_inv
         kernel = B12xNvFp4LinearKernel(NvFp4LinearLayerConfig())
-        counts = (1, 8, 32)
+        counts: tuple[int, ...] = (1, 8, 32)
     else:
         values = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
         exponents = torch.randint(
@@ -1413,7 +1495,10 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
             assert packed.scale_mma.data_ptr() == layer.weight_scale.data_ptr()
             assert packed.global_scale is layer.weight_global_scale
         session, _ = _prepare(
-            layer, device=torch.device("cuda"), counts=counts, fixed=fixed,
+            layer,
+            device=torch.device("cuda"),
+            counts=counts,
+            fixed=fixed,
             max_tokens=max(counts),
         )
         bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
@@ -1427,15 +1512,24 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
                 )
                 return (
                     dequantize_nvfp4_to_dtype(
-                        aq, sf, layer.input_global_scale_inv, torch.float32, source.device,
-                    ) @ decoded.T
+                        aq,
+                        sf,
+                        layer.input_global_scale_inv,
+                        torch.float32,
+                        source.device,
+                    )
+                    @ decoded.T
                 ).bfloat16() + bias
             aq, sf = _mxfp8_e4m3_quantize_torch(source)
-            query = blockscaled.query_from_call((aq, sf), packed, out_dtype=source.dtype)
+            query = blockscaled.query_from_call(
+                (aq, sf), packed, out_dtype=source.dtype
+            )
             plan = reference_plans.get(query)
             if plan is None:
                 plan = reference_plans[query] = blockscaled.plan(query)
-            return blockscaled.mm((aq, sf), packed, bias=bias, out_dtype=source.dtype, plan=plan)
+            return blockscaled.mm(
+                (aq, sf), packed, bias=bias, out_dtype=source.dtype, plan=plan
+            )
 
         reference_plans = {}
 
@@ -1461,7 +1555,9 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
                     assert output.data_ptr() == pointer
                     assert torch.isfinite(output).all() and torch.count_nonzero(output)
             expected = reference(source, config.mode == "a16")
-            relative = (output.float() - expected.float()).norm() / expected.float().norm()
+            relative = (
+                output.float() - expected.float()
+            ).norm() / expected.float().norm()
             assert relative < 0.005
     finally:
         session.close()
@@ -1500,6 +1596,7 @@ def test_v41_block32_adapter_preserves_native_output_view_and_replay(
     from types import SimpleNamespace
 
     from b12x._lib.runtime_control import kernel_resolution_guard
+
     from vllm.models.deepseek_v4_1 import b12x_layers
     from vllm.v1.worker import workspace
 
@@ -1525,15 +1622,18 @@ def test_v41_block32_adapter_preserves_native_output_view_and_replay(
     from b12x._lib import dense_gemm
 
     dense_gemm._cached_alpha_one(device)
-    allocated_before = torch.cuda.memory_allocated(device)
+    allocated_before = torch.accelerator.memory_allocated(device)
     session, _ = _prepare(layer, device=device, counts=(1, 8, 17), fixed=(1, 8))
-    assert torch.cuda.memory_allocated(device) == allocated_before
+    assert torch.accelerator.memory_allocated(device) == allocated_before
     session.freeze()
     manager = workspace.current_workspace_manager()
-    manager.reserve_all(*(
-        (spec.shape, spec.dtype)
-        for plan in layer.b12x_plans for spec in plan.scratch_specs()
-    ))
+    manager.reserve_all(
+        *(
+            (spec.shape, spec.dtype)
+            for plan in layer.b12x_plans
+            for spec in plan.scratch_specs()
+        )
+    )
     manager.lock()
     source = torch.randn((*leading_shape, 128), device=device, dtype=torch.bfloat16)
 
@@ -1558,20 +1658,25 @@ def test_v41_block32_adapter_preserves_native_output_view_and_replay(
             for rows in (1, 3, 8, 9, 17):
                 live = source.reshape(-1, 128)[:rows]
                 torch.testing.assert_close(
-                    apply(live), oracle().reshape(-1, 96)[:rows],
-                    rtol=0.01, atol=0.01,
+                    apply(live),
+                    oracle().reshape(-1, 96)[:rows],
+                    rtol=0.01,
+                    atol=0.01,
                 )
-            with workspace.collect_cuda_graph_capture_resources() as retained:
-                with session.capture(), torch.cuda.graph(graph):
-                    captured = apply(source)
+            with (
+                workspace.collect_cuda_graph_capture_resources() as retained,
+                session.capture(),
+                torch.cuda.graph(graph),
+            ):
+                captured = apply(source)
             source.mul_(0.5)
             captured.fill_(float("nan"))
             address = captured.data_ptr()
-            allocated = torch.cuda.memory_allocated(device)
+            allocated = torch.accelerator.memory_allocated(device)
             graph.replay()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             assert captured.data_ptr() == address
-            assert torch.cuda.memory_allocated(device) == allocated
+            assert torch.accelerator.memory_allocated(device) == allocated
             assert torch.isfinite(captured).all() and torch.count_nonzero(captured) > 0
             torch.testing.assert_close(captured, oracle(), rtol=0.01, atol=0.01)
             del retained
@@ -1582,6 +1687,7 @@ def test_v41_block32_adapter_preserves_native_output_view_and_replay(
 
 def _check_v41_vocab_embedding_and_tied_head(device):
     from b12x._lib.runtime_control import kernel_resolution_guard
+
     from vllm.distributed.parallel_state import graph_capture
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -1618,9 +1724,9 @@ def _check_v41_vocab_embedding_and_tied_head(device):
     probe = torch.zeros((1, hidden), dtype=torch.bfloat16, device=device)
     probe[0, 0] = 1
     target.quant_method.process_weights_after_loading(target)
-    allocated_before = torch.cuda.memory_allocated(device)
+    allocated_before = torch.accelerator.memory_allocated(device)
     session, _ = _prepare(target, device=device, counts=(1, 3, ids.numel()))
-    assert torch.cuda.memory_allocated(device) == allocated_before
+    assert torch.accelerator.memory_allocated(device) == allocated_before
     session.freeze()
     processor = LogitsProcessor(vocab)
 
@@ -1638,27 +1744,34 @@ def _check_v41_vocab_embedding_and_tied_head(device):
     graph = torch.cuda.CUDAGraph()
     try:
         lookup = torch.compile(
-            lambda values: target.quant_method.embedding(target, values), fullgraph=True,
+            lambda values: target.quant_method.embedding(target, values),
+            fullgraph=True,
         )
         for dtype in (torch.int32, torch.int64):
             local_ids = torch.arange(ids.numel(), device=device, dtype=dtype)
             for rows in (1, 3, ids.numel()):
                 actual = lookup(local_ids[:rows])
                 torch.testing.assert_close(
-                    actual, target.weight[local_ids[:rows].long()], rtol=0, atol=0,
+                    actual,
+                    target.weight[local_ids[:rows].long()],
+                    rtol=0,
+                    atol=0,
                 )
             with session.capture(), torch.cuda.graph(graph):
                 local_out = lookup(local_ids)
             address = local_out.data_ptr()
-            allocated = torch.cuda.memory_allocated(device)
+            allocated = torch.accelerator.memory_allocated(device)
             local_ids.add_(7)
             local_out.fill_(float("nan"))
             graph.replay()
-            torch.cuda.synchronize(device)
+            torch.accelerator.synchronize(device)
             assert local_out.data_ptr() == address
-            assert torch.cuda.memory_allocated(device) == allocated
+            assert torch.accelerator.memory_allocated(device) == allocated
             torch.testing.assert_close(
-                local_out, target.weight[local_ids.long()], rtol=0, atol=0,
+                local_out,
+                target.weight[local_ids.long()],
+                rtol=0,
+                atol=0,
             )
             graph.reset()
 
@@ -1678,11 +1791,11 @@ def _check_v41_vocab_embedding_and_tied_head(device):
             checkpoint.neg_()
             target.weight_loader(target.weight, checkpoint)
             captured.fill_(float("nan"))
-            allocated = torch.cuda.memory_allocated(device)
+            allocated = torch.accelerator.memory_allocated(device)
             graph.replay()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             assert captured.data_ptr() == address
-            assert torch.cuda.memory_allocated(device) == allocated
+            assert torch.accelerator.memory_allocated(device) == allocated
             torch.testing.assert_close(captured, checkpoint[ids], rtol=0, atol=0)
             # Reload the target after tying: the head must see current weights,
             # not a copied or prepacked snapshot from embedding finalization.
@@ -1710,7 +1823,7 @@ def _run_v41_sharded_embedding(rank, port):
     )
 
     device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
     with set_current_vllm_config(VllmConfig()), torch.no_grad():
         try:
             init_test_distributed_environment(2, 1, rank, str(port), local_rank=rank)
@@ -1724,7 +1837,7 @@ def _run_v41_sharded_embedding(rank, port):
 def test_v41_vocab_embedding_sharded_global_ids_and_target_weight_tie(monkeypatch):
     # This test already spawns fresh workers. Forking an outer test process
     # after a preceding CUDA test would inherit an unusable CUDA context.
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+    if not torch.cuda.is_available() or torch.accelerator.device_count() < 2:
         pytest.skip("native b12x embedding requires two GPUs")
     if any(torch.cuda.get_device_capability(i)[0] != 12 for i in range(2)):
         pytest.skip("native b12x embedding requires two SM12x GPUs")
@@ -1755,7 +1868,7 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x mHC requires SM12x")
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     capacity, hidden = 4096, 5120
     monkeypatch.setattr(b12x_layers, "_capacity", lambda: capacity)
     monkeypatch.setattr(
@@ -1771,11 +1884,11 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
         hc_eps=1e-6,
         hc_sinkhorn_iters=20,
     )
-    allocated = torch.cuda.memory_allocated(device)
+    allocated = torch.accelerator.memory_allocated(device)
     with torch.device(device):
         first, second = b12x_layers.B12xMHC(config), b12x_layers.B12xMHC(config)
     # Model construction must not reserve capacity-sized activations per layer.
-    assert torch.cuda.memory_allocated(device) - allocated < 1024**2
+    assert torch.accelerator.memory_allocated(device) - allocated < 1024**2
     torch.manual_seed(4124096)
     shape = (tokens, hidden) if broadcast else (tokens, 4, hidden)
     residual = torch.randn(shape, device=device, dtype=torch.bfloat16)
@@ -1818,9 +1931,13 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
     second.bind_layer_name(second_name)
 
     workload = B12xWorkload(
-        stage="weights", token_counts=(1, 8, 24, capacity),
-        fixed_token_counts=(1, 8, 24), output_dtype=torch.bfloat16,
-        max_tokens=capacity, max_seqs=1, max_model_len=capacity,
+        stage="weights",
+        token_counts=(1, 8, 24, capacity),
+        fixed_token_counts=(1, 8, 24),
+        output_dtype=torch.bfloat16,
+        max_tokens=capacity,
+        max_seqs=1,
+        max_model_len=capacity,
     )
     units = [
         *first.get_b12x_preparation_units(first_owner, workload),
@@ -1837,16 +1954,37 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
 
     reference_plans = [
         mhc.plan(
-            mhc.Caps(device=device, max_tokens=tokens, hidden_size=hidden, split_k=hidden // 64),
+            mhc.Caps(
+                device=device,
+                max_tokens=tokens,
+                hidden_size=hidden,
+                split_k=hidden // 64,
+            ),
             invocation=FrozenMapping(invocation),
         )
         for invocation in (
-            dict(operation="pre", output_mode="functional", lagged_mix=True,
-                 expanded_residual=not broadcast, has_norm_weight=True,
-                 rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20, norm_eps=1e-20),
-            dict(operation="pre", output_mode="functional", lagged_mix=True,
-                 expanded_residual=True, has_norm_weight=True,
-                 rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20, norm_eps=1e-20),
+            dict(
+                operation="pre",
+                output_mode="functional",
+                lagged_mix=True,
+                expanded_residual=not broadcast,
+                has_norm_weight=True,
+                rms_eps=1e-20,
+                hc_eps=1e-6,
+                sinkhorn_iters=20,
+                norm_eps=1e-20,
+            ),
+            dict(
+                operation="pre",
+                output_mode="functional",
+                lagged_mix=True,
+                expanded_residual=True,
+                has_norm_weight=True,
+                rms_eps=1e-20,
+                hc_eps=1e-6,
+                sinkhorn_iters=20,
+                norm_eps=1e-20,
+            ),
             dict(operation="post", output_mode="functional"),
         )
     ]
@@ -1854,19 +1992,30 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
     def expected():
         incoming = identity
         state = residual
-        outputs = []
+        outputs: list[torch.Tensor] = []
         for index in range(2):
             predicted = torch.empty_like(incoming)
             result = mhc.run_pre(
-                state, first_fn if index == 0 else fn, scale, bias,
-                pre_mix=incoming, pre_out=predicted, norm_weight=norm,
-                norm_eps=1e-20, rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
+                state,
+                first_fn if index == 0 else fn,
+                scale,
+                bias,
+                pre_mix=incoming,
+                pre_out=predicted,
+                norm_weight=norm,
+                norm_eps=1e-20,
+                rms_eps=1e-20,
+                hc_eps=1e-6,
+                sinkhorn_iters=20,
                 plan=reference_plans[index],
             )
             outputs.extend((*result, predicted))
             if index == 0:
                 state = mhc.run_post(
-                    result[3] * 0.125, result[0], result[1], result[2],
+                    result[3] * 0.125,
+                    result[0],
+                    result[1],
+                    result[2],
                     plan=reference_plans[2],
                 )
                 outputs.append(state)
@@ -1887,7 +2036,8 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
     specs = [
         spec
         for plan in (
-            first._plans[("pre", capacity)], first._plans[("post_pre", capacity)],
+            first._plans[("pre", capacity)],
+            first._plans[("post_pre", capacity)],
         )
         for spec in plan.memory_requirements().scratch
     ]
@@ -1910,7 +2060,7 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
         for factor in (0.5, -1.0):
             residual.mul_(factor)
             graph.replay()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             for got, want in zip(captured, expected(), strict=True):
                 torch.testing.assert_close(got, want, rtol=2e-5, atol=0.008)
         del resources
@@ -1922,8 +2072,11 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
 def _holder_with_prepared_state(monkeypatch, *, required_workspace: int):
     """A holder whose plan resolves to a fake prepared state; mm is recorded."""
     import b12x.preparation as preparation
+
     import vllm.model_executor.kernels.linear.b12x_blockscaled as module
-    from vllm.model_executor.kernels.linear.b12x_blockscaled import B12xBlockscaledLinear
+    from vllm.model_executor.kernels.linear.b12x_blockscaled import (
+        B12xBlockscaledLinear,
+    )
 
     holder = B12xBlockscaledLinear.__new__(B12xBlockscaledLinear)
     holder.layer_name = "layer.linear"
@@ -1931,11 +2084,19 @@ def _holder_with_prepared_state(monkeypatch, *, required_workspace: int):
     holder.activation_scale = None
     holder.plan = types.SimpleNamespace(prepared=object())
     state = types.SimpleNamespace(required_workspace=required_workspace)
-    monkeypatch.setattr(preparation, "require_prepared", lambda plan, component, device=None: state)
-    calls = []
     monkeypatch.setattr(
-        module, "get_b12x_blockscaled",
-        lambda: types.SimpleNamespace(mm=lambda *args, **kwargs: calls.append(kwargs) or "out"),
+        preparation, "require_prepared", lambda plan, component, device=None: state
+    )
+    calls = []
+
+    def mm(*args, **kwargs):
+        calls.append(kwargs)
+        return "out"
+
+    monkeypatch.setattr(
+        module,
+        "get_b12x_blockscaled",
+        lambda: types.SimpleNamespace(mm=mm),
     )
     return holder, calls
 
@@ -1945,17 +2106,23 @@ def test_b12x_holder_reports_its_prepared_scratch_requirement(monkeypatch) -> No
     assert holder.get_workspace_size(11) == 4096
     holder.plan = types.SimpleNamespace(
         prepared=None,
-        scratch_specs=lambda: (types.SimpleNamespace(nbytes=100), types.SimpleNamespace(nbytes=28)),
+        scratch_specs=lambda: (
+            types.SimpleNamespace(nbytes=100),
+            types.SimpleNamespace(nbytes=28),
+        ),
     )
     assert holder.get_workspace_size(11) == 128
 
 
-def test_b12x_holder_runs_inside_the_reserved_scratch_when_one_is_bound(monkeypatch) -> None:
+def test_b12x_holder_runs_inside_the_reserved_scratch_when_one_is_bound(
+    monkeypatch,
+) -> None:
     import vllm.v1.worker.workspace as workspace
 
     holder, calls = _holder_with_prepared_state(monkeypatch, required_workspace=64)
     monkeypatch.setattr(
-        workspace, "current_workspace_manager",
+        workspace,
+        "current_workspace_manager",
         lambda: (_ for _ in ()).throw(AssertionError("the manager must not be asked")),
     )
     reserved = torch.zeros(256, dtype=torch.uint8)
@@ -1965,20 +2132,30 @@ def test_b12x_holder_runs_inside_the_reserved_scratch_when_one_is_bound(monkeypa
     (kwargs,) = calls
     assert kwargs["workspace"].data_ptr() == reserved.data_ptr()
     assert kwargs["workspace"].numel() == 64
-    with workspace.use_preallocated_workspace(torch.zeros(32, dtype=torch.uint8)):
-        with pytest.raises(ValueError, match="reserved scratch holds 32 bytes"):
-            holder.run(source, None)
+    with (
+        workspace.use_preallocated_workspace(torch.zeros(32, dtype=torch.uint8)),
+        pytest.raises(ValueError, match="reserved scratch holds 32 bytes"),
+    ):
+        holder.run(source, None)
 
 
-def test_b12x_holder_draws_from_the_manager_without_a_reserved_scratch(monkeypatch) -> None:
+def test_b12x_holder_draws_from_the_manager_without_a_reserved_scratch(
+    monkeypatch,
+) -> None:
     import vllm.v1.worker.workspace as workspace
 
     holder, calls = _holder_with_prepared_state(monkeypatch, required_workspace=64)
     drawn = torch.zeros(64, dtype=torch.uint8)
     requests = []
+
+    def get_simultaneous(*specs):
+        requests.append(specs)
+        return (drawn,)
+
     monkeypatch.setattr(
-        workspace, "current_workspace_manager",
-        lambda: types.SimpleNamespace(get_simultaneous=lambda *specs: requests.append(specs) or (drawn,)),
+        workspace,
+        "current_workspace_manager",
+        lambda: types.SimpleNamespace(get_simultaneous=get_simultaneous),
     )
     assert holder.run(torch.zeros(3, 16, dtype=torch.bfloat16), None) == "out"
     assert requests == [(((64,), torch.uint8),)]
@@ -2013,16 +2190,55 @@ def test_b12x_linear_methods_report_their_kernel_scratch_requirement() -> None:
 
 
 @pytest.mark.parametrize("recipe", ["block", "tensor"])
+def test_b12x_fp8_preparation_unit_tracks_requested_rows(recipe):
+    """Collection declares each workload even when the layer retains more plans."""
+    pytest.importorskip("b12x")
+    layer = torch.nn.Module()
+    layer.b12x_layer_name = _encode_layer_name("fp8-preparation")
+    if recipe == "block":
+        kernel = object.__new__(B12xFp8BlockScaledMMKernel)
+        layer.weight = torch.empty((128, 128), dtype=torch.float8_e4m3fn)
+        layer.weight_scale = torch.ones((1, 1))
+        layer.b12x_block_fp8_plans = {}
+    else:
+        kernel = object.__new__(B12xTensorFP8ScaledMMLinearKernel)
+        layer.b12x_tensor_fp8_packed_weight = types.SimpleNamespace(
+            values=torch.empty((128, 128), dtype=torch.float8_e4m3fn),
+            in_features=128,
+            padded_in_features=128,
+            out_features=128,
+        )
+        layer.b12x_tensor_fp8_plans = {}
+    kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
+
+    for counts in ((1, 4), (4,)):
+        workload = B12xWorkload(
+            stage="weights",
+            token_counts=counts,
+            fixed_token_counts=(),
+            output_dtype=torch.bfloat16,
+            max_tokens=4,
+            max_seqs=1,
+            max_model_len=4,
+        )
+        (unit,) = kernel.get_b12x_preparation_units(layer, workload)
+        assert unit.key == ("fp8-preparation", counts)
+        assert tuple(request.plan.query.max_rows for request in unit.requests) == counts
+        assert all(request.plan.prepared is None for request in unit.requests)
+
+
+@pytest.mark.parametrize("recipe", ["block", "tensor"])
 @torch.inference_mode()
 def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.preparation import PreparationSession
+
     from vllm.model_executor.kernels.linear.scaled_mm import b12x as module
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("requires SM12x")
     torch.manual_seed(38)
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     n, k, capacity = 512, 256, 128
     values = torch.randn(n, k, device=device).to(torch.float8_e4m3fn)
     source = torch.randn(capacity, k, device=device).to(torch.float8_e4m3fn)
@@ -2034,28 +2250,51 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
         kernel = object.__new__(B12xFp8BlockScaledMMKernel)
         kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
         layer.weight = torch.nn.Parameter(values, requires_grad=False)
-        layer.weight_scale = torch.nn.Parameter(torch.full((n // 128, k // 128), 0.5, device=device), requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(
+            torch.full((n // 128, k // 128), 0.5, device=device), requires_grad=False
+        )
         layer.b12x_block_fp8_plans = {}
         plans = layer.b12x_block_fp8_plans
         scales = torch.full((capacity, k // 128), 0.25, device=device)
+
         def run(rows):
-            return module.run_b12x_block_fp8_linear(source[:rows], scales[:rows], layer.weight, layer.weight_scale, torch.bfloat16, layer.b12x_layer_name)
+            return module.run_b12x_block_fp8_linear(
+                source[:rows],
+                scales[:rows],
+                layer.weight,
+                layer.weight_scale,
+                torch.bfloat16,
+                layer.b12x_layer_name,
+            )
     else:
         kernel = object.__new__(B12xTensorFP8ScaledMMLinearKernel)
         kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
         api = module._import_b12x_tensor_fp8()
-        layer.b12x_tensor_fp8_packed_weight = api.pack_weight(values, torch.tensor([0.125], device=device))
+        layer.b12x_tensor_fp8_packed_weight = api.pack_weight(
+            values, torch.tensor([0.125], device=device)
+        )
         layer.b12x_tensor_fp8_plans = {}
         plans = layer.b12x_tensor_fp8_plans
+
         def run(rows):
-            return module.run_b12x_tensor_fp8_linear(source[:rows], None, n, torch.bfloat16, layer.b12x_layer_name)
+            return module.run_b12x_tensor_fp8_linear(
+                source[:rows], None, n, torch.bfloat16, layer.b12x_layer_name
+            )
+
     workload = B12xWorkload(
-        stage="weights", token_counts=(4, capacity), fixed_token_counts=(4,),
-        output_dtype=torch.bfloat16, max_tokens=capacity, max_seqs=4, max_model_len=1024,
+        stage="weights",
+        token_counts=(4, capacity),
+        fixed_token_counts=(4,),
+        output_dtype=torch.bfloat16,
+        max_tokens=capacity,
+        max_seqs=4,
+        max_model_len=1024,
     )
     units = kernel.get_b12x_preparation_units(layer, workload)
+
     def expected(rows):
         return (source[:rows].float() @ values.float().T * 0.125).bfloat16()
+
     with PreparationSession(device=device, autotune=False) as session:
         session.prepare(tuple(request for unit in units for request in unit.requests))
         assert set(plans) == {4, capacity}
@@ -2066,7 +2305,9 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
         session.freeze()
         with kernel_resolution_guard("FP8 prepared exact-M execution"):
             for rows in (4, 11, capacity):
-                torch.testing.assert_close(run(rows), expected(rows), rtol=0.02, atol=0.125)
+                torch.testing.assert_close(
+                    run(rows), expected(rows), rtol=0.02, atol=0.125
+                )
             graph = torch.cuda.CUDAGraph()
             try:
                 with session.capture(), torch.cuda.graph(graph):
@@ -2074,7 +2315,7 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
                 pointer = captured.data_ptr()
                 source.copy_((-source.float()).to(source.dtype))
                 graph.replay()
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 assert captured.data_ptr() == pointer
                 torch.testing.assert_close(captured, expected(4), rtol=0.02, atol=0.125)
             finally:
@@ -2088,7 +2329,7 @@ def test_v41_unquantized_prepares_dtypes_and_exact_rows_before_replay(output_dty
         pytest.skip("native b12x projection requires SM12x")
     from vllm.models.deepseek_v4_1.b12x_layers import B12xLinearMethod
 
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     layer = torch.nn.Module()
     layer.weight = torch.nn.Parameter(
         torch.randn(384, 5120, device=device).bfloat16().mul_(0.125),
@@ -2097,12 +2338,15 @@ def test_v41_unquantized_prepares_dtypes_and_exact_rows_before_replay(output_dty
     layer.out_dtype = output_dtype
     method = B12xLinearMethod()
     method.process_weights_after_loading(layer)
-    allocated_before = torch.cuda.memory_allocated(device)
+    allocated_before = torch.accelerator.memory_allocated(device)
     session, _ = _prepare(
-        layer, device=device, counts=(1, 8, 256), fixed=(1, 8),
+        layer,
+        device=device,
+        counts=(1, 8, 256),
+        fixed=(1, 8),
         output_dtype=output_dtype,
     )
-    assert torch.cuda.memory_allocated(device) == allocated_before
+    assert torch.accelerator.memory_allocated(device) == allocated_before
     session.freeze()
     graph = torch.cuda.CUDAGraph()
     tolerance = 0.015 if output_dtype == torch.bfloat16 else 1e-4
@@ -2112,22 +2356,28 @@ def test_v41_unquantized_prepares_dtypes_and_exact_rows_before_replay(output_dty
             source = torch.randn(256, 5120, device=device, dtype=dtype).mul_(0.125)
             for rows in (1, 8, 17, 256):
                 actual = method.apply(layer, source[:rows])
-                expected = (source[:rows].float() @ layer.weight.float().T).to(output_dtype)
-                torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+                expected = (source[:rows].float() @ layer.weight.float().T).to(
+                    output_dtype
+                )
+                torch.testing.assert_close(
+                    actual, expected, rtol=tolerance, atol=tolerance
+                )
             apply(source)
             with session.capture(), torch.cuda.graph(graph):
                 captured = apply(source)
             pointer = captured.data_ptr()
             source.neg_()
             captured.fill_(float("nan"))
-            allocated = torch.cuda.memory_allocated(device)
+            allocated = torch.accelerator.memory_allocated(device)
             graph.replay()
-            torch.cuda.synchronize(device)
+            torch.accelerator.synchronize(device)
             assert captured.data_ptr() == pointer
-            assert torch.cuda.memory_allocated(device) == allocated
+            assert torch.accelerator.memory_allocated(device) == allocated
             assert torch.isfinite(captured).all() and torch.count_nonzero(captured) > 0
             expected = (source.float() @ layer.weight.float().T).to(output_dtype)
-            torch.testing.assert_close(captured, expected, rtol=tolerance, atol=tolerance)
+            torch.testing.assert_close(
+                captured, expected, rtol=tolerance, atol=tolerance
+            )
             graph.reset()
     finally:
         graph.reset()
