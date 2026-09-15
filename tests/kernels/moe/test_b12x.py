@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the b12x tensor-parallel MoE integration."""
 
-import weakref
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -54,20 +56,36 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.platforms import current_platform
+from vllm.utils.b12x import B12xPreparationUnit, B12xWorkload
 from vllm.utils.torch_utils import set_random_seed
-from vllm.utils.b12x import B12xWorkload
+
+if TYPE_CHECKING:
+    from b12x.preparation import PreparationSession
 
 
-def _prepare(layer, *, device, counts, fixed=(), output_dtype=torch.bfloat16,
-             max_tokens=None, autotune=False, stage="weights"):
+def _prepare(
+    layer,
+    *,
+    device,
+    counts,
+    fixed=(),
+    output_dtype=torch.bfloat16,
+    max_tokens=None,
+    autotune=False,
+    stage="weights",
+):
     """Collect a layer's preparation units and fill their plans in place."""
     from b12x.preparation import PreparationSession
 
     max_tokens = max_tokens or max(counts)
     workload = B12xWorkload(
-        stage=stage, token_counts=tuple(sorted(set(counts))),
-        fixed_token_counts=tuple(sorted(set(fixed))), output_dtype=output_dtype,
-        max_tokens=max_tokens, max_seqs=1, max_model_len=max_tokens,
+        stage=stage,
+        token_counts=tuple(sorted(set(counts))),
+        fixed_token_counts=tuple(sorted(set(fixed))),
+        output_dtype=output_dtype,
+        max_tokens=max_tokens,
+        max_seqs=1,
+        max_model_len=max_tokens,
     )
     provider = layer.b12x_preparation_provider
     units = list(provider.get_b12x_preparation_units(layer, workload))
@@ -190,7 +208,7 @@ def _make_b12x_moe_kernel(
     quant_config: FusedMoEQuantConfig,
     *,
     fixed_token_counts: tuple[int, ...] = (),
-) -> tuple[mk.FusedMoEKernel, object, object]:
+) -> tuple[mk.FusedMoEKernel, PreparationSession, list[B12xPreparationUnit]]:
     num_experts = w1.shape[0]
     moe_config = make_dummy_moe_config(
         num_experts=num_experts,
@@ -220,9 +238,12 @@ def _make_b12x_moe_kernel(
     tokens = int(hidden_states.shape[0])
     experts.process_weights_after_loading(layer)
     session, units = _prepare(
-        layer, device=hidden_states.device, counts=(*fixed_token_counts, tokens),
+        layer,
+        device=hidden_states.device,
+        counts=(*fixed_token_counts, tokens),
         fixed=fixed_token_counts,
-        output_dtype=hidden_states.dtype, max_tokens=tokens,
+        output_dtype=hidden_states.dtype,
+        max_tokens=tokens,
     )
     return (
         mk.FusedMoEKernel(
@@ -682,6 +703,67 @@ def test_b12x_nvfp4_force_a16_leaves_row_order_for_b12x_preparation(
     assert reorder_w13 is False
 
 
+@pytest.mark.parametrize(
+    ("layer_max_input_scale", "expected_a13_scale", "expected_a2_scale"),
+    [
+        ("0", torch.tensor([2.0, 3.0]), torch.tensor([7.0, 5.0])),
+        ("w13", torch.tensor(3.0), torch.tensor([7.0, 5.0])),
+        ("w2", torch.tensor([2.0, 3.0]), torch.tensor(7.0)),
+        ("all", torch.tensor(3.0), torch.tensor(7.0)),
+        ("1", torch.tensor(3.0), torch.tensor(7.0)),
+    ],
+)
+def test_b12x_nvfp4_layer_max_input_scales_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+    layer_max_input_scale: str,
+    expected_a13_scale: torch.Tensor,
+    expected_a2_scale: torch.Tensor,
+) -> None:
+    monkeypatch.setattr(
+        nvfp4_oracle.envs,
+        "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE",
+        layer_max_input_scale,
+    )
+    a13_scale = torch.tensor([2.0, 3.0])
+    a2_scale = torch.tensor([7.0, 5.0])
+
+    def prepare_for_b12x(**kwargs):
+        return (
+            kwargs["w13"],
+            kwargs["w13_scale"],
+            kwargs["w13_scale_2"],
+            a13_scale,
+            kwargs["w2"],
+            kwargs["w2_scale"],
+            kwargs["w2_scale_2"],
+            a2_scale,
+        )
+
+    monkeypatch.setattr(
+        nvfp4_oracle,
+        "prepare_nvfp4_moe_layer_for_b12x",
+        prepare_for_b12x,
+    )
+    tensor = torch.ones(1)
+
+    prepared = nvfp4_oracle.convert_to_nvfp4_moe_kernel_format(
+        nvfp4_backend=NvFp4MoeBackend.B12X,
+        layer=SimpleNamespace(),
+        w13=tensor,
+        w13_scale=tensor,
+        w13_scale_2=tensor,
+        a13_scale=tensor,
+        w2=tensor,
+        w2_scale=tensor,
+        w2_scale_2=tensor,
+        a2_scale=tensor,
+        is_act_and_mul=True,
+    )
+
+    torch.testing.assert_close(prepared[3], expected_a13_scale)
+    torch.testing.assert_close(prepared[7], expected_a2_scale)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_b12x_nvfp4_preparation_pads_each_gated_half() -> None:
     device = torch.device("cuda")
@@ -777,9 +859,7 @@ def test_b12x_moe_candidate_calls_share_bounded_trial_storage() -> None:
         device=torch.device("cpu"),
         hidden_size=16,
         num_experts=8,
-        plan=SimpleNamespace(
-            activation=SimpleNamespace(io_dtype=torch.bfloat16)
-        ),
+        plan=SimpleNamespace(activation=SimpleNamespace(io_dtype=torch.bfloat16)),
     )
     factory = b12x._prepared_moe_call_factory(
         tokens=4,
@@ -792,6 +872,8 @@ def test_b12x_moe_candidate_calls_share_bounded_trial_storage() -> None:
 
     first_call = factory(first_state)
     second_call = factory(second_state)
+    assert first_state.bound is not None
+    assert second_state.bound is not None
 
     for name in ("a", "output", "topk_ids", "topk_weights"):
         assert first_state.bound[name] is second_state.bound[name]
@@ -802,12 +884,6 @@ def test_b12x_moe_candidate_calls_share_bounded_trial_storage() -> None:
     assert first_state.bound["scratch"][0] is not second_state.bound["scratch"][0]
     assert not first_call.capture_safe
     assert not second_call.capture_safe
-
-
-
-
-
-
 
 
 def test_b12x_source_release_preserves_prepared_storage_owner() -> None:
@@ -872,10 +948,6 @@ def test_b12x_moe_rejects_router_weight_on_input_for_w4a8() -> None:
         match="apply_router_weight_on_input only with W4A16",
     ):
         experts.process_weights_after_loading(layer)
-
-
-
-
 
 
 @dataclass
@@ -1151,9 +1223,8 @@ def test_b12x_moe_cuda_graph_replay(
         graph = torch.cuda.CUDAGraph()
         stream = torch.cuda.Stream()
         try:
-            with session.capture():
-                with torch.cuda.graph(graph, stream=stream):
-                    actual = apply()
+            with session.capture(), torch.cuda.graph(graph, stream=stream):
+                actual = apply()
             graph.replay()
             torch.accelerator.synchronize()
         finally:
@@ -1165,7 +1236,6 @@ def test_b12x_moe_cuda_graph_replay(
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
-
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
 @pytest.mark.parametrize(
     "weight_dtype,activation_dtype",
@@ -1175,9 +1245,13 @@ def test_b12x_moe_cuda_graph_replay(
 @torch.inference_mode()
 @pytest.mark.parametrize("capacity", [4, 128])
 def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
-    weight_dtype, activation_dtype, workspace_init, capacity,
+    weight_dtype,
+    activation_dtype,
+    workspace_init,
+    capacity,
 ) -> None:
     from b12x._lib.runtime_control import kernel_resolution_guard
+
     from vllm.v1.worker.workspace import current_workspace_manager, lock_workspace
 
     with set_current_vllm_config(
@@ -1185,37 +1259,61 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
     ):
         case = _make_b12x_moe_case(weight_dtype, activation_dtype, tokens=capacity)
         kernel, session, _ = _make_b12x_moe_kernel(
-            case.hidden_states, case.w1, case.w2, case.topk, case.activation,
-            case.quant_config, fixed_token_counts=(4,) if capacity > 4 else (),
+            case.hidden_states,
+            case.w1,
+            case.w2,
+            case.topk,
+            case.activation,
+            case.quant_config,
+            fixed_token_counts=(4,) if capacity > 4 else (),
         )
         weights, ids, _ = fused_topk(
-            case.hidden_states, case.score, case.topk, renormalize=False,
+            case.hidden_states,
+            case.score,
+            case.topk,
+            renormalize=False,
         )
         ids64 = ids.to(torch.int64)
         if activation_dtype == "nvfp4":
             reference = _nvfp4_activation_reference(
-                case.hidden_states, case.w1_ref, case.w2_ref, weights, ids,
-                case.quant_config.a1_gscale, case.quant_config.a2_gscale,
+                case.hidden_states,
+                case.w1_ref,
+                case.w2_ref,
+                weights,
+                ids,
+                case.quant_config.a1_gscale,
+                case.quant_config.a2_gscale,
             )
         else:
             reference = torch_moe(
-                case.hidden_states, case.w1_ref, case.w2_ref, case.score,
-                case.topk, activation=case.activation,
+                case.hidden_states,
+                case.w1_ref,
+                case.w2_ref,
+                case.score,
+                case.topk,
+                activation=case.activation,
             )
 
         def apply(rows, route_ids=ids):
             return kernel.apply(
-                hidden_states=case.hidden_states[:rows], w1=case.w1, w2=case.w2,
-                topk_weights=weights[:rows], topk_ids=route_ids[:rows],
-                activation=case.activation, global_num_experts=case.w1.shape[0],
-                expert_map=None, apply_router_weight_on_input=False,
+                hidden_states=case.hidden_states[:rows],
+                w1=case.w1,
+                w2=case.w2,
+                topk_weights=weights[:rows],
+                topk_ids=route_ids[:rows],
+                activation=case.activation,
+                global_num_experts=case.w1.shape[0],
+                expert_map=None,
+                apply_router_weight_on_input=False,
             )
 
         def check(output, rows):
             assert torch.isfinite(output).all() and torch.count_nonzero(output)
             torch.testing.assert_close(output, reference[:rows], atol=2e-1, rtol=2e-1)
             cosine = torch.nn.functional.cosine_similarity(
-                output.flatten().float(), reference[:rows].flatten().float(), dim=0,
+                output.flatten().float(),
+                reference[:rows].flatten().float(),
+                dim=0,
             )
             assert cosine > 0.99
 
@@ -1232,7 +1330,9 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
             )
             session.freeze()
             with kernel_resolution_guard("prepared MoE capacity reuse"):
-                for rows in (count for count in (4, 3, 11, 31, 125, 128) if count <= capacity):
+                for rows in (
+                    count for count in (4, 3, 11, 31, 125, 128) if count <= capacity
+                ):
                     for route_ids in (ids, ids64):
                         check(apply(rows, route_ids), rows)
                 graph = torch.cuda.CUDAGraph()
@@ -1240,7 +1340,7 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
                     with session.capture(), torch.cuda.graph(graph):
                         actual = apply(4)
                     graph.replay()
-                    torch.cuda.synchronize()
+                    torch.accelerator.synchronize()
                     check(actual, 4)
                 finally:
                     graph.reset()
@@ -1251,4 +1351,3 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
             )
         finally:
             session.close()
-
