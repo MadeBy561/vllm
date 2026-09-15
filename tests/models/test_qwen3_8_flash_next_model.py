@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Construction and execution tests for Qwen3.8-Flash-Next."""
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -106,9 +105,9 @@ def test_hyperconnection_consumes_projection_views_without_staging(monkeypatch):
     merged = torch.arange(64, dtype=torch.bfloat16).reshape(4, 16)
     layer.input_mix_weight_down_block_inject = lambda x: merged
     layer.input_mix_weight_up = lambda x: x
+    binding = object()
     layer._binding = lambda _state, _operation: binding
     normalized = torch.ones(4, 8)
-    binding = object()
     seen = {}
 
     def silu(projected, *, binding):
@@ -179,8 +178,13 @@ def test_final_hyperconnection_declares_the_combine_norm_it_consumes(monkeypatch
         lambda: SimpleNamespace(plan=lambda *args, **kwargs: Declaration()),
     )
     workload = B12xWorkload(
-        stage="weights", token_counts=(8,), fixed_token_counts=(),
-        output_dtype=torch.bfloat16, max_tokens=8, max_seqs=1, max_model_len=8,
+        stage="weights",
+        token_counts=(8,),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=8,
+        max_seqs=1,
+        max_model_len=8,
     )
 
     (unit,) = layer.get_b12x_preparation_units(layer, workload)
@@ -220,8 +224,13 @@ def test_hyperconnection_declares_one_capacity_per_operation(monkeypatch):
         lambda: SimpleNamespace(plan=lambda *args, **kwargs: Declaration()),
     )
     workload = B12xWorkload(
-        stage="weights", token_counts=(1, 2, 4, 16, 32), fixed_token_counts=(),
-        output_dtype=torch.bfloat16, max_tokens=32, max_seqs=1, max_model_len=32,
+        stage="weights",
+        token_counts=(1, 2, 4, 16, 32),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=32,
+        max_seqs=1,
+        max_model_len=32,
     )
 
     (unit,) = layer.get_b12x_preparation_units(layer, workload)
@@ -422,13 +431,14 @@ def test_attention_projection_overlap_replays_with_changed_inputs(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 4])
-@pytest.mark.parametrize("kind", ["gdn", "qsa"])
+@pytest.mark.parametrize("kind", ["gdn", "qsa", "qsa_selector"])
 @torch.inference_mode()
 def test_b12x_projection_overlap_preserves_scratch(monkeypatch, num_tokens, kind):
     """Concurrent projections must not overwrite activation or split-K scratch."""
     pytest.importorskip("b12x")
     from b12x.gemm import blockscaled
     from b12x.preparation import PreparationSession
+
     from vllm.model_executor.kernels.linear.b12x_blockscaled import (
         B12xBlockscaledLinear,
     )
@@ -439,7 +449,7 @@ def test_b12x_projection_overlap_preserves_scratch(monkeypatch, num_tokens, kind
     )
 
     torch.manual_seed(43)
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     if not blockscaled.is_supported(device):
         pytest.skip("requires b12x block-scaled kernels on SM120/SM121")
     init_workspace_manager(device)
@@ -455,15 +465,13 @@ def test_b12x_projection_overlap_preserves_scratch(monkeypatch, num_tokens, kind
     configs = (
         blockscaled.BlockscaledConfig(mode="quantized")
         if num_tokens == 1
-        else blockscaled.BlockscaledConfig(
-            mode="a16", tile_n=64, tile_k=64, split_k=2
-        ),
-        blockscaled.BlockscaledConfig(
-            mode="a16", tile_n=64, tile_k=128, split_k=4
-        ),
+        else blockscaled.BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=2),
+        blockscaled.BlockscaledConfig(mode="a16", tile_n=64, tile_k=128, split_k=4),
     )
     try:
-        with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        with PreparationSession(
+            device=device, autotune=False, compile_workers=2
+        ) as session:
             for n, config in zip(widths, configs):
                 weight = (torch.randn(n, 2560, device=device) * 0.05).to(
                     torch.float8_e4m3fn
@@ -471,19 +479,29 @@ def test_b12x_projection_overlap_preserves_scratch(monkeypatch, num_tokens, kind
                 scales = torch.full((n, 80), 127, device=device, dtype=torch.uint8)
                 packed = blockscaled.pack_weight(weight, scales)
                 holder = B12xBlockscaledLinear(
-                    packed, recipe="mxfp8", activation_mode="auto",
+                    packed,
+                    recipe="mxfp8",
+                    activation_mode="auto",
                     layer_name=f"projection.{n}",
                 )
                 query = blockscaled.BlockscaledQuery(
-                    recipe="mxfp8", num_tokens=num_tokens,
-                    in_features=2560, padded_in_features=2560,
-                    out_features=n, expected_m=num_tokens,
+                    recipe="mxfp8",
+                    num_tokens=num_tokens,
+                    in_features=2560,
+                    padded_in_features=2560,
+                    out_features=n,
+                    expected_m=num_tokens,
                     workspace_form="provided",
                 )
                 holder.plan = blockscaled.plan(query, override=config)
-                session.prepare((holder.plan.request(
-                    name=str(n), prepare_call=holder._call_factory(num_tokens),
-                ),))
+                session.prepare(
+                    (
+                        holder.plan.request(
+                            name=str(n),
+                            prepare_call=holder._call_factory(num_tokens),
+                        ),
+                    )
+                )
                 linears.append(holder)
             session.freeze()
 
@@ -496,15 +514,85 @@ def test_b12x_projection_overlap_preserves_scratch(monkeypatch, num_tokens, kind
 
             first, second = map(Projection, linears)
             layer = SimpleNamespace(
-                in_proj_qkvz=first, in_proj_ba=second, qkv_proj=first,
+                in_proj_qkvz=first,
+                in_proj_ba=second,
+                qkv_proj=first,
                 indexer=SimpleNamespace(index_qk_proj=second),
             )
-            monkeypatch.setattr(
-                module, "get_forward_context",
-                lambda: SimpleNamespace(no_compile_layers={"test.projection": layer}),
+            forward_context = SimpleNamespace(
+                no_compile_layers={"test.projection": layer},
+                cudagraph_runtime_mode=qsa_module.CUDAGraphMode.FULL,
             )
-            monkeypatch.setattr(module, "aux_stream", lambda: side_stream)
             side_stream = torch.cuda.Stream()
+            if kind == "qsa_selector":
+                from b12x._lib.scratch import scratch_buffer_spec
+
+                from vllm.utils.b12x import get_b12x_scratch_buffers
+
+                owner = qsa_module.Qwen3_8FlashNextQSAAttention.__new__(
+                    qsa_module.Qwen3_8FlashNextQSAAttention
+                )
+                nn.Module.__init__(owner)
+                owner.skip_topk = False
+                owner.overlap_input_projections = True
+                owner.max_decode_rows = 16
+                owner.max_speculative_tokens = 3
+                owner.layer_name = "test.projection"
+                owner.qkv_proj = first
+                owner.indexer = qsa_module.QSAIndexer.__new__(qsa_module.QSAIndexer)
+                nn.Module.__init__(owner.indexer)
+                owner.indexer.index_qk_proj = second
+                owner.indexer.index_q_heads, owner.indexer.index_head_dim = 4, 128
+                owner._index_ready = torch.cuda.Event()
+                owner._selector_done = torch.cuda.Event()
+                owner._selected_positions = torch.empty(1, device=device)
+                sizes = qsa_module.get_b12x_projection_workspace_sizes(
+                    num_tokens, first, second
+                )
+                specs = tuple(
+                    scratch_buffer_spec(str(i), nbytes=size, device=device)
+                    for i, size in enumerate((max(sizes), *sizes))
+                )
+                context = SimpleNamespace(
+                    prepared_plan=SimpleNamespace(scratch_specs=lambda: specs),
+                    main_block_table=None,
+                    compressed_block_table=None,
+                )
+                positions = torch.arange(num_tokens, device=device)
+                staged = SimpleNamespace(request_ids=positions)
+                owner._qsa_binding_for_workload = lambda **kwargs: context
+                owner._prepare_qsa_metadata = lambda *args: staged
+                owner._shared_qsa_rope_positions = lambda *args: positions
+                metadata = qsa_module.Qwen3_8FlashNextQSAMetadata.__new__(
+                    qsa_module.Qwen3_8FlashNextQSAMetadata
+                )
+                metadata.num_actual_tokens = metadata.max_query_len = num_tokens
+                metadata.max_seq_len = num_tokens
+                forward_context.attn_metadata = {owner.layer_name: metadata}
+                forward_context.no_compile_layers[owner.layer_name] = owner
+                get_b12x_scratch_buffers(context.prepared_plan)
+                serial_op = op
+
+                def op(value, *args):
+                    if not torch.cuda.is_current_stream_capturing():
+                        return serial_op(value, *args)
+                    qkv = torch.ops.vllm.qwen3_8_flash_next_qsa_project_inputs(
+                        positions,
+                        value,
+                        owner._selected_positions,
+                        widths[0],
+                        owner.layer_name,
+                    )
+                    # Exercise selector writes before the main projection joins.
+                    with torch.cuda.stream(side_stream):
+                        side_stream.wait_event(owner._index_ready)
+                        get_b12x_scratch_buffers(context.prepared_plan)[0].fill_(213)
+                    torch.cuda.current_stream().wait_stream(side_stream)
+                    iq, ik, _ = owner._selector_index_inputs
+                    return qkv, torch.cat((iq.flatten(-2), ik), dim=-1)
+
+            monkeypatch.setattr(module, "get_forward_context", lambda: forward_context)
+            monkeypatch.setattr(module, "aux_stream", lambda: side_stream)
             main_stream = torch.cuda.Stream()
             main_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(main_stream):
@@ -522,20 +610,23 @@ def test_b12x_projection_overlap_preserves_scratch(monkeypatch, num_tokens, kind
                         reference = tuple(
                             value.clone() for value in op(x, *widths, "test.projection")
                         )
-                        allocations = torch.cuda.memory_stats(device)[
+                        allocations = torch.accelerator.memory_stats(device)[
                             "allocation.all.allocated"
                         ]
                         graph.replay()
-                        torch.cuda.synchronize(device)
-                        assert torch.cuda.memory_stats(device)[
-                            "allocation.all.allocated"
-                        ] == allocations
+                        torch.accelerator.synchronize(device)
+                        assert (
+                            torch.accelerator.memory_stats(device)[
+                                "allocation.all.allocated"
+                            ]
+                            == allocations
+                        )
                         for value, ref in zip(actual, reference):
                             torch.testing.assert_close(value, ref, rtol=0, atol=0)
                 finally:
                     del graph
     finally:
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         reset_workspace_manager()
 
 
@@ -659,12 +750,18 @@ def test_disk_ple_preparation_refreshes_graph_output(tmp_path, monkeypatch) -> N
     resident.load_weights(weights.items())
     ple_layer_module.flush_weight_transfers()
     from b12x.preparation import PreparationSession
+
     from vllm.utils.b12x import B12xWorkload
 
     counts = (1, 2, 3, 4, 6, 7, 8, 12, 16, 24, 32)
     workload = B12xWorkload(
-        stage="weights", token_counts=counts, fixed_token_counts=(),
-        output_dtype=torch.bfloat16, max_tokens=32, max_seqs=2, max_model_len=32,
+        stage="weights",
+        token_counts=counts,
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=32,
+        max_seqs=2,
+        max_model_len=32,
     )
     session = PreparationSession(device="cuda")
     for candidate in (embedding, resident):
@@ -880,8 +977,6 @@ def test_ple_registers_request_dependent_piecewise_splitting_ops_once() -> None:
     }
 
 
-
-
 def test_decoder_layer_factory_accepts_make_layers_prefix(monkeypatch) -> None:
     created_layers: list[tuple[str, str]] = []
 
@@ -1004,17 +1099,16 @@ def test_ple_bind_uses_installed_execution_and_exact_aligned_page_stride(
     monkeypatch.setattr(layer, "get_state_shape", lambda: shapes)
     monkeypatch.setattr(layer, "get_state_dtype", lambda: dtypes)
     layer.kv_cache = (
-        ple_layer_module.MambaBase.bind_kv_cache(layer, raw_cache)
-        or layer.kv_cache[0],
+        ple_layer_module.MambaBase.bind_kv_cache(layer, raw_cache) or layer.kv_cache[0],
     )
     calls = []
+
+    def bind(bound_plan, **kwargs):
+        calls.append((bound_plan, kwargs))
+        return object()
+
     monkeypatch.setattr(
-        ple_layer_module,
-        "_b12x_module",
-        lambda _name: SimpleNamespace(
-            bind=lambda bound_plan, **kwargs: calls.append((bound_plan, kwargs))
-            or object()
-        ),
+        ple_layer_module, "_b12x_module", lambda _name: SimpleNamespace(bind=bind)
     )
 
     layer._bind_ple(4)
@@ -1121,10 +1215,16 @@ def test_b12x_gdn_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
     # buffers a real bind_kv_cache would build lazily via
     # _ensure_b12x_gdn_decode_staging.
     staging = SimpleNamespace(
-        mixed_qkv=torch.empty(0), a=torch.empty(0), b=torch.empty(0), z=torch.empty(0),
-        output=torch.empty(0), query_start_loc=torch.empty(0),
-        num_accepted_tokens=torch.empty(0), state_indices=torch.empty(0),
-        num_seqs=torch.empty(0), num_tokens=torch.empty(0),
+        mixed_qkv=torch.empty(0),
+        a=torch.empty(0),
+        b=torch.empty(0),
+        z=torch.empty(0),
+        output=torch.empty(0),
+        query_start_loc=torch.empty(0),
+        num_accepted_tokens=torch.empty(0),
+        state_indices=torch.empty(0),
+        num_seqs=torch.empty(0),
+        num_tokens=torch.empty(0),
     )
     layer._b12x_decode_staging = staging
 
@@ -1152,7 +1252,9 @@ def test_b12x_gdn_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
 
     assert layer.kv_cache == ()
     assert layer._b12x_decode_plan is None
-    with pytest.raises(RuntimeError, match="not prepared for the current KV generation"):
+    with pytest.raises(
+        RuntimeError, match="not prepared for the current KV generation"
+    ):
         layer._bind_b12x_gdn_decode()
 
 
@@ -1328,13 +1430,13 @@ def test_ple_embedding_reuses_capacity_for_live_token_counts(
     layer._num_tokens = torch.zeros(1, dtype=torch.int32)
     layer._embedding_out = torch.empty(128, 4)
     calls = []
+
+    def bind(bound_plan, **kwargs):
+        calls.append((bound_plan, kwargs))
+        return object()
+
     monkeypatch.setattr(
-        ple_layer_module,
-        "_b12x_module",
-        lambda _name: SimpleNamespace(
-            bind=lambda bound_plan, **kwargs: calls.append((bound_plan, kwargs))
-            or object()
-        ),
+        ple_layer_module, "_b12x_module", lambda _name: SimpleNamespace(bind=bind)
     )
 
     layer._bind_embedding(8)
@@ -1347,7 +1449,6 @@ def test_ple_embedding_reuses_capacity_for_live_token_counts(
     assert layer._plans == {8: planned, 128: capacity}
     with pytest.raises(ValueError, match="exceeds capacity"):
         layer._bind_embedding(129)
-
 
 
 def test_ple_state_prepare_call_restores_the_staging_buffers_it_overwrites(monkeypatch):
@@ -1374,21 +1475,37 @@ def test_ple_state_prepare_call_restores_the_staging_buffers_it_overwrites(monke
     live = {
         name: getattr(layer, name).clone()
         for name in (
-            "_residual", "_key", "_value", "_out", "_query_start_loc", "_state_slot_ids",
-            "_state_is_fresh", "_num_accepted_tokens", "_request_is_prefill",
-            "_num_seqs", "_num_tokens",
+            "_residual",
+            "_key",
+            "_value",
+            "_out",
+            "_query_start_loc",
+            "_state_slot_ids",
+            "_state_is_fresh",
+            "_num_accepted_tokens",
+            "_request_is_prefill",
+            "_num_seqs",
+            "_num_tokens",
         )
     }
     conv_state = layer.kv_cache[0].clone()
     runs = []
+
+    def run(binding, **kwargs):
+        runs.append(kwargs)
+        binding["conv_state"][0].fill_(-1.0)
+        binding["out"].fill_(5.0)
+
     state = SimpleNamespace(
-        layout=SimpleNamespace(scratch_specs=lambda: (
-            SimpleNamespace(shape=(1,), dtype=torch.uint8, device=torch.device("cpu")),
-        )),
-        bind=lambda **kwargs: kwargs,
-        run=lambda binding, **kwargs: (
-            runs.append(kwargs), binding["conv_state"][0].fill_(-1.0), binding["out"].fill_(5.0)
+        layout=SimpleNamespace(
+            scratch_specs=lambda: (
+                SimpleNamespace(
+                    shape=(1,), dtype=torch.uint8, device=torch.device("cpu")
+                ),
+            )
         ),
+        bind=lambda **kwargs: kwargs,
+        run=run,
     )
 
     call = layer._state_prepare_call(4)(state)

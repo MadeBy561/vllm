@@ -13,10 +13,10 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import weakref
-from collections.abc import Callable, Hashable, Iterable, Mapping
+from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass, fields, is_dataclass, replace
 from types import ModuleType
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -26,6 +26,9 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     direct_register_custom_op,
 )
+
+if TYPE_CHECKING:
+    from b12x.preparation import PreparationRequest
 
 
 class PreparationResourceUnavailableError(RuntimeError):
@@ -71,7 +74,9 @@ class B12xWorkload:
             raise ValueError("token counts must be sorted, unique, and within capacity")
         fixed = tuple(self.fixed_token_counts)
         if fixed != tuple(sorted(set(fixed))) or not set(fixed) <= set(counts):
-            raise ValueError("fixed token counts must be a sorted subset of token counts")
+            raise ValueError(
+                "fixed token counts must be a sorted subset of token counts"
+            )
         if any(count >= self.max_tokens for count in fixed):
             raise ValueError("fixed token counts must be below capacity")
         if type(self.eager_only) is not bool:
@@ -86,7 +91,7 @@ class B12xPreparationUnit:
 
     name: str
     key: Hashable
-    requests: tuple[object, ...]
+    requests: tuple[PreparationRequest, ...]
     stage: Literal["weights", "state"]
     autotune: bool = True
 
@@ -180,8 +185,12 @@ def scope_b12x_unit_calls(unit: B12xPreparationUnit, lane: int) -> B12xPreparati
                 return invoke
 
             return replace(
-                call, run=scoped(call.run), produce=scoped(call.produce),
-                reset=scoped(call.reset), restore=scoped(call.restore), close=scoped(call.close),
+                call,
+                run=scoped(call.run),
+                produce=scoped(call.produce),
+                reset=scoped(call.reset),
+                restore=scoped(call.restore),
+                close=scoped(call.close),
             )
 
         return wrapped
@@ -205,8 +214,11 @@ def scope_b12x_unit_calls(unit: B12xPreparationUnit, lane: int) -> B12xPreparati
 
 
 def b12x_preparation_token_counts(
-    *, max_tokens: int, cudagraph_capture_sizes: Iterable[int] = (),
-    compile_sizes: Iterable[int] = (), compile_range_endpoints: Iterable[int] = (),
+    *,
+    max_tokens: int,
+    cudagraph_capture_sizes: Iterable[int] = (),
+    compile_sizes: Iterable[int] = (),
+    compile_range_endpoints: Iterable[int] = (),
     speculative_tokens: int = 0,
 ) -> tuple[int, ...]:
     """Collect every exact serving specialization required by native owners."""
@@ -398,19 +410,28 @@ def run_b12x_blockscaled_linear(
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     """Run a layer's prepared block-scaled linear through the opaque op."""
-    return torch.ops.vllm.b12x_blockscaled_linear(source, bias, out_features, layer_name)
+    return torch.ops.vllm.b12x_blockscaled_linear(
+        source, bias, out_features, layer_name
+    )
+
+
+def get_b12x_projection_workspace_sizes(
+    rows: int, *layers: torch.nn.Module
+) -> tuple[int, ...]:
+    """Describe projection scratch without allocating CUDA storage."""
+    return tuple(
+        holder.get_workspace_size(rows)
+        if (holder := getattr(layer, "b12x_linear", None)) is not None
+        else 0
+        for layer in layers
+    )
 
 
 def get_b12x_projection_workspaces(
     rows: int, *layers: torch.nn.Module
 ) -> tuple[torch.Tensor | None, ...]:
     """Reserve disjoint scratch for projections that can run concurrently."""
-    sizes = tuple(
-        holder.get_workspace_size(rows)
-        if (holder := getattr(layer, "b12x_linear", None)) is not None
-        else 0
-        for layer in layers
-    )
+    sizes = get_b12x_projection_workspace_sizes(rows, *layers)
     if not any(sizes):
         return (None,) * len(layers)
 

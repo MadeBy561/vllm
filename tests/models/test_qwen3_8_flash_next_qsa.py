@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import math
 import os
 from types import SimpleNamespace
 from typing import Any
@@ -193,11 +192,15 @@ def test_qsa_main_cache_views_reinterpret_fp8_storage() -> None:
 @pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("large_pool", [False, True])
 def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
-    monkeypatch, draft, large_pool,
+    monkeypatch,
+    draft,
+    large_pool,
 ) -> None:
     from contextlib import ExitStack
+
     from b12x.attention import qsa
     from b12x.preparation import PreparationSession
+
     from vllm.utils.b12x import B12xWorkload, PreparationResourceUnavailableError
     from vllm.v1.worker import workspace
 
@@ -208,8 +211,8 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
 
     def make_cache():
         backing = torch.empty((high + 2) * page_bytes, dtype=torch.uint8, device=device)
-        backing[:2 * page_bytes].fill_(13)
-        backing[high * page_bytes:].fill_(17)
+        backing[: 2 * page_bytes].fill_(13)
+        backing[high * page_bytes :].fill_(17)
         cache = backing.as_strided(
             (high + 2, 2, page_size, 256),
             (page_bytes, page_size * 256, 256, 1),
@@ -223,8 +226,12 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     owner.impl = impl
     owner.max_tokens, owner.max_seqs, owner.max_seq_len = 32, 2, maximum
     owner._qsa_model_config = SimpleNamespace(max_model_len=maximum)
-    owner._qsa_cache_config = SimpleNamespace(block_size=page_size, num_gpu_blocks_override=None)
+    owner._qsa_cache_config = SimpleNamespace(
+        block_size=page_size, num_gpu_blocks_override=None
+    )
     owner.max_speculative_tokens, owner.max_decode_rows = 2, 6
+    owner.overlap_input_projections = True
+    owner.qkv_proj = SimpleNamespace()
     owner._share_mtp_indices = draft
     owner._mtp_source_rows = torch.full((2,), -1, dtype=torch.int64, device=device)
     owner._mtp_anchor_state = owner._mtp_anchor_storage = None
@@ -237,20 +244,38 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
         cos_sin_cache=torch.cat((angles.cos(), angles.sin()), -1).to(torch.bfloat16),
     )
     owner.indexer = SimpleNamespace(
-        q_layernorm=SimpleNamespace(weight=torch.zeros(128, dtype=torch.bfloat16, device=device),
-                                   variance_epsilon=1e-6),
-        k_layernorm=SimpleNamespace(weight=torch.zeros(128, dtype=torch.bfloat16, device=device)),
+        index_qk_proj=SimpleNamespace(),
+        q_layernorm=SimpleNamespace(
+            weight=torch.zeros(128, dtype=torch.bfloat16, device=device),
+            variance_epsilon=1e-6,
+        ),
+        k_layernorm=SimpleNamespace(
+            weight=torch.zeros(128, dtype=torch.bfloat16, device=device)
+        ),
     )
-    owner._raw_k_ring = torch.full((2, 8, 128), 0.125, dtype=torch.bfloat16, device=device)
-    owner._raw_logical_positions = torch.full((2, 8), -1, dtype=torch.int64, device=device)
-    owner._raw_rope_positions = torch.full((2, 8, 1), -1, dtype=torch.int64, device=device)
-    owner._raw_interval_start_positions = torch.full((2,), -1, dtype=torch.int64, device=device)
+    owner._raw_k_ring = torch.full(
+        (2, 8, 128), 0.125, dtype=torch.bfloat16, device=device
+    )
+    owner._raw_logical_positions = torch.full(
+        (2, 8), -1, dtype=torch.int64, device=device
+    )
+    owner._raw_rope_positions = torch.full(
+        (2, 8, 1), -1, dtype=torch.int64, device=device
+    )
+    owner._raw_interval_start_positions = torch.full(
+        (2,), -1, dtype=torch.int64, device=device
+    )
     owner._raw_state_slot_ids = torch.full((2,), -1, dtype=torch.int32, device=device)
     owner._qsa_output = torch.empty((32, 16, 256), dtype=torch.bfloat16, device=device)
-    owner._selected_positions = torch.full((32, 2051), -1, dtype=torch.int32, device=device)
+    owner._selected_positions = torch.full(
+        (32, 2051), -1, dtype=torch.int32, device=device
+    )
     owner._k_scale = torch.ones(1, dtype=torch.float32, device=device)
     owner._v_scale = torch.ones(1, dtype=torch.float32, device=device)
-    owner.kv_cache_torch_dtype, owner.kv_cache_kernel_dtype = torch.uint8, torch.float8_e4m3fn
+    owner.kv_cache_torch_dtype, owner.kv_cache_kernel_dtype = (
+        torch.uint8,
+        torch.float8_e4m3fn,
+    )
     owner._qsa_decode_context, owner._qsa_prefill_bindings = None, ()
     owner._main_block_table = owner._compressed_cache = None
     owner._selector_done = torch.cuda.Event()
@@ -259,9 +284,14 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     monkeypatch.setattr(workspace, "_manager", manager)
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
     workload = B12xWorkload(
-        stage="state", token_counts=(1, 3, 6, 16, 32), fixed_token_counts=(),
-        output_dtype=torch.bfloat16, max_tokens=32, max_seqs=2,
-        max_model_len=maximum, speculative_tokens=2,
+        stage="state",
+        token_counts=(1, 3, 6, 16, 32),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=32,
+        max_seqs=2,
+        max_model_len=maximum,
+        speculative_tokens=2,
     )
 
     with ExitStack() as owned, workspace.use_workspace_lane(0):
@@ -272,13 +302,13 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
         assert owner.get_b12x_preparation_units(owner, workload) == ()
 
         def bind_prepare_and_exercise(cache, backing, *, previous_plans):
-            saved_prefix = backing[:2 * page_bytes].clone()
+            saved_prefix = backing[: 2 * page_bytes].clone()
             saved_state = tuple(
                 tensor.clone() for tensor in owner.get_recurrent_checkpoint_tensors()
             )
-            allocated = torch.cuda.memory_allocated(device)
+            allocated = torch.accelerator.memory_allocated(device)
             owner.bind_kv_cache(cache)
-            assert torch.cuda.memory_allocated(device) == allocated
+            assert torch.accelerator.memory_allocated(device) == allocated
             context = owner._qsa_decode_context
             with pytest.raises(PreparationResourceUnavailableError):
                 owner._bind_qsa_context(context)
@@ -289,11 +319,16 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
             result = session.prepare(requests, autotune=False)
             owned.callback(result.close)
             assert all(plan.prepared is not None for plan in plans)
+            for plan in plans:
+                manager.get_simultaneous(
+                    *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
+                )
+            manager.reserve_all()
             if previous_plans is not None:
                 # A rebound pool declares fresh plan objects; it never reuses
                 # the released plans from the pool it replaced.
                 assert not set(plans) & set(previous_plans)
-            assert torch.equal(backing[:2 * page_bytes], saved_prefix)
+            assert torch.equal(backing[: 2 * page_bytes], saved_prefix)
             for tensor, saved in zip(
                 owner.get_recurrent_checkpoint_tensors(), saved_state, strict=True
             ):
@@ -307,22 +342,31 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
             owner._raw_state_slot_ids[0] = 0
             main_k[live_page].fill_(1)
             query = torch.ones((1, 16, 256), dtype=torch.bfloat16, device=device)
-            projection = torch.full((1, 5 * 128), 0.125, dtype=torch.bfloat16, device=device)
+            projection = torch.full(
+                (1, 5 * 128), 0.125, dtype=torch.bfloat16, device=device
+            )
             output = torch.empty_like(query)
             dynamic = dict(
-                query=query, index_query=projection[:, :4 * 128].unflatten(-1, (4, 128)),
-                raw_index_key=projection[:, 4 * 128:],
+                query=query,
+                index_query=projection[:, : 4 * 128].unflatten(-1, (4, 128)),
+                raw_index_key=projection[:, 4 * 128 :],
                 request_ids=torch.zeros(1, dtype=torch.int32, device=device),
                 query_positions=torch.zeros(1, dtype=torch.int64, device=device),
                 rope_positions=torch.zeros((1, 1), dtype=torch.int64, device=device),
                 sequence_lengths=torch.tensor([1, 0], dtype=torch.int32, device=device),
-                query_start_loc=torch.tensor([0, 1, 1], dtype=torch.int32, device=device),
-                num_accepted_tokens=torch.tensor([1, 0], dtype=torch.int32, device=device),
+                query_start_loc=torch.tensor(
+                    [0, 1, 1], dtype=torch.int32, device=device
+                ),
+                num_accepted_tokens=torch.tensor(
+                    [1, 0], dtype=torch.int32, device=device
+                ),
                 is_prefilling=torch.zeros(2, dtype=torch.bool, device=device),
             )
             manager.lock()
             for overlap in (False, True):
-                binding = owner._bind_qsa_context(context, output=output, overlap=overlap)
+                binding = owner._bind_qsa_context(
+                    context, output=output, overlap=overlap
+                )
                 owner._raw_interval_start_positions[0] = -1
                 main_v[live_page].fill_(0.25)
                 ready = torch.cuda.Event() if overlap else None
@@ -330,7 +374,9 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
                     ready.record()
                 dynamic["index_ready"] = ready
                 qsa.run(binding, **dynamic)
-                torch.testing.assert_close(output, torch.full_like(output, 0.25), rtol=0, atol=0)
+                torch.testing.assert_close(
+                    output, torch.full_like(output, 0.25), rtol=0, atol=0
+                )
                 graph = torch.cuda.CUDAGraph()
                 with session.capture():
                     owner._raw_interval_start_positions[0] = -1
@@ -338,13 +384,17 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
                         if ready is not None:
                             ready.record()
                         qsa.run(binding, **dynamic)
-                    replay_allocated = torch.cuda.memory_allocated(device)
+                    replay_allocated = torch.accelerator.memory_allocated(device)
                     owner._raw_interval_start_positions[0] = -1
                     main_v[live_page].fill_(0.5)
                     graph.replay()
-                    torch.cuda.synchronize(device)
-                    assert torch.cuda.memory_allocated(device) == replay_allocated
-                    torch.testing.assert_close(output, torch.full_like(output, 0.5), rtol=0, atol=0)
+                    torch.accelerator.synchronize(device)
+                    assert (
+                        torch.accelerator.memory_allocated(device) == replay_allocated
+                    )
+                    torch.testing.assert_close(
+                        output, torch.full_like(output, 0.5), rtol=0, atol=0
+                    )
                     graph.reset()
             manager.unlock()
             return context, plans
@@ -463,7 +513,6 @@ def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
     )
 
 
-
 def test_qsa_run_consumes_projection_views_and_writes_live_output(monkeypatch) -> None:
     rows = 2
     query = torch.randn(rows, 6, 256, dtype=torch.bfloat16)
@@ -535,7 +584,9 @@ def test_qsa_selects_the_smallest_sufficient_prefill_context_plan() -> None:
         qsa_module._QSAContextPlan(max_seq_len=64, caps=None, plan=binding_64),
     )
     owner._qsa_decode_context = qsa_module._QSAContextPlan(
-        max_seq_len=64, caps=None, plan=decode_plan,
+        max_seq_len=64,
+        caps=None,
+        plan=decode_plan,
     )
 
     assert owner._qsa_binding_for_workload(rows=1, max_seq_len=20).plan is decode_plan
