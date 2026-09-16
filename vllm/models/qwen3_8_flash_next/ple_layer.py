@@ -1,0 +1,1515 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""B12X-backed position-learning enhancement for Qwen3.8-Flash-Next."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Sequence
+from dataclasses import replace
+from typing import Any
+
+import torch
+from torch import nn
+
+import vllm.envs as envs
+from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+    is_conv_state_dim_first,
+)
+from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.weight_transfer import (
+    allocate_weights,
+    copy_weight,
+    flush_weight_transfers,
+    get_file_tensor_source,
+)
+from vllm.platforms import current_platform
+from vllm.utils.b12x import (
+    B12xPreparationUnit,
+    B12xWorkload,
+    get_b12x_ple,
+    get_b12x_ple_embedding,
+    get_b12x_scratch_buffers,
+    set_b12x_preparation_provider,
+)
+from vllm.utils.torch_utils import current_stream, direct_register_custom_op
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+from .config import Qwen3_8FlashNextTextConfig
+from .ple_attn import PLEAttentionBackend, PLEAttentionMetadata
+
+logger = init_logger(__name__)
+
+_PLE_SPLITTING_OPS = (
+    "vllm::qwen3_8_flash_next_ple_embedding",
+    "vllm::qwen3_8_flash_next_ple_prefetch",
+    "vllm::qwen3_8_flash_next_ple_prefetch_wait",
+    "vllm::qwen3_8_flash_next_ple",
+)
+
+_prefetch_stream: torch.cuda.Stream | None = None
+
+
+def _get_prefetch_stream() -> torch.cuda.Stream:
+    global _prefetch_stream
+    if _prefetch_stream is None:
+        _prefetch_stream = torch.cuda.Stream()
+    return _prefetch_stream
+
+
+def _register_ple_compilation_context(
+    compilation_config: Any,
+    layer_name: str,
+    layer: nn.Module,
+) -> None:
+    """Keep request-dependent PLE transactions outside piecewise graphs.
+
+    Piecewise graph dispatch is keyed by padded token count, while PLE hashing
+    and recurrent-state routing also depend on the live request count and query
+    boundaries. These custom operators must therefore execute as partition
+    boundaries so a graph compiled for one request layout cannot replay stale
+    PLE metadata for another layout.
+    """
+    static_context = compilation_config.static_forward_context
+    if layer_name in static_context:
+        raise ValueError(f"duplicate layer name: {layer_name}")
+    static_context[layer_name] = layer
+
+    splitting_ops = compilation_config.splitting_ops
+    if splitting_ops is not None:
+        for op_name in _PLE_SPLITTING_OPS:
+            if op_name not in splitting_ops:
+                splitting_ops.append(op_name)
+
+
+def _b12x_module(name: str) -> Any:
+    api = {
+        "ple": get_b12x_ple,
+        "ple_embedding": get_b12x_ple_embedding,
+    }[name]()
+    if api is None:
+        raise ImportError(
+            f"Qwen3.8-Flash-Next requires b12x.sequence.{name}; "
+            "install the b12x serving extra"
+        )
+    return api
+
+
+def _resolve_ple_table_memory(additional_config: Any) -> str:
+    """Translate the public offload policy into a b12x storage mode."""
+    if isinstance(additional_config, dict) and "ple_table_memory" in additional_config:
+        table_memory = additional_config["ple_table_memory"]
+    else:
+        table_memory = envs.VLLM_PLE_TABLE_MEMORY
+        if table_memory is None:
+            offload = envs.is_set("VLLM_PLE_CPU_OFFLOAD") and envs.VLLM_PLE_CPU_OFFLOAD
+            return "mapped_host" if offload else "device"
+    if table_memory == "ram":
+        return "mapped_host"
+    if table_memory == "disk":
+        return "io_uring"
+    if table_memory == "device":
+        return "device"
+    raise ValueError(
+        "additional_config.ple_table_memory must be 'device', "
+        f"'ram', or 'disk', got {table_memory!r}"
+    )
+
+
+def _copy_embedding_shard(
+    destination: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    *,
+    checkpoint_start: int,
+    tp_start: int,
+    tp_end: int,
+) -> torch.Tensor | None:
+    checkpoint_end = checkpoint_start + loaded_weight.shape[0]
+    overlap_start = max(checkpoint_start, tp_start)
+    overlap_end = min(checkpoint_end, tp_end)
+    if overlap_start >= overlap_end:
+        return None
+    rows = overlap_end - overlap_start
+    source = loaded_weight.narrow(0, overlap_start - checkpoint_start, rows)
+    target = destination.narrow(0, overlap_start - tp_start, rows)
+    with torch.no_grad():
+        copy_weight(target, source)
+    return target
+
+
+class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
+    """Checkpoint-compatible zero-centered grouped RMSNorm parameter."""
+
+    def __init__(self, hidden_size: int, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(
+            allocate_weights(torch.zeros, hidden_size, dtype=dtype)
+        )
+
+
+class _NGramEmbeddingStorage(nn.Module):
+    def __init__(self, layout: Any, shard_rows: int) -> None:
+        super().__init__()
+        self.disk_table = None
+        self._table_storage = None
+        if layout.caps.table_memory == "io_uring":
+            api = _b12x_module("ple_embedding")
+            self.disk_table = api.DiskTable(layout, shard_rows)
+            tensors: dict[str, torch.Tensor | None] = {"weight": None}
+            for name in ("weight_scale", "weight_scale_2"):
+                shape = getattr(layout, f"{name}_shape")
+                tensors[name] = (
+                    allocate_weights(
+                        torch.empty,
+                        shape,
+                        dtype=getattr(layout, f"{name}_dtype"),
+                        device=layout.caps.device,
+                    )
+                    if shape == (1,)
+                    else None
+                )
+        else:
+            self._table_storage = allocate_weights(layout.allocate_storage)
+            tensors = {
+                name: getattr(self._table_storage, name)
+                for name in ("weight", "weight_scale", "weight_scale_2")
+            }
+        for name, tensor in tensors.items():
+            self.register_parameter(
+                name,
+                nn.Parameter(tensor, requires_grad=False)
+                if tensor is not None
+                else None,
+            )
+
+    @property
+    def weight_load_view(self) -> torch.Tensor | None:
+        return self._table_storage.weight_load_view if self._table_storage else None
+
+    @property
+    def weight_scale_load_view(self) -> torch.Tensor | None:
+        if self._table_storage is None:
+            return self.weight_scale
+        return self._table_storage.weight_scale_load_view
+
+    @property
+    def weight_scale_2_load_view(self) -> torch.Tensor | None:
+        if self._table_storage is None:
+            return self.weight_scale_2
+        return self._table_storage.weight_scale_2_load_view
+
+    @property
+    def mapped_host_nbytes(self) -> int:
+        return int(self._table_storage.mapped_host_nbytes) if self._table_storage else 0
+
+
+class Qwen3_8FlashNextNGramEmbedding(nn.Module):
+    """Prime-hashed learned n-gram embedding with fixed b12x storage."""
+
+    _STORAGE_MODES = {
+        "bfloat16": "bf16",
+        "float8_e4m3fn": "fp8_e4m3_per_tensor",
+        "float4_e2m1fn_x2": "nvfp4_group16",
+        "nvfp4": "nvfp4_group16",
+        "nvfp4_group16": "nvfp4_group16",
+        "uint8": "nvfp4_group16",
+    }
+
+    def __init__(
+        self,
+        config: Qwen3_8FlashNextTextConfig,
+        embedding_dim: int,
+        ple_dense_layer_id: int,
+        max_total_tokens: int,
+        max_num_reqs: int,
+        owner_prefix: str,
+        prefix: str,
+        dtype: torch.dtype,
+        table_memory: str,
+    ) -> None:
+        super().__init__()
+        self.embedding_dim = int(embedding_dim)
+        self.max_total_tokens = int(max_total_tokens)
+        self.max_num_reqs = int(max_num_reqs)
+        self.ngram_size = int(config.ngram_size)
+        self.heads_per_ngram = int(config.heads_per_ngram)
+        self.ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
+        self.requires_disk_preparation = table_memory == "io_uring"
+        self._disk_prepared_tokens = -1
+        self._disk_prepared = False
+        self.head_dim = self.embedding_dim // self.ngram_heads
+        self.eos_token_id = int(config.eos_token_id)
+        self.split_ngram_parts = int(getattr(config, "split_ngram_parts", 512))
+        self.owner_prefix = owner_prefix
+        if (
+            not self.requires_disk_preparation
+            and envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP
+            and current_platform.is_cuda()
+        ):
+            _get_prefetch_stream()
+        self.embedding_storage_dtype = str(
+            getattr(config, "ple_embedding_dtype", "bfloat16")
+        )
+        if self.embedding_storage_dtype not in self._STORAGE_MODES:
+            raise NotImplementedError(
+                "Qwen3.8-Flash-Next PLE embedding storage dtype "
+                f"{self.embedding_storage_dtype!r} is unsupported"
+            )
+        self._quant_mode = self._STORAGE_MODES[self.embedding_storage_dtype]
+        self._embedding_load_ranges: set[tuple[int, int]] = set()
+        self._scale_load_ranges: set[tuple[int, int]] = set()
+        self._weight_scale_loaded = False
+        self._weight_scale_2_loaded = False
+        self._embedding_validated = False
+
+        device = torch.device(current_platform.current_device())
+        common_caps = {
+            "device": device,
+            "max_tokens": self.max_total_tokens,
+            "max_seqs": self.max_num_reqs,
+            "vocab_size": int(config.vocab_size),
+            "eos_token_id": self.eos_token_id,
+            "max_order": self.ngram_size,
+            "heads_per_order": self.heads_per_ngram,
+            "dense_layer_ordinal": int(ple_dense_layer_id),
+            "base_table_size": int(config.ngram_vocab_size_base),
+            "table_alignment": int(config.make_ngram_vocab_size_divisible_by),
+        }
+        api = _b12x_module("ple_embedding")
+        self._caps = api.Caps(
+            **common_caps,
+            embedding_dim=self.embedding_dim,
+            tp_size=get_tensor_model_parallel_world_size(),
+            tp_rank=get_tensor_model_parallel_rank(),
+            quant_mode=self._quant_mode,
+            table_memory=table_memory,
+            output_dtype=dtype,
+        )
+        self._geometry = api.compute_geometry(self._caps)
+        geometry_tensors = api.allocate_geometry(self._geometry, device=device)
+        self._table_layout = api.storage_layout(self._caps, geometry=self._geometry)
+        self.register_buffer("layer_multipliers", geometry_tensors.multipliers)
+        self.register_buffer("ngram_heads_offsets", geometry_tensors.table_offsets)
+        self.register_buffer("ngram_heads_vocab_sizes", geometry_tensors.prime_sizes)
+        self._plans: dict[int, object] = {}
+        shard_rows = (
+            self._table_layout.padded_vocab_size + self.split_ngram_parts - 1
+        ) // self.split_ngram_parts
+        self.ngram_embedding = _NGramEmbeddingStorage(self._table_layout, shard_rows)
+        if self.ngram_embedding.mapped_host_nbytes:
+            logger.info(
+                "Using %.2f GiB of CUDA-mapped host memory for this TP rank's "
+                "PLE table",
+                self.ngram_embedding.mapped_host_nbytes / (1 << 30),
+            )
+        scratch_spec = self._table_layout.scratch_specs()[0]
+        self.register_buffer(
+            "_scratch",
+            torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_token_ids",
+            torch.empty(self.max_total_tokens, dtype=torch.int64, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_query_start_loc",
+            torch.empty(self.max_num_reqs + 1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_committed_history",
+            torch.empty(
+                self.max_num_reqs,
+                self.ngram_size - 1,
+                dtype=torch.int64,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_num_seqs",
+            torch.zeros(1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_num_tokens",
+            torch.zeros(1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_embedding_out",
+            torch.empty(
+                self._table_layout.output_shape,
+                dtype=self._table_layout.output_dtype,
+                device=device,
+            ),
+            persistent=False,
+        )
+        if not getattr(self, "b12x_preparation_suppressed", False):
+            set_b12x_preparation_provider(self, self)
+
+    def _declare_embedding_plan(self, token_count: int):
+        api = _b12x_module("ple_embedding")
+        return api.plan(
+            replace(self._caps, max_tokens=token_count),
+            geometry=self._geometry,
+            prime_sizes=self.ngram_heads_vocab_sizes,
+            table_offsets=self.ngram_heads_offsets,
+            multipliers=self.layer_multipliers,
+        )
+
+    def _capacity_for(self, token_count: int) -> int:
+        if not 0 <= token_count <= self.max_total_tokens:
+            raise ValueError("PLE embedding token count exceeds capacity")
+        if not self.requires_disk_preparation and token_count in self._plans:
+            return token_count
+        return self.max_total_tokens
+
+    def _plan_for(self, token_count: int):
+        """Resolve a live token count within the declared embedding capacity."""
+        capacity = self._capacity_for(token_count)
+        plan = self._plans.get(capacity)
+        if plan is None:
+            plan = self._declare_embedding_plan(capacity)
+            self._plans[capacity] = plan
+        return plan
+
+    def _bind_embedding(self, token_count: int):
+        capacity = self._capacity_for(token_count)
+        api = _b12x_module("ple_embedding")
+        return api.bind(
+            self._plan_for(token_count),
+            scratch=self._scratch,
+            weight=self.ngram_embedding.weight,
+            weight_scale=self.ngram_embedding.weight_scale,
+            weight_scale_2=self.ngram_embedding.weight_scale_2,
+            token_ids=self._token_ids[:capacity],
+            query_start_loc=self._query_start_loc,
+            committed_history=self._committed_history,
+            num_seqs=self._num_seqs,
+            num_tokens=self._num_tokens,
+            out=self._embedding_out[:capacity],
+            disk_table=self.ngram_embedding.disk_table,
+        )
+
+    def _bind_embedding_state(self, state: object, token_count: int):
+        capacity = (
+            self.max_total_tokens if self.requires_disk_preparation else token_count
+        )
+        return state.bind(
+            scratch=self._scratch,
+            weight=self.ngram_embedding.weight,
+            weight_scale=self.ngram_embedding.weight_scale,
+            weight_scale_2=self.ngram_embedding.weight_scale_2,
+            token_ids=self._token_ids[:capacity],
+            query_start_loc=self._query_start_loc,
+            committed_history=self._committed_history,
+            num_seqs=self._num_seqs,
+            num_tokens=self._num_tokens,
+            out=self._embedding_out[:capacity],
+            disk_table=self.ngram_embedding.disk_table,
+        )
+
+    def _request_name(self, token_count: int) -> str:
+        return f"{self.owner_prefix}.ple_embedding.m{token_count}"
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if layer is not self:
+            raise ValueError("PLE embedding preparation owner mismatch")
+        self._validate_embedding_loaded()
+        requests = []
+        plans = self._plans
+        token_counts = (
+            (self.max_total_tokens,)
+            if self.requires_disk_preparation
+            else tuple(sorted({self.max_total_tokens, *workload.fixed_token_counts}))
+        )
+        # Plans are declared once per token count; a later collection reuses
+        # them so prepared state stays installed.
+        for token_count in token_counts:
+            plan = plans.get(token_count)
+            if plan is None:
+                plan = self._declare_embedding_plan(token_count)
+                plans[token_count] = plan
+            requests.append(
+                plan.request(
+                    name=self._request_name(token_count),
+                    prepare_call=self._embedding_prepare_call(token_count),
+                )
+            )
+        if not requests:
+            return ()
+        return (
+            B12xPreparationUnit(
+                name="PLE embedding",
+                key=self.owner_prefix,
+                requests=tuple(requests),
+                stage="weights",
+                autotune=False,
+            ),
+        )
+
+    def _embedding_prepare_call(self, token_count: int):
+        def prepare(state):
+            from b12x.preparation import PreparedCall
+
+            # Prime one real row through the checkpoint-owned table and
+            # geometry.  These are the only mutable staging rows this callback
+            # touches; unlike a pool clone they are restored when the call is
+            # released and never replace checkpoint parameters.
+            capacity = (
+                self.max_total_tokens if self.requires_disk_preparation else token_count
+            )
+            token_ids = self._token_ids[:1].clone()
+            query_start = self._query_start_loc[:2].clone()
+            history = self._committed_history[:1].clone()
+            num_seqs = self._num_seqs.clone()
+            num_tokens = self._num_tokens.clone()
+            output = self._embedding_out[:1].clone()
+
+            def produce() -> None:
+                self._token_ids[0] = self.eos_token_id
+                self._query_start_loc[:2].zero_()
+                self._query_start_loc[1] = 1
+                self._committed_history[0].fill_(self.eos_token_id)
+                self._num_seqs.fill_(1)
+                self._num_tokens.fill_(1)
+
+            def restore() -> None:
+                self._token_ids[:1].copy_(token_ids)
+                self._query_start_loc[:2].copy_(query_start)
+                self._committed_history[:1].copy_(history)
+                self._num_seqs.copy_(num_seqs)
+                self._num_tokens.copy_(num_tokens)
+                self._embedding_out[:1].copy_(output)
+
+            binding = self._bind_embedding_state(state, capacity)
+            return PreparedCall(
+                run=lambda: state.run(binding, token_count=1),
+                produce=produce,
+                restore=restore,
+                owners=(binding,),
+            )
+
+        return prepare
+
+    def _prepare_inputs(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> int:
+        token_count = input_ids.numel()
+        num_seqs = query_start_loc.numel() - 1
+        if token_count > self.max_total_tokens or num_seqs > self.max_num_reqs:
+            raise ValueError(
+                "PLE hashing capacity exceeded: "
+                f"tokens={token_count}/{self.max_total_tokens}, "
+                f"requests={num_seqs}/{self.max_num_reqs}"
+            )
+        if tuple(ngram_context.shape) != (num_seqs, self.ngram_size - 1):
+            raise ValueError(
+                "ngram_context must have shape "
+                f"{(num_seqs, self.ngram_size - 1)}, got "
+                f"{tuple(ngram_context.shape)}"
+            )
+        self._token_ids.fill_(self.eos_token_id)
+        self._token_ids[:token_count].copy_(input_ids.reshape(-1).to(torch.int64))
+        self._query_start_loc.zero_()
+        self._query_start_loc[: num_seqs + 1].copy_(query_start_loc.to(torch.int32))
+        self._committed_history.fill_(self.eos_token_id)
+        self._committed_history[:num_seqs].copy_(ngram_context.to(torch.int64))
+        self._num_seqs.fill_(num_seqs)
+        self._num_tokens.copy_(query_start_loc[num_seqs : num_seqs + 1])
+        return token_count
+
+    def _run_embedding(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        self._validate_embedding_loaded()
+        self._plan_for(input_ids.numel())
+        token_count = self._prepare_inputs(input_ids, query_start_loc, ngram_context)
+        _b12x_module("ple_embedding").run(
+            self._bind_embedding(token_count), token_count=token_count
+        )
+
+    def prepare_disk(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        """Produce local embeddings before the model's graph is replayed."""
+        if not self.requires_disk_preparation:
+            raise RuntimeError("prepare_disk requires an io_uring PLE table")
+        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Disk PLE preparation must run outside CUDA graphs")
+        self._disk_prepared_tokens = -1
+        self._disk_prepared = False
+        self._run_embedding(input_ids, query_start_loc, ngram_context)
+        self._disk_prepared_tokens = input_ids.numel()
+        self._disk_prepared = True
+
+    def prepare_dummy_output(self, num_tokens: int) -> None:
+        """Initialize graph-visible profiling output without reading the table."""
+        if not self.requires_disk_preparation:
+            raise RuntimeError("Dummy disk output requires an io_uring table")
+        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Dummy disk PLE preparation must run outside CUDA graphs"
+            )
+        if not 0 <= num_tokens <= self.max_total_tokens:
+            raise ValueError("Dummy PLE output exceeds token capacity")
+        self._embedding_out[:num_tokens].zero_()
+        self._disk_prepared_tokens = num_tokens
+        self._disk_prepared = True
+
+    def _run_prefetch(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        if input_ids.numel() > 16 or not torch.cuda.is_current_stream_capturing():
+            self._run_embedding(input_ids, query_start_loc, ngram_context)
+            return
+        stream = _get_prefetch_stream()
+        stream.wait_stream(current_stream())
+        for tensor in (input_ids, query_start_loc, ngram_context):
+            tensor.record_stream(stream)
+        with torch.cuda.stream(stream):
+            self._run_embedding(input_ids, query_start_loc, ngram_context)
+
+    def prefetch(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        if self.requires_disk_preparation:
+            raise RuntimeError("Disk PLE tables must be prepared before model forward")
+        if torch.compiler.is_compiling():
+            torch.ops.vllm.qwen3_8_flash_next_ple_prefetch(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                self._embedding_out,
+                self.owner_prefix,
+            )
+        else:
+            self._run_prefetch(input_ids, query_start_loc, ngram_context)
+
+    def _validate_embedding_loaded(self) -> None:
+        if self._embedding_validated:
+            return
+
+        covered_until = self._table_layout.shard_start
+        for start, end in sorted(self._embedding_load_ranges):
+            if start > covered_until:
+                raise ValueError(
+                    "PLE embedding shards do not cover the local table: "
+                    f"expected row {covered_until}, got {start}"
+                )
+            covered_until = max(covered_until, end)
+        if covered_until != self._table_layout.shard_end:
+            raise ValueError(
+                "PLE embedding shards do not cover the local table: "
+                f"stopped at row {covered_until}, "
+                f"expected {self._table_layout.shard_end}"
+            )
+
+        if self._table_layout.weight_scale_shape is not None:
+            if self._quant_mode == "fp8_e4m3_per_tensor":
+                if not self._weight_scale_loaded:
+                    raise ValueError(
+                        "FP8 PLE embedding checkpoint is missing weight_scale"
+                    )
+            else:
+                scale_covered_until = self._table_layout.shard_start
+                for start, end in sorted(self._scale_load_ranges):
+                    if start > scale_covered_until:
+                        raise ValueError(
+                            "NVFP4 PLE scale shards do not cover the local table: "
+                            f"expected row {scale_covered_until}, got {start}"
+                        )
+                    scale_covered_until = max(scale_covered_until, end)
+                if scale_covered_until != self._table_layout.shard_end:
+                    raise ValueError(
+                        "NVFP4 PLE scale shards do not cover the local table: "
+                        f"stopped at row {scale_covered_until}, expected "
+                        f"{self._table_layout.shard_end}"
+                    )
+        if (
+            self._table_layout.weight_scale_2_shape is not None
+            and not self._weight_scale_2_loaded
+        ):
+            raise ValueError("NVFP4 PLE embedding checkpoint is missing weight_scale_2")
+        self._embedding_validated = True
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        *,
+        wait_for: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        input_ids = input_ids.reshape(-1)
+        if self.requires_disk_preparation:
+            # Batch counts must not become per-step Dynamo specialization guards.
+            if not self._disk_prepared or (
+                not torch.compiler.is_compiling()
+                and self._disk_prepared_tokens < input_ids.shape[0]
+            ):
+                raise RuntimeError(
+                    "Disk PLE output is not prepared; call prepare_disk before forward"
+                )
+        elif wait_for is not None:
+            torch.ops.vllm.qwen3_8_flash_next_ple_prefetch_wait(
+                self._embedding_out, wait_for
+            )
+        elif torch.compiler.is_compiling():
+            torch.ops.vllm.qwen3_8_flash_next_ple_embedding(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                self._embedding_out,
+                self.owner_prefix,
+            )
+        else:
+            self._run_embedding(input_ids, query_start_loc, ngram_context)
+        embeddings = self._embedding_out[: input_ids.shape[0]]
+        if get_tensor_model_parallel_world_size() > 1:
+            embeddings = tensor_model_parallel_all_reduce(embeddings)
+        return embeddings
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        persistent_buffers = {
+            "layer_multipliers": self.layer_multipliers,
+            "ngram_heads_offsets": self.ngram_heads_offsets,
+            "ngram_heads_vocab_sizes": self.ngram_heads_vocab_sizes,
+        }
+        loaded: set[str] = set()
+        regular_weights: list[tuple[str, torch.Tensor]] = []
+        shard_prefix = "ngram_embedding.shard_"
+        embedding = self.ngram_embedding
+        org_vocab_size = self._table_layout.padded_vocab_size
+        tp_start = self._table_layout.shard_start
+        tp_end = self._table_layout.shard_end
+        shard_size = (
+            org_vocab_size + self.split_ngram_parts - 1
+        ) // self.split_ngram_parts
+
+        for name, loaded_weight in weights:
+            leaf_name = name.rsplit(".", 1)[-1]
+            if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
+                continue
+            if name in persistent_buffers:
+                buffer = persistent_buffers[name]
+                if tuple(buffer.shape) != tuple(loaded_weight.shape):
+                    raise ValueError(
+                        f"shape mismatch for {name}: expected {tuple(buffer.shape)}, "
+                        f"got {tuple(loaded_weight.shape)}"
+                    )
+                checkpoint_value = loaded_weight.to(
+                    device=buffer.device, dtype=buffer.dtype
+                )
+                if not torch.equal(buffer, checkpoint_value):
+                    raise ValueError(
+                        f"checkpoint {name} does not match planned PLE geometry"
+                    )
+                loaded.add(name)
+                continue
+            if name == "ngram_embedding.weight_scale":
+                if self._quant_mode != "fp8_e4m3_per_tensor":
+                    regular_weights.append((name, loaded_weight))
+                    continue
+                expected_shape = self._table_layout.weight_scale_shape
+                if tuple(loaded_weight.shape) != expected_shape:
+                    raise ValueError(
+                        "shape mismatch for PLE embedding scale: expected "
+                        f"{expected_shape}, got {tuple(loaded_weight.shape)}"
+                    )
+                if loaded_weight.dtype != self._table_layout.weight_scale_dtype:
+                    raise TypeError(
+                        "PLE embedding weight_scale must have dtype "
+                        f"{self._table_layout.weight_scale_dtype}, "
+                        f"got {loaded_weight.dtype}"
+                    )
+                scale = loaded_weight.float()
+                if not bool(torch.isfinite(scale).all()) or not bool((scale > 0).all()):
+                    raise ValueError(
+                        "PLE embedding weight_scale must be finite and positive"
+                    )
+                with torch.no_grad():
+                    target = getattr(
+                        embedding, "weight_scale_load_view", embedding.weight_scale
+                    )
+                    assert target is not None
+                    target.copy_(
+                        loaded_weight.to(
+                            device=target.device,
+                            dtype=target.dtype,
+                        )
+                    )
+                self._weight_scale_loaded = True
+                self._embedding_validated = False
+                loaded.add(name)
+                continue
+            if name == "ngram_embedding.weight_scale_2":
+                if self._quant_mode != "nvfp4_group16":
+                    regular_weights.append((name, loaded_weight))
+                    continue
+                expected_shape = self._table_layout.weight_scale_2_shape
+                if loaded_weight.ndim == 0 and expected_shape == (1,):
+                    loaded_weight = loaded_weight.reshape(1)
+                if tuple(loaded_weight.shape) != expected_shape:
+                    raise ValueError(
+                        "shape mismatch for PLE embedding weight_scale_2: expected "
+                        f"{expected_shape}, got {tuple(loaded_weight.shape)}"
+                    )
+                if loaded_weight.dtype != self._table_layout.weight_scale_2_dtype:
+                    raise TypeError(
+                        "PLE embedding weight_scale_2 must have dtype "
+                        f"{self._table_layout.weight_scale_2_dtype}, got "
+                        f"{loaded_weight.dtype}"
+                    )
+                scale_2 = loaded_weight.float()
+                if not bool(torch.isfinite(scale_2).all()) or not bool(
+                    (scale_2 > 0).all()
+                ):
+                    raise ValueError(
+                        "PLE embedding weight_scale_2 must be finite and positive"
+                    )
+                with torch.no_grad():
+                    target = getattr(
+                        embedding,
+                        "weight_scale_2_load_view",
+                        embedding.weight_scale_2,
+                    )
+                    assert target is not None
+                    target.copy_(
+                        loaded_weight.to(device=target.device, dtype=target.dtype)
+                    )
+                self._weight_scale_2_loaded = True
+                self._embedding_validated = False
+                loaded.add(name)
+                continue
+            if name.startswith(shard_prefix):
+                shard_and_suffix = name[len(shard_prefix) :]
+                shard_text, separator, suffix = shard_and_suffix.partition(".")
+                if not shard_text.isdigit():
+                    regular_weights.append((name, loaded_weight))
+                    continue
+                shard_index = int(shard_text)
+                if shard_index >= self.split_ngram_parts:
+                    raise ValueError(
+                        f"PLE shard {shard_index} exceeds "
+                        f"split_ngram_parts={self.split_ngram_parts}"
+                    )
+                checkpoint_start = shard_index * shard_size
+                expected_rows = max(
+                    0,
+                    min(shard_size, org_vocab_size - checkpoint_start),
+                )
+                if separator != "." or suffix not in {"weight", "weight_scale"}:
+                    regular_weights.append((name, loaded_weight))
+                    continue
+                if suffix == "weight":
+                    expected_shape = (expected_rows, self._table_layout.weight_shape[1])
+                    expected_dtype = self._table_layout.weight_dtype
+                else:
+                    if self._quant_mode != "nvfp4_group16":
+                        regular_weights.append((name, loaded_weight))
+                        continue
+                    assert self._table_layout.weight_scale_shape is not None
+                    assert self._table_layout.weight_scale_dtype is not None
+                    expected_shape = (
+                        expected_rows,
+                        self._table_layout.weight_scale_shape[1],
+                    )
+                    expected_dtype = self._table_layout.weight_scale_dtype
+                if tuple(loaded_weight.shape) != expected_shape:
+                    raise ValueError(
+                        f"shape mismatch for PLE shard {shard_index} {suffix}: "
+                        f"expected {expected_shape}, got {tuple(loaded_weight.shape)}"
+                    )
+                if loaded_weight.dtype != expected_dtype:
+                    raise TypeError(
+                        f"PLE shard {shard_index} {suffix} must have dtype "
+                        f"{expected_dtype}, got {loaded_weight.dtype}"
+                    )
+                overlap_start = max(checkpoint_start, tp_start)
+                overlap_end = min(checkpoint_start + expected_rows, tp_end)
+                disk_table = getattr(embedding, "disk_table", None)
+                if disk_table is not None:
+                    source = get_file_tensor_source(loaded_weight)
+                    if source is None:
+                        raise ValueError(
+                            "File-backed PLE tables require safetensors weights "
+                            "from the b12x, instanttensor, fastsafetensors, or "
+                            "safetensors loader"
+                        )
+                    if source.shape != expected_shape or source.dtype != expected_dtype:
+                        raise ValueError(f"file source geometry does not match {name}")
+                    if overlap_start < overlap_end:
+                        disk_table.add_shard(
+                            shard_index,
+                            source.path,
+                            source.offset,
+                            scale=suffix == "weight_scale",
+                        )
+                else:
+                    parameter = getattr(embedding, suffix)
+                    destination = getattr(
+                        embedding, f"{suffix}_load_view", parameter.data
+                    )
+                    assert destination is not None
+                    target = _copy_embedding_shard(
+                        destination,
+                        loaded_weight,
+                        checkpoint_start=checkpoint_start,
+                        tp_start=tp_start,
+                        tp_end=tp_end,
+                    )
+                    if suffix == "weight_scale" and target is not None:
+                        flush_weight_transfers()
+                        scale = target.float()
+                        if not bool(torch.isfinite(scale).all()) or not bool(
+                            (scale > 0).all()
+                        ):
+                            raise ValueError(
+                                f"PLE shard {shard_index} weight_scale must be "
+                                "finite and positive"
+                            )
+                if overlap_start < overlap_end:
+                    load_ranges = (
+                        self._embedding_load_ranges
+                        if suffix == "weight"
+                        else self._scale_load_ranges
+                    )
+                    load_ranges.add((overlap_start, overlap_end))
+                    self._embedding_validated = False
+                loaded.add(f"ngram_embedding.{suffix}")
+                continue
+            regular_weights.append((name, loaded_weight))
+
+        if regular_weights:
+            loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+        return loaded
+
+
+class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
+    """PLE projections plus b12x stateful mixed prefill/decode kernel."""
+
+    def __init__(
+        self,
+        config: Qwen3_8FlashNextTextConfig,
+        vllm_config: VllmConfig,
+        layer_idx: int = 0,
+        ple_dense_layer_id: int | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if not is_conv_state_dim_first():
+            raise RuntimeError(
+                "b12x PLE requires VLLM_SSM_CONV_STATE_LAYOUT=DS so its "
+                "per-page convolution state uses [channels, history] layout"
+            )
+        self.model_config: ModelConfig = vllm_config.model_config
+        self.cache_config: CacheConfig = vllm_config.cache_config
+        self.layer_idx = int(layer_idx)
+        self.ple_dense_layer_id = (
+            int(ple_dense_layer_id)
+            if ple_dense_layer_id is not None
+            else self.layer_idx
+        )
+        self.prefix = prefix
+        self.hidden_size = int(config.hidden_size)
+        self.hc_count = int(config.hc_count)
+        self.hc_hidden_size = self.hidden_size * self.hc_count
+        self.conv_kernel_size = int(config.ple_conv_kernel_size)
+        self.short_conv_dilation = int(config.ngram_size)
+        self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
+        self.num_spec_tokens = int(vllm_config.num_speculative_tokens)
+        self.max_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
+        self.max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+        self.eps = float(config.rms_norm_eps)
+        dtype = self.model_config.dtype
+        if dtype != torch.bfloat16:
+            raise TypeError("b12x PLE requires a BF16 model")
+
+        table_memory = _resolve_ple_table_memory(vllm_config.additional_config)
+
+        self.ple_embedding = Qwen3_8FlashNextNGramEmbedding(
+            config,
+            int(config.ple_embed_dim),
+            self.ple_dense_layer_id,
+            self.max_tokens,
+            self.max_seqs,
+            prefix,
+            f"{prefix}.ple_embedding",
+            dtype,
+            table_memory,
+        )
+        self.key_proj = ReplicatedLinear(
+            int(config.ple_embed_dim),
+            self.hc_hidden_size,
+            bias=False,
+            params_dtype=dtype,
+            quant_config=None,
+            prefix=f"{prefix}.key_proj",
+            return_bias=False,
+        )
+        self.value_proj = ReplicatedLinear(
+            int(config.ple_embed_dim),
+            self.hidden_size,
+            bias=False,
+            params_dtype=dtype,
+            quant_config=None,
+            prefix=f"{prefix}.value_proj",
+            return_bias=False,
+        )
+        self.norm_key = Qwen3_8FlashNextPLEGroupedNorm(self.hc_hidden_size, dtype)
+        self.norm_query = Qwen3_8FlashNextPLEGroupedNorm(self.hc_hidden_size, dtype)
+        self.norm_conv = Qwen3_8FlashNextPLEGroupedNorm(self.hc_hidden_size, dtype)
+        self.conv1d = allocate_weights(
+            nn.Conv1d,
+            self.hc_hidden_size,
+            self.hc_hidden_size,
+            self.conv_kernel_size,
+            groups=self.hc_hidden_size,
+            bias=False,
+            dtype=dtype,
+            device=current_platform.current_device(),
+        )
+        nn.init.zeros_(self.conv1d.weight)
+        self.conv1d.weight._no_reinit = True
+
+        device = torch.device(current_platform.current_device())
+        factory = dict(device=device, dtype=dtype)
+        self.register_buffer(
+            "_residual",
+            torch.empty(self.max_tokens, self.hc_count, self.hidden_size, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_key",
+            torch.empty(self.max_tokens, self.hc_count, self.hidden_size, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_value",
+            torch.empty(self.max_tokens, self.hidden_size, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_out",
+            torch.empty(self.max_tokens, self.hc_count, self.hidden_size, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_query_start_loc",
+            torch.zeros(self.max_seqs + 1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_state_slot_ids",
+            torch.full(
+                (self.max_seqs,), NULL_BLOCK_ID, dtype=torch.int64, device=device
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_state_is_fresh",
+            torch.ones(self.max_seqs, dtype=torch.bool, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_num_accepted_tokens",
+            torch.ones(self.max_seqs, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_request_is_prefill",
+            torch.zeros(self.max_seqs, dtype=torch.bool, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_num_seqs",
+            torch.zeros(1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_num_tokens",
+            torch.zeros(1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer("_scratch", None, persistent=False)
+        self._state_caps = None
+        self._state_plans: dict[int, object] = {}
+        self.kv_cache = (torch.tensor([]),)
+
+        compilation_config = get_current_vllm_config().compilation_config
+        _register_ple_compilation_context(compilation_config, prefix, self)
+        self._preparation_prefix = prefix or f"qwen3_8_flash_next.ple.{self.layer_idx}"
+        if not getattr(self, "b12x_preparation_suppressed", False):
+            set_b12x_preparation_provider(self, self)
+
+    def _make_caps(self, max_state_slots: int):
+        api = _b12x_module("ple")
+        return api.Caps(
+            device=current_platform.current_device(),
+            mode="mixed",
+            max_tokens=self.max_tokens,
+            max_seqs=self.max_seqs,
+            max_state_slots=max_state_slots,
+            max_speculative_tokens=self.num_spec_tokens,
+            streams=self.hc_count,
+            hidden_size=self.hidden_size,
+            kernel_size=self.conv_kernel_size,
+            dilation=self.short_conv_dilation,
+            dtype=self.model_config.dtype,
+        )
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        conv_state = self.kv_cache[0]
+        expected_tail = self.conv_state_len + self.num_spec_tokens
+        if tuple(conv_state.shape[1:]) != (self.hc_hidden_size, expected_tail):
+            raise RuntimeError(
+                "unexpected PLE cache shape: expected "
+                f"[slots,{self.hc_hidden_size},{expected_tail}], got "
+                f"{tuple(conv_state.shape)}"
+            )
+        self._state_caps = self._make_caps(max_state_slots=conv_state.shape[0])
+        self._state_plans = {}
+
+    def _declare_state_plan(self, token_count: int):
+        return _b12x_module("ple").plan(
+            replace(self._state_caps, max_tokens=token_count),
+            invocation=self._state_invocation(token_count),
+        )
+
+    def _state_capacity_for(self, token_count: int) -> int:
+        if not 0 <= token_count <= self.max_tokens:
+            raise ValueError("PLE state token count exceeds capacity")
+        return token_count if token_count in self._state_plans else self.max_tokens
+
+    def _state_plan_for(self, token_count: int):
+        """Resolve a live token count within the declared state capacity."""
+        if self._state_caps is None:
+            raise RuntimeError("PLE KV cache was not bound before inference")
+        capacity = self._state_capacity_for(token_count)
+        plan = self._state_plans.get(capacity)
+        if plan is None:
+            plan = self._declare_state_plan(capacity)
+            self._state_plans[capacity] = plan
+        return plan
+
+    def _bind_ple(self, token_count: int):
+        capacity = self._state_capacity_for(token_count)
+        plan = self._state_plan_for(token_count)
+        (scratch,) = get_b12x_scratch_buffers(plan)
+        return _b12x_module("ple").bind(
+            plan,
+            scratch=scratch,
+            residual=self._residual[:capacity],
+            key=self._key[:capacity],
+            value=self._value[:capacity],
+            k_norm_weight=self.norm_key.weight,
+            q_norm_weight=self.norm_query.weight,
+            u_norm_weight=self.norm_conv.weight,
+            conv_weight=self.conv1d.weight.squeeze(1),
+            query_start_loc=self._query_start_loc,
+            state_slot_ids=self._state_slot_ids,
+            state_is_fresh=self._state_is_fresh,
+            num_accepted_tokens=self._num_accepted_tokens,
+            num_seqs=self._num_seqs,
+            num_tokens=self._num_tokens,
+            conv_state=self.kv_cache[0],
+            out=self._out[:capacity],
+            request_is_prefill=self._request_is_prefill,
+        )
+
+    def _state_request_name(self, token_count: int) -> str:
+        return f"{self._preparation_prefix}.state.m{token_count}"
+
+    def _state_invocation(self, token_count: int):
+        api = _b12x_module("ple")
+        return api.invocation_from_tensors(
+            residual=self._residual[:token_count],
+            key=self._key[:token_count],
+            value=self._value[:token_count],
+            k_norm_weight=self.norm_key.weight,
+            q_norm_weight=self.norm_query.weight,
+            u_norm_weight=self.norm_conv.weight,
+            conv_weight=self.conv1d.weight.squeeze(1),
+            query_start_loc=self._query_start_loc,
+            state_slot_ids=self._state_slot_ids,
+            state_is_fresh=self._state_is_fresh,
+            num_accepted_tokens=self._num_accepted_tokens,
+            request_is_prefill=self._request_is_prefill,
+            num_seqs=self._num_seqs,
+            num_tokens=self._num_tokens,
+            conv_state=self.kv_cache[0],
+            out=self._out[:token_count],
+        )
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if layer is not self:
+            raise ValueError("PLE state preparation owner mismatch")
+        if self._state_caps is None:
+            return ()
+        requests = []
+        plans: dict[int, object] = {}
+        for token_count in sorted({self.max_tokens, *workload.fixed_token_counts}):
+            if token_count > self.max_tokens:
+                continue
+            plan = self._declare_state_plan(token_count)
+            plans[token_count] = plan
+            requests.append(
+                plan.request(
+                    name=self._state_request_name(token_count),
+                    prepare_call=self._state_prepare_call(token_count),
+                )
+            )
+        self._state_plans = plans
+        if not requests:
+            return ()
+        return (
+            B12xPreparationUnit(
+                name="PLE state",
+                key=self._preparation_prefix,
+                requests=tuple(requests),
+                stage="state",
+                autotune=False,
+            ),
+        )
+
+    def _state_prepare_call(self, token_count: int):
+        def prepare(state):
+            from b12x.preparation import PreparedCall
+
+            # The prepare factory owns its scratch; the runtime binding in
+            # _bind_ple draws from the workspace manager instead.
+            scratch_spec = state.layout.scratch_specs()[0]
+            scratch = torch.empty(
+                scratch_spec.shape, dtype=scratch_spec.dtype, device=scratch_spec.device
+            )
+            # Exercise the actual mixed recurrent branch on one bounded slot.
+            # The preparation lease owns a snapshot only of that touched region;
+            # every reset/close restores it before production can observe it.
+            state_slot = 0
+            original_conv_state = self.kv_cache[0][state_slot].clone()
+            # The call stages its own inputs in the layer's staging buffers, so
+            # it snapshots and restores everything it overwrites: a plan can be
+            # prepared on demand in the middle of a live forward pass.
+            staging = (
+                self._residual[:token_count],
+                self._key[:token_count],
+                self._value[:token_count],
+                self._out[:token_count],
+                self._query_start_loc,
+                self._state_slot_ids,
+                self._state_is_fresh,
+                self._num_accepted_tokens,
+                self._request_is_prefill,
+                self._num_seqs,
+                self._num_tokens,
+            )
+            snapshot = tuple(buffer.clone() for buffer in staging)
+            binding = state.bind(
+                scratch=scratch,
+                residual=self._residual[:token_count],
+                key=self._key[:token_count],
+                value=self._value[:token_count],
+                k_norm_weight=self.norm_key.weight,
+                q_norm_weight=self.norm_query.weight,
+                u_norm_weight=self.norm_conv.weight,
+                conv_weight=self.conv1d.weight.squeeze(1),
+                query_start_loc=self._query_start_loc,
+                state_slot_ids=self._state_slot_ids,
+                state_is_fresh=self._state_is_fresh,
+                num_accepted_tokens=self._num_accepted_tokens,
+                num_seqs=self._num_seqs,
+                num_tokens=self._num_tokens,
+                conv_state=self.kv_cache[0],
+                out=self._out[:token_count],
+                request_is_prefill=self._request_is_prefill,
+            )
+
+            def restore():
+                self.kv_cache[0][state_slot].copy_(original_conv_state)
+                for buffer, saved in zip(staging, snapshot):
+                    buffer.copy_(saved)
+
+            def reset():
+                self.kv_cache[0][state_slot].copy_(original_conv_state)
+                self._residual[:token_count].fill_(1)
+                self._key[:token_count].fill_(1)
+                self._value[:token_count].fill_(1)
+                self._out[:token_count].zero_()
+                self._query_start_loc.zero_()
+                self._query_start_loc[1] = token_count
+                self._state_slot_ids.fill_(NULL_BLOCK_ID)
+                self._state_slot_ids[0] = state_slot
+                self._state_is_fresh.fill_(True)
+                self._num_accepted_tokens.fill_(1)
+                self._request_is_prefill.zero_()
+                self._num_seqs.fill_(1)
+                self._num_tokens.fill_(token_count)
+
+            return PreparedCall(
+                run=lambda: state.run(binding, eps=self.eps, token_count=token_count),
+                reset=reset,
+                restore=restore,
+                owners=(scratch, original_conv_state),
+            )
+
+        return prepare
+
+    def unbind_kv_cache(self) -> None:
+        self._state_caps = None
+        self._state_plans = {}
+        super().unbind_kv_cache()
+
+    @property
+    def mamba_type(self) -> MambaAttentionBackendEnum:
+        return MambaAttentionBackendEnum.SHORT_CONV
+
+    def get_attn_backend(self) -> type[PLEAttentionBackend]:
+        return PLEAttentionBackend
+
+    @property
+    def is_kv_cache_tp_replicated(self) -> bool:
+        return True
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        return MambaStateDtypeCalculator.short_conv_state_dtype(
+            self.model_config.dtype, self.cache_config.mamba_cache_dtype
+        )
+
+    def get_state_shape(self) -> Sequence[tuple[int, ...]]:
+        # b12x binds the DS layout directly; construction rejects the global SD
+        # layout so runner state-copy semantics remain consistent.
+        return MambaStateShapeCalculator.short_conv_state_shape(
+            tp_world_size=1,
+            intermediate_size=self.hc_hidden_size,
+            conv_kernel=self.conv_state_len + 1,
+            num_spec=self.num_spec_tokens,
+        )
+
+    def _prepare_metadata(
+        self,
+        metadata: PLEAttentionMetadata,
+        query_start_loc: torch.Tensor,
+        token_count: int,
+    ) -> None:
+        inputs = metadata.graph_inputs
+        if inputs is None:
+            raise RuntimeError("PLE metadata has no staged graph inputs")
+        if inputs.max_seqs != self.max_seqs or token_count > self.max_tokens:
+            raise ValueError(
+                f"PLE capacity exceeded: tokens={token_count}/{self.max_tokens}, "
+                f"requests={inputs.max_seqs}/{self.max_seqs}"
+            )
+        self._query_start_loc.copy_(inputs.query_start_loc)
+        self._state_slot_ids.copy_(inputs.state_slot_ids)
+        self._state_is_fresh.copy_(inputs.state_is_fresh)
+        self._num_accepted_tokens.copy_(inputs.num_accepted_tokens)
+        self._request_is_prefill.copy_(inputs.request_is_prefill)
+        self._num_seqs.copy_(inputs.num_seqs)
+        self._num_tokens.copy_(inputs.num_tokens)
+
+    def _run_ple(
+        self,
+        residual: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> None:
+        token_count = residual.shape[0]
+        forward_context = get_forward_context()
+        raw_metadata = forward_context.attn_metadata
+        metadata = (
+            raw_metadata.get(self.prefix) if isinstance(raw_metadata, dict) else None
+        )
+        if metadata is None:
+            # Initial memory profiling deliberately runs without attention
+            # metadata because the KV cache has not been admitted yet.
+            self._out.zero_()
+            self._out[:token_count].copy_(value[:, None, :].expand_as(residual))
+            return
+        if not isinstance(metadata, PLEAttentionMetadata):
+            raise TypeError(
+                f"expected PLEAttentionMetadata for {self.prefix}, got "
+                f"{type(metadata).__name__}"
+            )
+        if self._state_caps is None:
+            raise RuntimeError("PLE KV cache was not bound before inference")
+        self._state_plan_for(token_count)
+        self._residual[:token_count].copy_(residual)
+        self._key[:token_count].copy_(key)
+        self._value[:token_count].copy_(value)
+        self._prepare_metadata(metadata, query_start_loc, token_count)
+        _b12x_module("ple").run_mixed(
+            self._bind_ple(token_count), eps=self.eps, token_count=token_count
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        *,
+        prefetched: bool = False,
+    ) -> torch.Tensor:
+        token_count = hidden_states.shape[0]
+        if input_ids.numel() != token_count:
+            raise ValueError(
+                "PLE input_ids and hidden states must have the same token count"
+            )
+        embeddings = self.ple_embedding(
+            input_ids,
+            query_start_loc,
+            ngram_context,
+            wait_for=hidden_states if prefetched else None,
+        )
+        key = self.key_proj(embeddings).reshape(
+            token_count, self.hc_count, self.hidden_size
+        )
+        value = self.value_proj(embeddings)
+        residual = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
+        if torch.compiler.is_compiling():
+            torch.ops.vllm.qwen3_8_flash_next_ple(
+                residual,
+                key,
+                value,
+                query_start_loc,
+                self._out,
+                self.prefix,
+            )
+        else:
+            self._run_ple(residual, key, value, query_start_loc)
+        return self._out[:token_count].flatten(-2)
+
+
+def _ple_embedding_op(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer.ple_embedding._run_embedding(input_ids, query_start_loc, ngram_context)
+
+
+def _ple_embedding_fake(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+def _ple_prefetch_op(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer.ple_embedding._run_prefetch(input_ids, query_start_loc, ngram_context)
+
+
+def _ple_prefetch_wait_op(out: torch.Tensor, dependency: torch.Tensor) -> None:
+    # The dependency places this join after the preceding layer's computation.
+    if dependency.shape[0] <= 16 and torch.cuda.is_current_stream_capturing():
+        current_stream().wait_stream(_get_prefetch_stream())
+
+
+def _ple_prefetch_wait_fake(out: torch.Tensor, dependency: torch.Tensor) -> None:
+    return
+
+
+def _ple_op(
+    residual: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer._run_ple(residual, key, value, query_start_loc)
+
+
+def _ple_fake(
+    residual: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="qwen3_8_flash_next_ple_embedding",
+    op_func=_ple_embedding_op,
+    mutates_args=["out"],
+    fake_impl=_ple_embedding_fake,
+)
+direct_register_custom_op(
+    op_name="qwen3_8_flash_next_ple_prefetch",
+    op_func=_ple_prefetch_op,
+    mutates_args=["out"],
+    fake_impl=_ple_embedding_fake,
+)
+direct_register_custom_op(
+    op_name="qwen3_8_flash_next_ple_prefetch_wait",
+    op_func=_ple_prefetch_wait_op,
+    mutates_args=["out"],
+    fake_impl=_ple_prefetch_wait_fake,
+)
+direct_register_custom_op(
+    op_name="qwen3_8_flash_next_ple",
+    op_func=_ple_op,
+    mutates_args=["out"],
+    fake_impl=_ple_fake,
+)
+
+
+__all__ = [
+    "Qwen3_8FlashNextNGramEmbedding",
+    "Qwen3_8FlashNextPLEGroupedNorm",
+    "Qwen3_8FlashNextPLELayer",
+]
