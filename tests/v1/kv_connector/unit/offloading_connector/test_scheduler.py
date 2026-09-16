@@ -4534,6 +4534,8 @@ def _shared_kv_mtp_config():
     spec.use_eagle_block_drop.return_value = True
     spec.use_multi_module_mtp.return_value = False
     spec.num_speculative_tokens_per_batch_size = None
+    spec.adaptive_speculative_tokens_window = None
+    spec.adaptive_speculative_tokens_initial = None
     spec.max_num_new_slots_for_drafting = 0
     spec.num_speculative_tokens = 1
     return spec

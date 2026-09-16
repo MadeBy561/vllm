@@ -1161,7 +1161,10 @@ class OffloadingConnectorScheduler:
                     load_start_gpu_block_idx = i
                     break
 
-            assert num_locally_computed_tokens % tokens_per_block == 0
+            assert (
+                num_locally_computed_tokens
+                <= load_start_gpu_block_idx * tokens_per_block
+            )
             num_pending_gpu_blocks = num_gpu_blocks - load_start_gpu_block_idx
 
             if group_config.sliding_window_size_in_chunks is not None:
@@ -1563,6 +1566,9 @@ class OffloadingConnectorScheduler:
                 num_chunks = req_status.storable_chunks(
                     group_config, group_state, num_offloadable_tokens
                 )
+
+                if group_config.requires_cow_source:
+                    continue
 
                 start_chunk_idx = group_state.next_stored_chunk_idx
                 prompt_horizon_chunks = (
