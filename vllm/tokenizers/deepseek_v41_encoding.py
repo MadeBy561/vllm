@@ -181,8 +181,10 @@ REASONING_EFFORT_TEMPLATE = (
     "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
 )
 REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
-    "low": 25,
-    "high": 50,
+    "low": 50,
+    "high": 75,
+    # Preserve the accepted alias at its numeric value; the official names
+    # are low, high and max.
     "xhigh": 75,
     "max": 100,
 }
@@ -292,7 +294,7 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
 
 def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
     """
-    Find the index of the last user/developer message.
+    Find the index of the last user message.
 
     V4.1 supports mid-conversation system messages, which count as user
     messages for the purposes of the assistant generation header.
@@ -300,7 +302,7 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
     last_user_index = -1
     for idx in range(len(messages) - 1, -1, -1):
         role = messages[idx].get("role")
-        if role in ["user", "developer"] or (role == "system" and idx > 0):
+        if role == "user" or (role == "system" and idx > 0):
             last_user_index = idx
             break
     return last_user_index
@@ -361,21 +363,6 @@ def render_message(
             prompt += "\n\n" + response_format_template.format(
                 schema=to_json(response_format)
             )
-
-    elif role == "developer":
-        assert content, f"Invalid message for role `{role}`: {msg}"
-
-        content_developer = USER_SP_TOKEN
-        content_developer += content
-
-        if tools:
-            content_developer += "\n\n" + render_tools(tools)
-        if response_format:
-            content_developer += "\n\n" + response_format_template.format(
-                schema=to_json(response_format)
-            )
-
-        prompt += user_msg_template.format(content=content_developer)
 
     elif role == "user":
         prompt += USER_SP_TOKEN
@@ -492,9 +479,7 @@ def render_message(
             )
             prompt += task_sp_token
 
-    elif messages[index].get("role") in ["user", "developer"] or (
-        messages[index].get("role") == "system" and index > 0
-    ):
+    elif role == "user" or (role == "system" and index > 0):
         # Normal generation: append Assistant + thinking token
         # (mid-conversation system messages also trigger the assistant header)
         prompt += ASSISTANT_SP_TOKEN
@@ -525,7 +510,6 @@ def _drop_thinking_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, An
             msg = copy.copy(msg)
             msg.pop("reasoning_content", None)
             result.append(msg)
-        # developer and other roles before last_user_idx are dropped
 
     return result
 

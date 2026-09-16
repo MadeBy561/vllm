@@ -25,6 +25,8 @@ def _normalize_messages(
         role = message.get("role")
         if role not in ("system", "developer", "user", "assistant", "tool"):
             raise ValueError(f"Invalid role: {role}")
+        if role == "developer":
+            message["role"] = "system"
         if "reasoning" in message:
             message["reasoning_content"] = message["reasoning"]
         content = message.get("content")
@@ -61,7 +63,11 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             # parts with '\n'. V4.1 encodes the original messages with '\n\n'.
             conversation = _normalize_messages(messages)
             if tools:
-                system = next((m for m in conversation if m["role"] == "system"), None)
+                system = (
+                    conversation[0]
+                    if conversation and conversation[0]["role"] == "system"
+                    else None
+                )
                 if system is None:
                     system = {"role": "system", "content": ""}
                     conversation.insert(0, system)
