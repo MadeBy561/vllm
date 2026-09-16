@@ -13,16 +13,17 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Literal
 
 import filelock
 import huggingface_hub.constants
 import numpy as np
 import regex as re
 import torch
+from safetensors.torch import _TYPES as _SAFETENSORS_BASE_DTYPES
 from safetensors.torch import load, load_file, safe_open, save_file
 from tqdm.auto import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
@@ -42,6 +43,11 @@ from vllm.model_executor.layers.quantization import (
 )
 from vllm.model_executor.model_loader.ep_weight_filter import (
     should_skip_weight,
+)
+from vllm.model_executor.weight_transfer import (
+    FileTensorSource,
+    copy_weight,
+    flush_weight_transfers,
 )
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
@@ -63,6 +69,13 @@ except ImportError:
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 
 logger = init_logger(__name__)
+
+# The Rust reader supports E8M0 even in releases whose Python lookup omits it.
+# Extend a local map; do not mutate safetensors' process-global dtype registry.
+_SAFETENSORS_TO_TORCH_DTYPE = {
+    **_SAFETENSORS_BASE_DTYPES,
+    "F8_E8M0": torch.float8_e8m0fnu,
+}
 
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
@@ -463,6 +476,7 @@ def download_weights_from_hf(
     revision: str | None = None,
     subfolder: str | None = None,
     ignore_patterns: str | list[str] | None = None,
+    weight_name_prefixes: Sequence[str] | None = None,
 ) -> str:
     """Download model weights from Hugging Face Hub.
 
@@ -479,6 +493,9 @@ def download_weights_from_hf(
         ignore_patterns (Optional[Union[str, list[str]]]): The patterns to
             filter out the weight files. Files matched by any of the patterns
             will be ignored.
+        weight_name_prefixes: Optional checkpoint tensor name prefixes. When
+            a safetensors index is present, only shards containing matching
+            tensor names are downloaded.
 
     Returns:
         str: The path to the downloaded model weights.
@@ -510,11 +527,19 @@ def download_weights_from_hf(
                 )
                 with open(index_path) as f:
                     weight_map = json.load(f)["weight_map"]
+                if weight_name_prefixes:
+                    weight_map = {
+                        name: filename
+                        for name, filename in weight_map.items()
+                        if _matches_weight_name_prefixes(name, weight_name_prefixes)
+                    }
+                    if not weight_map:
+                        allow_patterns = []
                 if weight_map:
                     # Extra [] so that weight_map files are treated as a
                     # single allow_pattern in the loop below
                     allow_patterns = [list(set(weight_map.values()))]  # type: ignore[list-item]
-                else:
+                elif not weight_name_prefixes:
                     allow_patterns = ["*.safetensors"]
             else:
                 # Use the first pattern found in the HF repo's files.
@@ -530,6 +555,12 @@ def download_weights_from_hf(
                 model_name_or_path,
                 e,
             )
+
+    if len(allow_patterns) == 0:
+        raise RuntimeError(
+            "The safetensors index does not contain any checkpoint tensors "
+            f"matching prefixes: {tuple(weight_name_prefixes or ())}"
+        )
 
     logger.debug("Using model weights format %s", allow_patterns)
     # Use file lock to prevent multiple processes from
@@ -634,6 +665,48 @@ def filter_duplicate_safetensors_files(
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
+
+
+def _matches_weight_name_prefixes(
+    weight_name: str, weight_name_prefixes: Sequence[str]
+) -> bool:
+    return weight_name.startswith(tuple(weight_name_prefixes))
+
+
+def filter_safetensors_files_by_weight_name_prefixes(
+    hf_weights_files: list[str],
+    hf_folder: str,
+    index_file: str,
+    weight_name_prefixes: Sequence[str] | None,
+) -> list[str]:
+    if not weight_name_prefixes:
+        return hf_weights_files
+
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return hf_weights_files
+
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    weight_files_for_prefixes = {
+        os.path.join(hf_folder, filename)
+        for weight_name, filename in weight_map.items()
+        if _matches_weight_name_prefixes(weight_name, weight_name_prefixes)
+    }
+    if not weight_files_for_prefixes:
+        raise RuntimeError(
+            "The safetensors index does not contain any checkpoint tensors "
+            f"matching prefixes: {tuple(weight_name_prefixes)}"
+        )
+
+    filtered_files = [f for f in hf_weights_files if f in weight_files_for_prefixes]
+    logger.info_once(
+        "Safetensors index filter selected %d/%d checkpoint shards.",
+        len(filtered_files),
+        len(hf_weights_files),
+    )
+    return filtered_files
 
 
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
@@ -867,11 +940,97 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def safetensors_file_sources(path: str) -> dict[str, FileTensorSource]:
+    """Read exact tensor ranges from a header, never from tensor payloads."""
+    path = os.path.abspath(path)
+    # Unbuffered reads cannot read ahead into the first tensor's payload.
+    with open(path, "rb", buffering=0) as f:
+        size = os.fstat(f.fileno()).st_size
+        length_bytes = f.read(8)
+        if len(length_bytes) != 8:
+            raise ValueError(f"Missing safetensors header in {path}")
+        length = int.from_bytes(length_bytes, "little")
+        if length > 100 << 20 or length > size - 8:
+            raise ValueError(f"Invalid safetensors header length in {path}")
+        header = json.loads(f.read(length))
+    # Let safetensors validate ranges, shapes, duplicate keys and payload bounds.
+    # Opening the file reads metadata only; no get_tensor/get_slice is needed.
+    with safe_open(path, framework="pt"):
+        pass
+    return {
+        name: FileTensorSource(
+            path=path,
+            offset=8 + length + entry["data_offsets"][0],
+            shape=tuple(entry["shape"]),
+            dtype=_SAFETENSORS_TO_TORCH_DTYPE[entry["dtype"]],
+        )
+        for name, entry in header.items()
+        if name != "__metadata__"
+    }
+
+
+def file_source_tensor(source: FileTensorSource) -> torch.Tensor:
+    """Make routing metadata for a checkpoint range without allocating storage."""
+    tensor = torch.empty(source.shape, dtype=source.dtype, device="meta")
+    tensor._vllm_file_tensor_source = source
+    return tensor
+
+
+def file_backed_safetensors_weights_iterator(
+    hf_weights_files: list[str],
+    ordinary_iterator: Callable[
+        [list[str]], Generator[tuple[str, torch.Tensor], None, None]
+    ],
+    file_weight_filter: Callable[[str], bool],
+    *,
+    weight_name_prefixes: Sequence[str] | None = None,
+    local_expert_ids: set[int] | None = None,
+    tensor_order: Literal["name", "offset"] = "name",
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Keep accelerated I/O for ordinary files and descriptors for opted-in ranges.
+
+    Files must arrive in the backend's original order. Only contiguous ordinary
+    runs are batched, so duplicate names and source ordering are not changed.
+    Mixed files use named lazy reads: accelerated backends either read the whole
+    file or reserve a full-file CUDA buffer even with tensor filtering enabled.
+    """
+    ordinary_files: list[str] = []
+    for path in hf_weights_files:
+        sources = safetensors_file_sources(path)
+        file_names = {name for name in sources if file_weight_filter(name)}
+        if not file_names:
+            ordinary_files.append(path)
+            continue
+        if ordinary_files:
+            yield from ordinary_iterator(ordinary_files)
+            ordinary_files = []
+        names = list(sources)
+        if tensor_order == "name":
+            names.sort()
+        elif tensor_order == "offset":
+            names.sort(key=lambda name: sources[name].offset)
+        with safe_open(path, framework="pt") as f:
+            for name in names:
+                if weight_name_prefixes and not _matches_weight_name_prefixes(
+                    name, weight_name_prefixes
+                ):
+                    continue
+                if should_skip_weight(name, local_expert_ids):
+                    continue
+                if name in file_names:
+                    yield name, file_source_tensor(sources[name])
+                else:
+                    yield name, f.get_tensor(name)
+    if ordinary_files:
+        yield from ordinary_iterator(ordinary_files)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     safetensors_load_strategy: str | None = None,
     local_expert_ids: set[int] | None = None,
+    weight_name_prefixes: Sequence[str] | None = None,
     *,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
@@ -963,6 +1122,10 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
+                if weight_name_prefixes and not _matches_weight_name_prefixes(
+                    name, weight_name_prefixes
+                ):
+                    continue
                 if not should_skip_weight(name, local_expert_ids):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
@@ -980,6 +1143,10 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
+                    if weight_name_prefixes and not _matches_weight_name_prefixes(
+                        name, weight_name_prefixes
+                    ):
+                        continue
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     state_dict[name] = f.get_tensor(name)
@@ -998,6 +1165,10 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
+                    if weight_name_prefixes and not _matches_weight_name_prefixes(
+                        name, weight_name_prefixes
+                    ):
+                        continue
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     param = f.get_tensor(name)
@@ -1008,6 +1179,7 @@ def multi_thread_safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     max_workers: int = 4,
+    weight_name_prefixes: Sequence[str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
 
@@ -1031,6 +1203,11 @@ def multi_thread_safetensors_weights_iterator(
             state_dict = future.result()
             del future
             for key in list(state_dict):
+                if weight_name_prefixes and not _matches_weight_name_prefixes(
+                    key, weight_name_prefixes
+                ):
+                    state_dict.pop(key)
+                    continue
                 yield key, state_dict.pop(key)
 
 
@@ -1074,6 +1251,7 @@ def runai_safetensors_weights_iterator(
 def fastsafetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
+    weight_name_prefixes: Sequence[str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
     using fastsafetensor library.
@@ -1121,6 +1299,10 @@ def fastsafetensors_weights_iterator(
         try:
             pl = _make_loader(nogds)
             for name, tensor in pl.iterate_weights():
+                if weight_name_prefixes and not _matches_weight_name_prefixes(
+                    name, weight_name_prefixes
+                ):
+                    continue
                 yielded = True
                 yield name, tensor
         except RuntimeError as e:
@@ -1134,7 +1316,12 @@ def fastsafetensors_weights_iterator(
             if pl is not None:
                 pl.close()
             pl = _make_loader(nogds=True)
-            yield from pl.iterate_weights()
+            for name, tensor in pl.iterate_weights():
+                if weight_name_prefixes and not _matches_weight_name_prefixes(
+                    name, weight_name_prefixes
+                ):
+                    continue
+                yield name, tensor
     finally:
         if pl is not None:
             pl.close()
@@ -1143,6 +1330,7 @@ def fastsafetensors_weights_iterator(
 def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
+    weight_name_prefixes: Sequence[str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
     using instanttensor library."""
@@ -1190,6 +1378,10 @@ def instanttensor_weights_iterator(
         try:
             for name, tensor in f.tensors():
                 pbar.update(tensor.numel() * tensor.element_size())
+                if weight_name_prefixes and not _matches_weight_name_prefixes(
+                    name, weight_name_prefixes
+                ):
+                    continue
                 yield name, tensor
         finally:
             pbar.close()
@@ -1252,14 +1444,14 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
             # Sometimes scalar values aren't considered tensors with shapes
             # so if both param and loaded_weight are a scalar,
             # reshape to match before copying
-            param.data.copy_(loaded_weight.view(param.shape))
+            copy_weight(param.data, loaded_weight.view(param.shape))
         else:
             assert param.size() == loaded_weight.size(), (
                 f"Attempted to load weight ({loaded_weight.size()}) "
                 f"into parameter ({param.size()})"
             )
 
-            param.data.copy_(loaded_weight)
+            copy_weight(param.data, loaded_weight)
     except Exception:
         # NOTE: This exception is added for the purpose of setting breakpoint to
         # debug weight loading issues.
@@ -1306,6 +1498,8 @@ def composed_weight_loader(
 
     def composed_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         loader(param, loaded_weight)
+        if not param.is_meta:
+            flush_weight_transfers()
         param.data.copy_(fn(param))
         return
 

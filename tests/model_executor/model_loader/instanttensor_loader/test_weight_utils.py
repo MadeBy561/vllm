@@ -2,16 +2,66 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import glob
+import sys
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+import vllm.model_executor.model_loader.weight_utils as weight_utils
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     instanttensor_weights_iterator,
     safetensors_weights_iterator,
 )
 from vllm.platforms import current_platform
+
+
+def test_instanttensor_requests_owned_tensors(monkeypatch):
+    tensor = torch.ones(4)
+    observed: dict[str, object] = {}
+
+    class FakeReader:
+        total_tensor_size = tensor.numel() * tensor.element_size()
+
+        def tensors(self):
+            yield "weight", tensor
+
+    @contextmanager
+    def fake_safe_open(files, *, framework, device, process_group, copy):
+        observed.update(
+            files=files,
+            framework=framework,
+            device=device,
+            process_group=process_group,
+            copy=copy,
+        )
+        yield FakeReader()
+
+    def no_world_group():
+        raise AssertionError
+
+    monkeypatch.setattr(
+        weight_utils,
+        "current_platform",
+        SimpleNamespace(is_cuda=lambda: True, current_device=lambda: 0),
+    )
+    monkeypatch.setattr(weight_utils, "get_world_group", no_world_group)
+    monkeypatch.setitem(
+        sys.modules, "instanttensor", SimpleNamespace(safe_open=fake_safe_open)
+    )
+
+    loaded = list(instanttensor_weights_iterator(["model.safetensors"], False))
+
+    assert loaded == [("weight", tensor)]
+    assert observed == {
+        "files": ["model.safetensors"],
+        "framework": "pt",
+        "device": 0,
+        "process_group": None,
+        "copy": True,
+    }
 
 
 @pytest.mark.skipif(
