@@ -111,6 +111,10 @@ _TEXT_GENERATION_MODELS = {
     "Gemma3nForCausalLM": ("gemma3n", "Gemma3nForCausalLM"),
     "Gemma4ForCausalLM": ("gemma4", "Gemma4ForCausalLM"),
     "Qwen3NextForCausalLM": ("qwen3_next", "Qwen3NextForCausalLM"),
+    "Qwen3_8FlashNextForCausalLM": (
+        "vllm.models.qwen3_8_flash_next",
+        "Qwen3_8FlashNextForCausalLM",
+    ),
     "Qwen4ExpForCausalLM": (
         "vllm.models.qwen4_exp",
         "Qwen4ExpForCausalLM",
@@ -599,6 +603,10 @@ _MULTIMODAL_MODELS = {
         "qwen3_5",
         "Qwen3_5MoeForConditionalGeneration",
     ),
+    "Qwen3_8FlashNextForConditionalGeneration": (
+        "vllm.models.qwen3_8_flash_next",
+        "Qwen3_8FlashNextForConditionalGeneration",
+    ),
     "Qwen4ExpForConditionalGeneration": (
         "vllm.models.qwen4_exp",
         "Qwen4ExpForConditionalGeneration",
@@ -648,6 +656,7 @@ _SPECULATIVE_DECODING_MODELS = {
         "vllm.models.deepseek_v41",
         "DSparkDeepseekV4ForCausalLM",
     ),
+    "Glm53DSparkForCausalLM": ("glm53_dspark", "Glm53DSparkForCausalLM"),
     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "Qwen3OmniDSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "K3DSparkModel": (
@@ -695,6 +704,10 @@ _SPECULATIVE_DECODING_MODELS = {
     "OpenPanguMTPModel": ("openpangu_mtp", "OpenPanguMTP"),
     "Qwen3NextMTP": ("qwen3_next_mtp", "Qwen3NextMTP"),
     "Qwen4ExpMTP": ("vllm.models.qwen4_exp", "Qwen4ExpMTP"),
+    "Qwen3_8FlashNextMTP": (
+        "vllm.models.qwen3_8_flash_next",
+        "Qwen3_8FlashNextMTP",
+    ),
     "Step3p5MTP": ("step3p5_mtp", "Step3p5MTP"),
     "Qwen3_5MTP": ("qwen3_5_mtp", "Qwen3_5MTP"),
     "Qwen3_5MoeMTP": ("qwen3_5_mtp", "Qwen3_5MoeMTP"),

@@ -45,6 +45,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "FunAudioChatAudioEncoderConfig": "vllm.transformers_utils.configs.funaudiochat",
     "Granite4VisionConfig": "vllm.transformers_utils.configs.granite4_vision",
     "Glm5NextConfig": "vllm.transformers_utils.configs.glm5_next",
+    "Glm53DSparkConfig": "vllm.transformers_utils.configs.glm53_dspark",
     "Glm5NextTextConfig": "vllm.transformers_utils.configs.glm5_next",
     "Glm5NextVisionConfig": "vllm.transformers_utils.configs.glm5_next",
     "HYV3Config": "vllm.transformers_utils.configs.hy_v3",
@@ -98,6 +99,13 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "QianfanOCRVisionConfig": "vllm.transformers_utils.configs.qianfan_ocr",
     "Qwen3ASRConfig": "vllm.transformers_utils.configs.qwen3_asr",
     "Qwen3NextConfig": "vllm.transformers_utils.configs.qwen3_next",
+    "Qwen3_8FlashNextConfig": "vllm.transformers_utils.configs.qwen3_8_flash_next",
+    "Qwen3_8FlashNextTextConfig": (
+        "vllm.transformers_utils.configs.qwen3_8_flash_next"
+    ),
+    "Qwen3_8FlashNextVisionConfig": (
+        "vllm.transformers_utils.configs.qwen3_8_flash_next"
+    ),
     "Qwen4ExpConfig": "vllm.transformers_utils.configs.qwen4_exp",
     "Qwen4ExpTextConfig": "vllm.transformers_utils.configs.qwen4_exp",
     "Qwen4ExpVisionConfig": "vllm.transformers_utils.configs.qwen4_exp",
@@ -136,6 +144,7 @@ __all__ = [
     "DeepseekVLV2Config",
     "DeepseekV3Config",
     "DeepseekV4Config",
+    "DeepseekV41Config",
     "Dots3NoteConfig",
     "K3DSparkConfig",
     "DotsOCRConfig",
@@ -144,6 +153,7 @@ __all__ = [
     "FunAudioChatAudioEncoderConfig",
     "Granite4VisionConfig",
     "Glm5NextConfig",
+    "Glm53DSparkConfig",
     "Glm5NextTextConfig",
     "Glm5NextVisionConfig",
     "HYV3Config",
@@ -192,6 +202,9 @@ __all__ = [
     "QianfanOCRVisionConfig",
     "Qwen3ASRConfig",
     "Qwen3NextConfig",
+    "Qwen3_8FlashNextConfig",
+    "Qwen3_8FlashNextTextConfig",
+    "Qwen3_8FlashNextVisionConfig",
     "Qwen4ExpConfig",
     "Qwen4ExpTextConfig",
     "Qwen4ExpVisionConfig",

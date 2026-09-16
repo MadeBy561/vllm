@@ -518,6 +518,7 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         extras={"native-prefix": "imdatta0/small_qwen3_5_20b"},
         max_model_len=4096,
     ),
+    "Qwen3_8FlashNextForCausalLM": _HfExamplesInfo("", is_available_online=False),
     "Qwen4ExpForCausalLM": _HfExamplesInfo("", is_available_online=False),
     "MellumForCausalLM": _HfExamplesInfo("JetBrains/Mellum2-12B-A2.5B-Base"),
     "Qwen3NextForCausalLM": _HfExamplesInfo(
@@ -1384,10 +1385,10 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         "Qwen/Qwen3.5-35B-A3B",
         max_model_len=4096,
     ),
-    "Qwen4ExpForConditionalGeneration": _HfExamplesInfo(
-        "",
-        is_available_online=False,
+    "Qwen3_8FlashNextForConditionalGeneration": _HfExamplesInfo(
+        "", is_available_online=False
     ),
+    "Qwen4ExpForConditionalGeneration": _HfExamplesInfo("", is_available_online=False),
     "Qwen3OmniMoeForConditionalGeneration": _HfExamplesInfo(
         "Qwen/Qwen3-Omni-30B-A3B-Instruct",
         max_model_len=4096,
@@ -1546,9 +1547,8 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
     ),
     "DSparkV41DraftModel": _HfExamplesInfo(
         "deepseek-ai/DeepSeek-V4.1-Flash",
-        speculative_model="deepseek-ai/DeepSeek-V4.1-Flash",  # draft in mtp.*
-        is_available_online=False,
-        use_original_num_layers=True,  # DSpark has >1 draft block
+        speculative_model="deepseek-ai/DeepSeek-V4.1-Flash",
+        use_original_num_layers=True,
     ),
     "K3DSparkModel": _HfExamplesInfo(
         "moonshotai/Kimi-K3",
@@ -1838,6 +1838,7 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
     "Qwen3NextMTP": _HfExamplesInfo(
         "Qwen/Qwen3-Next-80B-A3B-Instruct", min_transformers_version="4.56.3"
     ),
+    "Qwen3_8FlashNextMTP": _HfExamplesInfo("", is_available_online=False),
     "Qwen3_5MTP": _HfExamplesInfo(
         "Qwen/Qwen3.5-0.8B",
         speculative_model="Qwen/Qwen3.5-0.8B",

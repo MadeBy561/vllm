@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
@@ -8,7 +8,7 @@ from vllm.utils.math_utils import round_up
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
-    from vllm.config import CacheConfig, ModelConfig, VllmConfig
+    from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
     from vllm.config.cache import MambaDType
 
 
@@ -22,6 +22,12 @@ class VerifyAndUpdateConfig:
 
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        return
+
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
         return
 
 
@@ -347,6 +353,102 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
                 model_config.hf_text_config.quantization_config["quant_method"] = (
                     "deepseek_v4_fp8"
                 )
+
+
+class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        from vllm.platforms import current_platform
+
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
+            DeepseekV4ForCausalLMConfig.verify_and_update_model_config(model_config)
+            return
+        for cfg in (
+            model_config.hf_config,
+            model_config.hf_text_config,
+            model_config.model_arch_config,
+        ):
+            quant_config = getattr(cfg, "quantization_config", None)
+            if (
+                isinstance(quant_config, dict)
+                and quant_config.get("quant_method") == "fp8"
+            ):
+                quant_config["quant_method"] = "deepseek_v41_fp8"
+
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        from vllm.platforms import current_platform
+
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
+            return
+        text_config = model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        original_heads = getattr(
+            text_config, "original_num_attention_heads", text_config.num_attention_heads
+        )
+        original_groups = getattr(
+            text_config, "original_o_groups", text_config.o_groups
+        )
+        if original_heads % original_groups:
+            raise ValueError(
+                "DeepSeek V4.1 attention heads must be divisible by output groups."
+            )
+
+        padded_groups = round_up(original_groups, tp_size)
+        if padded_groups == original_groups:
+            return
+        padded_heads = padded_groups * (original_heads // original_groups)
+
+        seen: set[int] = set()
+        for config in (
+            model_config.hf_config,
+            model_config.hf_text_config,
+            model_config.model_arch_config,
+        ):
+            if id(config) in seen:
+                continue
+            seen.add(id(config))
+            config_with_originals: Any = config
+            if hasattr(config, "num_attention_heads"):
+                config_with_originals.original_num_attention_heads = original_heads
+                config.num_attention_heads = padded_heads
+            if hasattr(config, "o_groups"):
+                config_with_originals.original_o_groups = original_groups
+                config.o_groups = padded_groups
+
+        model_config.model_arch_config = model_config.get_model_arch_config()
+        logger.warning(
+            "Padded DeepSeek V4.1 attention for TP%d: heads %d -> %d, "
+            "output groups %d -> %d.",
+            tp_size,
+            original_heads,
+            padded_heads,
+            original_groups,
+            padded_groups,
+        )
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        from vllm.platforms import current_platform
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
+            return
+        backend = AttentionBackendEnum.B12X
+        if vllm_config.attention_config.backend not in (None, backend):
+            raise ValueError("DeepSeek V4.1 requires B12X.")
+        vllm_config.attention_config.backend = backend
 
 
 class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
@@ -916,6 +1018,57 @@ class Qwen4ExpMTPConfig(Qwen4ExpForConditionalGenerationConfig):
         _strip_qwen4_exp_mrope(vllm_config.model_config)
 
 
+def _strip_qwen3_8_flash_next_target_and_draft_mrope(
+    vllm_config: "VllmConfig",
+) -> None:
+    """Keep a text target and its native draft on the same position contract."""
+    model_config = vllm_config.model_config
+    _strip_qwen4_exp_mrope(model_config)
+
+    spec_config = vllm_config.speculative_config
+    draft_model_config = (
+        getattr(spec_config, "draft_model_config", None)
+        if spec_config is not None
+        else None
+    )
+    if draft_model_config is None or draft_model_config is model_config:
+        return
+    _strip_qwen4_exp_mrope(draft_model_config)
+    draft_model_config.model_arch_config = draft_model_config.get_model_arch_config()
+
+
+class Qwen3_8FlashNextForConditionalGenerationConfig(
+    Qwen4ExpForConditionalGenerationConfig
+):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        multimodal_config = vllm_config.model_config.multimodal_config
+        if multimodal_config is not None and multimodal_config.language_model_only:
+            _strip_qwen3_8_flash_next_target_and_draft_mrope(vllm_config)
+
+
+class Qwen3_8FlashNextForCausalLMConfig(Qwen3_8FlashNextForConditionalGenerationConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen3_8FlashNextForConditionalGenerationConfig.verify_and_update_config(
+            vllm_config
+        )
+        _strip_qwen3_8_flash_next_target_and_draft_mrope(vllm_config)
+
+
+class Qwen3_8FlashNextMTPConfig(Qwen3_8FlashNextForConditionalGenerationConfig):
+    """Preserve M-RoPE for a VL target and use 1D RoPE for a text target."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen3_8FlashNextForConditionalGenerationConfig.verify_and_update_config(
+            vllm_config
+        )
+        if not hasattr(vllm_config.model_config.hf_config, "vision_config"):
+            _strip_qwen4_exp_mrope(vllm_config.model_config)
+
+
 class ColQwen3_5Config(Qwen3_5ForConditionalGenerationConfig):
     """Apply the attention contract declared by a ColQwen3.5 checkpoint."""
 
@@ -1003,7 +1156,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColQwen3_5": ColQwen3_5Config,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV4ForConditionalGeneration": DeepseekV4ForCausalLMConfig,
-    "DeepseekV41ForCausalLM": DeepseekV4ForCausalLMConfig,
+    "DeepseekV41ForCausalLM": DeepseekV41ForCausalLMConfig,
+    "DSparkV41DraftModel": DeepseekV41ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
@@ -1045,6 +1199,11 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen4ExpForCausalLM": Qwen4ExpForCausalLMConfig,
     "Qwen4ExpForConditionalGeneration": (Qwen4ExpForConditionalGenerationConfig),
     "Qwen4ExpMTP": Qwen4ExpMTPConfig,
+    "Qwen3_8FlashNextForCausalLM": Qwen3_8FlashNextForCausalLMConfig,
+    "Qwen3_8FlashNextForConditionalGeneration": (
+        Qwen3_8FlashNextForConditionalGenerationConfig
+    ),
+    "Qwen3_8FlashNextMTP": Qwen3_8FlashNextMTPConfig,
     "UnlimitedOCRForCausalLM": UnlimitedOCRForCausalLMConfig,
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,

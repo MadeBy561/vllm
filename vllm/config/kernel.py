@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, field_validator
 
+import vllm.envs as envs
 from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.logger import init_logger
 
@@ -236,6 +237,9 @@ class KernelConfig:
     enable_flashinfer_autotune: bool = None  # type: ignore[assignment]
     """If True, run FlashInfer autotuning during kernel warmup."""
 
+    enable_b12x_autotune: bool = True
+    """Search uncached b12x choices at startup; mandatory preparation always runs."""
+
     # TODO(roberto): Remove after registered CuTeDSL warmups are migrated
     # to the shared JIT warmup infrastructure.
     # https://github.com/vllm-project/vllm/pull/47451
@@ -245,8 +249,17 @@ class KernelConfig:
     enable_jit_warmup: bool = True
     """If True, run JIT compile warmup during kernel warmup."""
 
-    moe_backend: MoEBackend = "auto"
-    """Backend for MoE expert computation kernels. Available options:
+    enable_bf16x3_router_gemm: bool = False
+    """If True, use the experimental SM100 BF16x3 CuteDSL router GEMM."""
+
+    moe_backend: MoEBackend = Field(
+        default_factory=lambda: envs.VLLM_DEFAULT_MOE_BACKEND,
+        validate_default=True,
+    )
+    """Backend for MoE expert computation kernels. Defaults to
+    `VLLM_DEFAULT_MOE_BACKEND`, or "auto" when the variable is unset.
+    Explicit configuration takes precedence over the deployment default.
+    Available options:
 
     - "auto": Automatically select the best backend based on model and hardware
     - "triton": Use Triton-based fused MoE kernels
@@ -364,6 +377,7 @@ class KernelConfig:
             "enable_cutedsl_warmup",
             "enable_jit_warmup",
             "enable_flashinfer_autotune",
+            "enable_b12x_autotune",
             "ir_op_priority",  # handled separately below
         }
         if self.linear_backend_per_quant is None:
