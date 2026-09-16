@@ -55,6 +55,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_flashinfer_allreduce = False
             use_flashinfer_pcie_ipc_allreduce = False
             use_aiter_allreduce = False
+            use_b12x_allreduce = False
+            use_roce_allreduce = False
         else:
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
@@ -71,12 +73,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_aiter_allreduce = use_custom_allreduce and bool(
                 rocm_aiter_ops.is_custom_all_reduce_enabled()
             )
+            use_b12x_allreduce = (
+                use_custom_allreduce
+                and envs.VLLM_ENABLE_PCIE_ALLREDUCE
+                and envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x"
+            )
+            use_roce_allreduce = (
+                use_custom_allreduce and envs.VLLM_ENABLE_ROCE_ALLREDUCE
+            )
+            if use_b12x_allreduce or use_roce_allreduce:
+                use_flashinfer_allreduce = False
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
         self.use_flashinfer_pcie_ipc_allreduce = use_flashinfer_pcie_ipc_allreduce
         self.use_aiter_allreduce = use_aiter_allreduce
+        self.use_b12x_allreduce = use_b12x_allreduce
+        self.use_roce_allreduce = use_roce_allreduce
 
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -110,6 +124,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
         self.use_aiter_ag_rs: bool = False
+        self.b12x_ar_comm = None
+
+        if self.use_b12x_allreduce and self.world_size > 1:
+            from .b12x_pcie_all_reduce import B12xPcieAllReduce
+
+            self.b12x_ar_comm = B12xPcieAllReduce(
+                group=self.cpu_group,
+                device_group=self.device_group,
+                device=self.device,
+                global_ranks=self.ranks,
+            )
+        elif self.use_roce_allreduce and self.world_size > 1:
+            # RoCEnante: multi-node DGX Spark one-shot RDMA collectives
+            # from b12x.comm.roce.
+            from .b12x_roce_all_reduce import B12xRoceAllReduce
+
+            self.b12x_ar_comm = B12xRoceAllReduce(
+                group=self.cpu_group,
+                device_group=self.device_group,
+                device=self.device,
+                global_ranks=self.ranks,
+            )
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -140,7 +176,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
-        if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
+        if (
+            use_custom_allreduce
+            and self.aiter_ar_comm is None
+            and (self.b12x_ar_comm is None or self.b12x_ar_comm.disabled)
+            and self.world_size > 1
+        ):
             # Initialize a custom fast all-reduce implementation.
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
@@ -260,6 +301,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """
         all_potential_ar_backends = [
             "FLASHINFER_PCIE_IPC",
+            "B12X_PCIE",
+            "B12X_ROCENANTE",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
             "QUICK_REDUCE",
@@ -274,6 +317,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not self.fi_pcie_ipc_ar_comm.disabled
         ):
             enabled_ar_backends.append("FLASHINFER_PCIE_IPC")
+        if self.b12x_ar_comm is not None and not self.b12x_ar_comm.disabled:
+            enabled_ar_backends.append(
+                getattr(self.b12x_ar_comm, "backend_name", "B12X_PCIE")
+            )
         if self.fi_ar_comm is not None and not self.fi_ar_comm.disabled:
             enabled_ar_backends.append("FLASHINFER")
         # Mirror the static preconditions of `should_nccl_symm_mem_allreduce`:
@@ -325,6 +372,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        b12x_ar_comm = self.b12x_ar_comm
+        if (
+            b12x_ar_comm is not None
+            and not b12x_ar_comm.disabled
+            and b12x_ar_comm.should_custom_ar(input_)
+        ):
+            out = b12x_ar_comm.custom_all_reduce(input_)
+            assert out is not None
+            return out
+
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
@@ -418,6 +475,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # gather-before-GEMM uses dim=0 with tp-aligned (uniform) shards.
         if dim < 0:
             dim += input_.dim()
+        # RoCEnante all-gather (writes the concatenated
+        # layout directly, so no reshape/copy follows).
+        b12x_ar_comm = self.b12x_ar_comm
+        if (
+            b12x_ar_comm is not None
+            and not b12x_ar_comm.disabled
+            and getattr(b12x_ar_comm, "should_all_gather", None) is not None
+            and b12x_ar_comm.should_all_gather(input_, dim)
+        ):
+            return b12x_ar_comm.all_gather(input_, dim)
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
 
@@ -651,6 +718,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        if self.b12x_ar_comm is not None:
+            self.b12x_ar_comm.close()
+            self.b12x_ar_comm = None
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None

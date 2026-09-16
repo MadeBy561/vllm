@@ -191,6 +191,33 @@ def resume_device_comms() -> None:
     _apply_to_device_comms(lambda comm: comm.resume())
 
 
+def register_b12x_collective_describer(owner, describe, *, group=None) -> bool:
+    """Attach exact native collective metadata to an existing TP communicator.
+
+    This never constructs a process group or a transport.  A producer may be
+    loaded on a non-native configuration; in that case it simply has no native
+    preparation obligation.
+    """
+    if group is None:
+        try:
+            group = get_tp_group()
+        except AssertionError:
+            return False
+    communicator = getattr(group, "device_communicator", None)
+    native = getattr(communicator, "b12x_ar_comm", None)
+    # Descriptor registration is an opt-in for the concrete native PCIe
+    # transport only.  A similarly shaped third-party communicator must not
+    # acquire b12x preparation obligations.
+    from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+        B12xPcieAllReduce,
+    )
+
+    if not isinstance(native, B12xPcieAllReduce) or native.disabled:
+        return False
+    native.register_describer(owner, describe)
+    return True
+
+
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -676,6 +703,7 @@ class GroupCoordinator:
 
         # only cuda/rocm uses this function,
         # so we don't abstract it into the base class
+        maybe_b12x_context = nullcontext()
         maybe_ca_context = nullcontext()
         maybe_fi_pcie_ipc_context: AbstractContextManager[Any] = nullcontext()
         maybe_aiter_ar_context = nullcontext()
@@ -691,6 +719,9 @@ class GroupCoordinator:
                 self.device_communicator,
                 (CudaCommunicator, XpuCommunicator),
             )
+            b12x_ar_comm = getattr(self.device_communicator, "b12x_ar_comm", None)
+            if b12x_ar_comm is not None:
+                maybe_b12x_context = b12x_ar_comm.capture(stream=stream)
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
                 maybe_ca_context = ca_comm.capture()  # type: ignore
@@ -712,6 +743,7 @@ class GroupCoordinator:
 
         with (
             torch.cuda.stream(stream),
+            maybe_b12x_context,
             maybe_ca_context,
             maybe_fi_pcie_ipc_context,
             maybe_aiter_ar_context,
