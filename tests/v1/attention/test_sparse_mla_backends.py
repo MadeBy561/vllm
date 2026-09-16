@@ -849,7 +849,7 @@ def _triton_convert_reference_impl(
 
 
 @pytest.mark.parametrize("block_size", [16, 64, 128])
-@pytest.mark.parametrize("num_topk_tokens", [128, 256, 512])
+@pytest.mark.parametrize("num_topk_tokens", [128, 256, 512, 2051])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability() < (9, 0),
     reason="FlashMLASparseBackend requires CUDA 9.0 or higher",
@@ -1648,9 +1648,8 @@ def test_split_indexer_prefill_chunks_single_request_overflow():
     assert out == expected
 
 
-# 384 is not a power of two, so it counts via the tiled atomic accumulation
-# rather than the single-tile path 128 takes.
-@pytest.mark.parametrize("num_topk_tokens", [128, 384])
+# Width 384 exercises tiled counting; 2051 exercises a masked single-row tile.
+@pytest.mark.parametrize("num_topk_tokens", [128, 384, 2051])
 def test_triton_convert_returns_valid_counts(num_topk_tokens: int):
     """Test that return_valid_counts correctly counts non-negative indices."""
     device = torch.device(DEVICE_TYPE)

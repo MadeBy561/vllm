@@ -28,6 +28,7 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
+from vllm.utils.b12x import set_b12x_preparation_provider
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -427,6 +428,12 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_sharing_target_layer_name,
             **extra_impl_args,
         )
+        # The native paged provider is the implementation, while this layer
+        # remains the sole owner of real KV storage and quantization scales.
+        # Register only after both are constructed so declarations cannot
+        # observe a half-initialized owner.
+        if self.attn_backend.get_name() == "B12X":
+            set_b12x_preparation_provider(self, self.impl)
         self.backend = AttentionBackendEnum[self.attn_backend.get_name()]
         self.dtype = dtype
 
@@ -481,6 +488,22 @@ class Attention(nn.Module, AttentionLayerBase):
                 if is_per_head
                 else GroupShape.PER_TENSOR,
             )
+
+    def _uses_b12x_paged_preparation(self) -> bool:
+        return self.attn_backend.get_name() == "B12X"
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        if self._uses_b12x_paged_preparation():
+            # Plans hold views of the bound cache. Drop them before the base
+            # class publishes a replacement; the next preparation collection
+            # declares plans against the new cache.
+            self.impl._plans = {}
+        super().bind_kv_cache(kv_cache)
+
+    def unbind_kv_cache(self) -> None:
+        if self._uses_b12x_paged_preparation():
+            self.impl._plans = {}
+        super().unbind_kv_cache()
 
     def forward(
         self,

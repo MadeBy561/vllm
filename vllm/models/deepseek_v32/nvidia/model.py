@@ -50,8 +50,16 @@ from vllm.v1.attention.backends.mla.index_group import (
     SparseMLAIndexGroupBuilder,
     get_sparse_mla_index_group_max_rows,
 )
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from .b12x import DeepseekV32B12xAttention
 from .glm52_low_latency_gemm import enable_glm52_low_latency_gemm
+
+
+def _get_attention_cls(vllm_config: VllmConfig) -> type[DeepseekV32Attention]:
+    if vllm_config.attention_config.backend == AttentionBackendEnum.B12X:
+        return DeepseekV32B12xAttention
+    return DeepseekV32Attention
 
 
 class DeepseekV32DecoderLayer(torch.nn.Module):
@@ -80,7 +88,7 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             and parallel_config.pipeline_parallel_size == 1
         )
 
-        self.self_attn = DeepseekV32Attention(
+        self.self_attn = _get_attention_cls(vllm_config)(
             vllm_config=vllm_config,
             config=config,
             prefix=f"{prefix}.self_attn",

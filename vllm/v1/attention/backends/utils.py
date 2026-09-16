@@ -33,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -60,6 +61,81 @@ def find_attention_impl_variant(
 
 
 _LN_2 = math.log(2.0)
+
+
+def refresh_dcp_local_seq_lens_(
+    local_seq_lens: torch.Tensor,
+    global_seq_lens: torch.Tensor,
+    num_reqs: int,
+    dcp_size: int,
+    dcp_rank: int,
+    cp_kv_cache_interleave_size: int,
+) -> None:
+    """Refresh persistent rank-local lengths after a fused draft step.
+
+    Args:
+        local_seq_lens: Persistent output buffer for rank-local lengths.
+        global_seq_lens: Current global sequence lengths for each request.
+        num_reqs: Number of active requests in ``global_seq_lens``.
+        dcp_size: Decode context parallel world size.
+        dcp_rank: Rank within the decode context parallel group.
+        cp_kv_cache_interleave_size: Tokens assigned to a rank per DCP round.
+
+    Returns:
+        None.
+    """
+    max_num_reqs = local_seq_lens.numel()
+    if max_num_reqs == 0:
+        return
+    block_size = 128
+    _refresh_dcp_local_seq_lens_kernel[(triton.cdiv(max_num_reqs, block_size),)](
+        local_seq_lens,
+        global_seq_lens,
+        dcp_size,
+        dcp_rank,
+        cp_kv_cache_interleave_size,
+        num_reqs,
+        max_num_reqs,
+        BLOCK_SIZE=block_size,
+    )
+
+
+@triton.jit
+def _refresh_dcp_local_seq_lens_kernel(
+    out_ptr,
+    seq_lens_ptr,
+    dcp_size,
+    dcp_rank,
+    cp_kv_cache_interleave_size,
+    num_reqs,
+    max_num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Apply the scheduler's DCP length mapping without host synchronization.
+
+    Args:
+        out_ptr: Output pointer for rank-local sequence lengths.
+        seq_lens_ptr: Input pointer for global sequence lengths.
+        dcp_size: Decode context parallel world size.
+        dcp_rank: Rank within the decode context parallel group.
+        cp_kv_cache_interleave_size: Tokens assigned to a rank per DCP round.
+        num_reqs: Number of active requests.
+        max_num_reqs: Capacity of the persistent output buffer.
+        BLOCK_SIZE: Number of request slots handled by each Triton program.
+
+    Returns:
+        None.
+    """
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    seq_lens = tl.load(seq_lens_ptr + offsets, mask=offsets < num_reqs, other=0)
+    virtual_block = dcp_size * cp_kv_cache_interleave_size
+    rounds = seq_lens // virtual_block
+    remainder = seq_lens % virtual_block
+    remainder = tl.maximum(remainder - dcp_rank * cp_kv_cache_interleave_size, 0)
+    remainder = tl.minimum(remainder, cp_kv_cache_interleave_size)
+    local_seq_lens = rounds * cp_kv_cache_interleave_size + remainder
+    local_seq_lens = tl.where(offsets < num_reqs, local_seq_lens, 0)
+    tl.store(out_ptr + offsets, local_seq_lens, mask=offsets < max_num_reqs)
 
 
 def log2_lse_to_ln(lse: torch.Tensor) -> torch.Tensor:
@@ -400,6 +476,34 @@ def get_num_attention_heads_from_layers(
         f"got {heads} for {layer_names}."
     )
     return heads.pop()
+
+
+def get_kv_cache_dtype_from_layers(
+    vllm_config: VllmConfig, layer_names: list[str]
+) -> str | None:
+    """Return the KV-cache format shared by one attention group.
+
+    Args:
+        vllm_config: Engine configuration containing the attention layers.
+        layer_names: Names of the layers in the attention group.
+
+    Returns:
+        The shared cache format, or ``None`` when the group has no attention
+        layers.
+    """
+    attn_layers = get_layers_from_vllm_config(
+        vllm_config,
+        AttentionLayerBase,  # type: ignore[type-abstract]
+        layer_names,
+    )
+    if not attn_layers:
+        return None
+    cache_dtypes = {cast(Any, layer).kv_cache_dtype for layer in attn_layers.values()}
+    assert len(cache_dtypes) == 1, (
+        "All layers in one attention group must share kv_cache_dtype; "
+        f"got {cache_dtypes} for {layer_names}."
+    )
+    return cache_dtypes.pop()
 
 
 def infer_global_hyperparameters(
