@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.platforms import current_platform
@@ -59,8 +60,14 @@ class GateLinear(ReplicatedLinear):
                 input_size,
                 output_size,
             ) in ROCM_FP32_ROUTER_GEMM_SUPPORTED_SHAPES
+        is_blackwell_rtx = current_platform.is_device_capability((12, 0))
         can_use_specialized_kernels = (
             current_platform.is_cuda() and (is_hopper or is_blackwell) and not bias
+        )
+        self._can_use_ll_bf16 = (
+            current_platform.is_cuda()
+            and (is_hopper or is_blackwell or is_blackwell_rtx)
+            and not bias
         )
 
         # If fp32 compute is required and no specialized kernel is available,
@@ -93,12 +100,15 @@ class GateLinear(ReplicatedLinear):
                 or (is_gfx950 and is_rocm_fp32_shape)
             )
         )
+        vllm_config = get_current_vllm_config_or_none()
         self.allow_bf16x3_router_gemm = (
             not bias
             and self.weight.dtype == torch.float32
             and current_platform.is_cuda()
             and is_blackwell
             and input_size % 8 == 0
+            and vllm_config is not None
+            and vllm_config.kernel_config.enable_bf16x3_router_gemm
         )
 
         # Fused bf16 x bf16 -> fp32 GEMM eligibility. torch.mm's out_dtype
@@ -108,6 +118,7 @@ class GateLinear(ReplicatedLinear):
         # applies on any CUDA-alike device (no bias, since torch.mm has no bias
         # term). The specialized-kernel gate above excludes family-120 Blackwell
         # (GB10 / DGX Spark), which this tier still covers. See #49921.
+        self._sm120_graph_pool_lifetime_guard = is_blackwell_rtx
         self._router_gemm_no_bias = not bias
         self._router_gemm_cublas_capable = (
             current_platform.is_cuda() or current_platform.is_rocm()
@@ -122,7 +133,7 @@ class GateLinear(ReplicatedLinear):
         # 1. PDL support. Both dot-product and split-K kernels.
         # 2. Thread Block Clusters. Split-K kernel for cross-CTA reduction.
         self.allow_ll_bf16_gemm = False
-        if can_use_specialized_kernels:
+        if self._can_use_ll_bf16:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 is_available,
             )
@@ -151,7 +162,7 @@ class GateLinear(ReplicatedLinear):
             self.allow_cublas_router_gemm = self.weight.dtype == torch.bfloat16
 
         # out_dtype may start as None -> recompute eligibility here
-        if self.allow_specialized_router_gemm:
+        if self._can_use_ll_bf16:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 is_available,
             )
@@ -197,7 +208,26 @@ class GateLinear(ReplicatedLinear):
 
         # Tier 4: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
+            graph_pool_guard = None
+            if self._sm120_graph_pool_lifetime_guard:
+                from vllm.compilation.breakable_cudagraph import (
+                    BreakableCUDAGraphCapture,
+                )
+
+                if (
+                    BreakableCUDAGraphCapture.current() is not None
+                    or torch.cuda.is_current_stream_capturing()
+                ):
+                    # The former linear-plus-cast path reserved a BF16 router
+                    # output before its FP32 result. Preserve that graph-pool
+                    # address layout while using the fused FP32 cuBLAS output;
+                    # auxiliary-stream graph nodes retain addresses across the
+                    # differently sized captures that share this pool.
+                    graph_pool_guard = x.new_empty(
+                        (*x.shape[:-1], self.weight.shape[0])
+                    )
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+            del graph_pool_guard
             return output, None
 
         # Tier 5: F.linear (ReplicatedLinear)

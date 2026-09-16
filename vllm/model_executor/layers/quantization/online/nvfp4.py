@@ -5,6 +5,11 @@ import torch
 from torch.nn import Module
 
 from vllm._custom_ops import scaled_fp4_quant
+from vllm.model_executor.kernels.linear.nvfp4.b12x import (
+    B12xNvFp4LinearKernel,
+    run_b12x_nvfp4_serialized_linear,
+)
+from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -16,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     make_nvfp4_moe_quant_config,
     select_nvfp4_moe_backend,
 )
+from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
@@ -32,6 +38,70 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+
+class Nvfp4OnlineLinearMethod(OnlineLinearBase):
+    """Online NVFP4 draft head with selectable activation precision."""
+
+    def __init__(self, *, use_a16: bool = False):
+        super().__init__()
+        supported, reason = B12xNvFp4LinearKernel.is_supported()
+        if not supported:
+            raise ValueError(f"Online NVFP4 draft head requires b12x: {reason}")
+        self.kernel = B12xNvFp4LinearKernel(NvFp4LinearLayerConfig())
+        self.use_a16 = use_a16
+        if use_a16 and self.input_dtype != torch.bfloat16:
+            raise ValueError("A16 LM heads require BF16 activations")
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        weight = layer.weight.contiguous()
+        if weight.shape[1] % 16:
+            raise ValueError("Online NVFP4 head requires K divisible by 16")
+        amax = weight.abs().amax().float().clamp_min(1e-8)
+        global_scale = (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX) / amax
+        packed, scales = scaled_fp4_quant(
+            weight, global_scale, is_sf_swizzled_layout=False
+        )
+        replace_parameter(layer, "weight", packed)
+        replace_parameter(layer, "weight_scale", scales)
+        replace_parameter(layer, "weight_global_scale", global_scale.reciprocal())
+        replace_parameter(layer, "input_global_scale_inv", torch.ones_like(amax))
+        replace_parameter(layer, "alpha", layer.weight_global_scale.clone())
+        # The quantized head scales its activations per call and runs the
+        # serialized GEMM, so its exact-M plans are serialized declarations
+        # even though the activations arrive in BF16.
+        layer.b12x_nvfp4_serialized_activations = not self.use_a16
+        layer.b12x_activation_mode = "a16" if self.use_a16 else "quantized"
+        self.kernel.process_weights_after_loading(layer)
+        layer._already_called_process_weights_after_loading = True
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.use_a16:
+            return self.kernel.apply_weights(layer, x, bias)
+        amax = x.abs().amax().float().clamp_min(1e-8)
+        input_scale = amax / (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX)
+        x_packed, x_scale = scaled_fp4_quant(
+            x.reshape(-1, x.shape[-1]),
+            input_scale.reciprocal(),
+            is_sf_swizzled_layout=True,
+        )
+        output = run_b12x_nvfp4_serialized_linear(
+            x_packed,
+            x_scale,
+            bias,
+            int(layer.weight.shape[0]),
+            x.dtype,
+            layer.b12x_layer_name,
+            alpha=input_scale * layer.weight_global_scale,
+        )
+        return output.view(*x.shape[:-1], layer.weight.shape[0])
 
 
 def _quantize_moe_weight_to_nvfp4(

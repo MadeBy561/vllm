@@ -691,6 +691,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
@@ -706,6 +707,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            workspace=workspace,
         )
 
 
@@ -1106,6 +1108,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
@@ -1121,6 +1124,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            workspace=workspace,
         )
 
 
@@ -1475,6 +1479,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
@@ -1490,6 +1495,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            workspace=workspace,
         )
 
 

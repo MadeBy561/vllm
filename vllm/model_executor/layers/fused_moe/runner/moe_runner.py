@@ -120,6 +120,7 @@ def _moe_forward(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    routed_output_dtype: torch.dtype,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return cast(
@@ -140,14 +141,18 @@ def _moe_forward_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    routed_output_dtype: torch.dtype,
 ) -> torch.Tensor:
     # `hidden_dim_unpadded > 0` only on the TRT-LLM MXFP4 path, where the
     # real kernel writes narrower than `hidden_states.shape[-1]`. Plumbed
     # as an op arg (not peeked from the layer registry) to keep the fake
     # a pure shape function of its inputs and preserve subgraph dedup.
     if hidden_dim_unpadded > 0:
-        return hidden_states.new_empty((*hidden_states.shape[:-1], hidden_dim_unpadded))
-    return torch.empty_like(hidden_states)
+        return hidden_states.new_empty(
+            (*hidden_states.shape[:-1], hidden_dim_unpadded),
+            dtype=routed_output_dtype,
+        )
+    return torch.empty_like(hidden_states, dtype=routed_output_dtype)
 
 
 def _moe_forward_shared(
@@ -157,6 +162,7 @@ def _moe_forward_shared(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    routed_output_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return cast(
@@ -177,16 +183,18 @@ def _moe_forward_shared_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    routed_output_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # `fused_out`: see `_moe_forward_fake` for hidden_dim_unpadded semantics.
     # `shared_out`: matches `shared_experts_input` if provided (latent MoE),
     # else `hidden_states`.
     if hidden_dim_unpadded > 0:
         fused_out = hidden_states.new_empty(
-            (*hidden_states.shape[:-1], hidden_dim_unpadded)
+            (*hidden_states.shape[:-1], hidden_dim_unpadded),
+            dtype=routed_output_dtype,
         )
     else:
-        fused_out = torch.empty_like(hidden_states)
+        fused_out = torch.empty_like(hidden_states, dtype=routed_output_dtype)
     if shared_experts_input is not None:
         shared_out = torch.empty_like(shared_experts_input)
     else:
@@ -503,6 +511,11 @@ class MoERunner(MoERunnerInterface):
         if output_is_reduced is None:
             output_is_reduced = self._fused_output_is_reduced
 
+        # Optional model-installed callback fired before the final all-reduce
+        # (GLM-5.3 L2 weight prefetch: the reduction leaves device memory idle).
+        _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
+        if _hook is not None:
+            _hook(states.shape[0])
         if (
             not self.moe_config.is_sequence_parallel
             and not self.moe_config.skip_final_all_reduce
@@ -587,10 +600,14 @@ class MoERunner(MoERunnerInterface):
         self,
         shared_experts_input: torch.Tensor | None,
         order: SharedExpertsOrder,
+        workspace: torch.Tensor | None = None,
     ):
         if self._shared_experts is not None:
             assert shared_experts_input is not None
-            self._shared_experts(shared_experts_input, order)
+            if workspace is None:
+                self._shared_experts(shared_experts_input, order)
+            else:
+                self._shared_experts(shared_experts_input, order, workspace=workspace)
 
     def _apply_quant_method(
         self,
@@ -610,8 +627,17 @@ class MoERunner(MoERunnerInterface):
         overlap. Then the shared expert was already launched in a separate
         stream, so the results only have to be awaited here.
         """
+        workspace = None
+        shared_workspace = None
+        if self._shared_experts is not None:
+            assert shared_experts_input is not None
+            shared_size = self._shared_experts.workspace_size(shared_experts_input)
+            if shared_size:
+                workspace, shared_workspace = self._quant_method.prepare_workspace(
+                    hidden_states, shared_size
+                )
         self._maybe_apply_shared_experts(
-            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+            shared_experts_input, SharedExpertsOrder.NO_OVERLAP, shared_workspace
         )
 
         if self.routed_experts.quant_method.is_monolithic:
@@ -630,17 +656,33 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
+            if workspace is None:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
+            else:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                    workspace=workspace,
+                )
 
         if shared_experts_overlapping:
             assert self._shared_experts is not None
             self._shared_experts.wait()
+        else:
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+                shared_workspace,
+            )
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,
@@ -737,6 +779,7 @@ class MoERunner(MoERunnerInterface):
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
             else 0,
+            self._quant_method.output_dtype,
         )
 
         #
@@ -890,9 +933,17 @@ class MoERunner(MoERunnerInterface):
         # before routed expert dispatch.
         shared_experts_overlapping = False
         if self._shared_experts is not None:
-            shared_experts_overlapping = self._shared_experts.maybe_forward_async(
-                shared_experts_input
-            )
+            assert shared_experts_input is not None
+            if self._shared_experts.workspace_size(shared_experts_input):
+                # Dispatch determines routed scratch sizes. Reserve both branches
+                # together before launching arena-backed shared experts.
+                self._shared_experts.maybe_sync_shared_experts_stream(
+                    shared_experts_input
+                )
+            else:
+                shared_experts_overlapping = self._shared_experts.maybe_forward_async(
+                    shared_experts_input
+                )
 
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
