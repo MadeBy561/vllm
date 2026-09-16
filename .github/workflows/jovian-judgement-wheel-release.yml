@@ -4,20 +4,10 @@ on:
   push:
     branches:
       - dev/jovian-judgement
+      - integration/beta
     tags:
       - vllm-jovian-cu134-stable-*
-    paths:
-      - .github/workflows/jovian-judgement-wheel-release.yml
-      - cmake/**
-      - csrc/**
-      - requirements/**
-      - rust/**
-      - tools/jovian_wheel_release/**
-      - vllm/**
-      - CMakeLists.txt
-      - pyproject.toml
-      - rust-toolchain.toml
-      - setup.py
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -97,7 +87,9 @@ jobs:
 
   notify-container:
     needs: build-beta
-    if: github.ref == 'refs/heads/dev/jovian-judgement'
+    if: >-
+      vars.LIL_CONTAINER_DISPATCH_ENABLED == 'true' &&
+      (github.ref == 'refs/heads/dev/jovian-judgement' || github.ref == 'refs/heads/integration/beta')
     permissions: {}
     uses: local-inference-lab/blackwell-llm-docker/.github/workflows/component-container-dispatch.yml@7eebe3ba39a1a15e06ffdc6d3df7b00a814a8364
     secrets:
