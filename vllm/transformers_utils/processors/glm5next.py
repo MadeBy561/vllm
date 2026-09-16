@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """vLLM-native multimodal processor for GLM-5.3-Flash."""
 
+import json
 import math
 
 import numpy as np
@@ -32,7 +33,7 @@ from transformers.processing_utils import (
     VideosKwargs,
 )
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
-from transformers.utils import TensorType, logging
+from transformers.utils import TensorType, cached_file, logging
 from transformers.video_processing_utils import BaseVideoProcessor
 from transformers.video_utils import (
     VideoInput,
@@ -40,8 +41,6 @@ from transformers.video_utils import (
     group_videos_by_shape,
     reorder_videos,
 )
-
-from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
 logger = logging.get_logger(__name__)
 
@@ -805,6 +804,18 @@ class Glm5NextProcessor(ProcessorMixin):
 
         model_path = pretrained_model_name_or_path
         tokenizer = AutoTokenizer.from_pretrained(model_path, **kwargs)
+        config_kwargs = {
+            key: kwargs[key]
+            for key in (
+                "cache_dir",
+                "force_download",
+                "local_files_only",
+                "revision",
+                "subfolder",
+                "token",
+            )
+            if key in kwargs
+        }
 
         def _cap_cfg(cfg: dict, *, is_video: bool) -> dict:
             # Video keeps a serving token cap (the checkpoint's 240k-token
@@ -818,20 +829,24 @@ class Glm5NextProcessor(ProcessorMixin):
             return cfg
 
         ip_cfg = _cap_cfg(
-            dict(get_image_processor_config(model_path, **kwargs)), is_video=False
+            dict(get_image_processor_config(model_path, **config_kwargs)),
+            is_video=False,
         )
         image_processor = Glm5NextImageProcessor(
             **{k: v for k, v in ip_cfg.items() if k != "image_processor_type"}
         )
 
-        processor_config = get_hf_file_to_dict(
-            "processor_config.json",
+        processor_config_file = cached_file(
             model_path,
-            revision=kwargs.get("revision", "main"),
+            "processor_config.json",
+            **config_kwargs,
         )
-        if processor_config is None:
-            raise ValueError(f"Missing processor_config.json for {model_path}")
-        vp_cfg = _cap_cfg(dict(processor_config["video_processor"]), is_video=True)
+        if processor_config_file is None:
+            raise FileNotFoundError(
+                f"processor_config.json was not found for {model_path!r}"
+            )
+        with open(processor_config_file) as f:
+            vp_cfg = _cap_cfg(dict(json.load(f)["video_processor"]), is_video=True)
         video_processor = Glm5NextVideoProcessor(
             **{k: v for k, v in vp_cfg.items() if k != "video_processor_type"}
         )
@@ -896,10 +911,12 @@ class Glm5NextProcessor(ProcessorMixin):
     def _get_num_multimodal_tokens(self, image_sizes=None, video_sizes=None, **kwargs):
         vision_data = {}
         if image_sizes is not None:
-            images_kwargs = Glm5NextProcessorKwargs._defaults.get("images_kwargs", {})
+            images_kwargs = dict(
+                Glm5NextProcessorKwargs._defaults.get("images_kwargs", {})
+            )
             images_kwargs.update(kwargs)
             merge_size = (
-                images_kwargs.get("merge_size", None) or self.image_processor.merge_size
+                images_kwargs.get("merge_size") or self.image_processor.merge_size
             )
 
             num_image_patches = [
@@ -917,8 +934,13 @@ class Glm5NextProcessor(ProcessorMixin):
             )
 
         if video_sizes is not None:
-            videos_kwargs = Glm5NextProcessorKwargs._defaults.get("videos_kwargs", {})
+            videos_kwargs = dict(
+                Glm5NextProcessorKwargs._defaults.get("videos_kwargs", {})
+            )
             videos_kwargs.update(kwargs)
+            merge_size = (
+                videos_kwargs.get("merge_size") or self.video_processor.merge_size
+            )
             num_video_patches = [
                 self.video_processor.get_number_of_video_patches(
                     *video_size, videos_kwargs

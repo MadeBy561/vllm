@@ -40,6 +40,7 @@ from vllm.model_executor.models.vision import (
     get_vit_attn_backend,
     is_vit_use_data_parallel,
 )
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -242,7 +243,7 @@ class Glm5NextVisionBlock(nn.Module):
     ) -> None:
         super().__init__()
         if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+            norm_layer = partial(allocate_weights, nn.LayerNorm, eps=1e-6)
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
         self.attn = Glm5NextVisionAttention(
@@ -303,7 +304,7 @@ class Glm5NextPatchMerger(nn.Module):
             prefix=f"{prefix}.proj",
             disable_tp=use_data_parallel,
         )
-        self.post_projection_norm = nn.LayerNorm(self.hidden_size)
+        self.post_projection_norm = allocate_weights(nn.LayerNorm, self.hidden_size)
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=self.hidden_size,
             output_sizes=[context_dim] * 2,
@@ -370,9 +371,9 @@ class Glm5NextVisionTransformer(nn.Module):
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.out_hidden_size = vision_config.out_hidden_size
 
-        swiglu_limit = vision_config.swiglu_limit
+        swiglu_limit = getattr(vision_config, "swiglu_limit", None)
         if swiglu_limit is None:
-            swiglu_limit = text_config.swiglu_limit
+            swiglu_limit = getattr(text_config, "swiglu_limit", None)
         assert swiglu_limit is not None, (
             "GLM-5.3-Flash vision requires swiglu_limit (vision_config or text_config)"
         )
@@ -628,7 +629,10 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
     def _glm5_hf_processor(self):
         from vllm.transformers_utils.processors.glm5next import Glm5NextProcessor
 
-        return Glm5NextProcessor.from_pretrained(self.ctx.model_config.model)
+        return Glm5NextProcessor.from_pretrained(
+            self.ctx.model_config.model,
+            revision=self.ctx.model_config.revision,
+        )
 
     def get_hf_processor(self, **kwargs: object):
         return self._glm5_hf_processor

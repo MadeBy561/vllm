@@ -61,7 +61,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         linear_head_dim: int = 128,
         linear_num_heads: int = 64,
         linear_conv_kernel_dim: int = 4,
-        linear_lower_bound: float = -5.0,
+        linear_lower_bound: float | None = -5.0,
         index_head_dim: int | None = None,
         index_topk: int | None = None,
         index_n_heads: int | None = None,

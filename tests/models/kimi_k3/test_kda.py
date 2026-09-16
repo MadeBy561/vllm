@@ -1144,6 +1144,56 @@ def test_fused_kda_decode_rejects_speculative_conv_state():
     )
 
 
+@torch.inference_mode()
+def test_flashkda_near_collinear_keys_remain_finite():
+    """Guard against unstable inversion of near-collinear key blocks."""
+    lower_bound = -5.0
+    if not is_flashkda_supported(128, torch.bfloat16, torch.float32, lower_bound):
+        pytest.skip("FlashKDA is not supported on this platform")
+
+    import vllm._flashkda_C  # noqa: F401
+
+    T, H, D = 16384, 1, 128
+    torch.manual_seed(0)
+    key = torch.randn(1, 1, H, D, dtype=torch.bfloat16, device=DEVICE)
+    qk = key.expand(1, T, H, D).contiguous()
+    value_block = torch.randn(1, 16, H, D, dtype=torch.bfloat16, device=DEVICE)
+    value = value_block.repeat(1, T // 16, 1, 1)
+    raw_gate = torch.full_like(qk, -12.0)
+    raw_beta = torch.full((1, T, H), 8.0, dtype=qk.dtype, device=DEVICE)
+    A_log = torch.zeros(H, dtype=torch.float32, device=DEVICE)
+    dt_bias = torch.zeros(H, D, dtype=torch.float32, device=DEVICE)
+    initial_state = torch.zeros(1, H, D, D, dtype=torch.float32, device=DEVICE)
+    final_state = torch.empty_like(initial_state)
+    output = torch.empty_like(value)
+    cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device=DEVICE)
+    workspace = torch.empty(
+        torch.ops._flashkda_C.get_workspace_size(T, H, 1),
+        dtype=torch.uint8,
+        device=DEVICE,
+    )
+
+    torch.ops._flashkda_C.fwd(
+        qk,
+        qk,
+        value,
+        raw_gate,
+        raw_beta,
+        D**-0.5,
+        output,
+        workspace,
+        A_log,
+        dt_bias,
+        lower_bound,
+        initial_state,
+        final_state,
+        cu_seqlens,
+    )
+
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(final_state).all()
+
+
 def _make_kda_prefill_inputs(
     state_dtype: torch.dtype,
     *,
@@ -1531,3 +1581,72 @@ def test_flashkda_checkpoint_correctness(state_dtype: torch.dtype, tolerance: fl
     )
     torch.testing.assert_close(conv_state[1], q[0, 13:16].flatten(1).transpose(0, 1))
     torch.testing.assert_close(recurrent_state[1], checkpoint_state[0])
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@torch.inference_mode()
+def test_flashkda_packed_fp32_checkpoints_survive_graph_replay(state_dtype):
+    """Packed rows preserve sequence ownership and FP32 state with BF16 final state."""
+    from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+        _flashkda_prefill as packed_prefill,
+    )
+
+    _require_kda_prefill_backend("flashkda", state_dtype, -3.0)
+    import vllm._flashkda_C  # noqa: F401
+
+    inputs = _make_kda_prefill_inputs(state_dtype, lower_bound=-3.0)
+    inputs.cu_seqlens.copy_(torch.tensor([0, 16, 48], device=DEVICE))
+    out = torch.empty_like(inputs.v)
+    final = torch.empty_like(inputs.initial_state)
+    checkpoints = torch.empty_like(inputs.initial_state, dtype=torch.float32)
+    offsets = torch.tensor([16, 32], dtype=torch.int32, device=DEVICE)
+    indptr = torch.tensor([0, 0, 2], dtype=torch.int32, device=DEVICE)
+    workspace = torch.empty(
+        torch.ops._flashkda_C.get_workspace_size(48, 2, 2),
+        dtype=torch.uint8,
+        device=DEVICE,
+    )
+
+    def run():
+        packed_prefill(
+            inputs.q,
+            inputs.k,
+            inputs.v,
+            inputs.raw_g,
+            inputs.raw_beta,
+            inputs.A_log,
+            inputs.dt_bias,
+            inputs.lower_bound,
+            inputs.initial_state,
+            inputs.cu_seqlens,
+            out,
+            final,
+            workspace,
+            checkpoints,
+            offsets,
+            indptr,
+        )
+
+    run()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for factor in (1.0, 0.5):
+        inputs.initial_state.mul_(factor)
+        graph.replay()
+        expected_out, expected_final = _kda_prefill_reference(inputs)
+        assert_close("packed output", expected_out, out, 0.03)
+        assert_close("packed final", expected_final, final, 0.03)
+        for row, length in enumerate((16, 32)):
+            prefix = SimpleNamespace(**vars(inputs))
+            for name in ("q", "k", "v", "raw_g", "raw_beta"):
+                setattr(prefix, name, getattr(inputs, name)[:, 16 : 16 + length])
+            prefix.initial_state = inputs.initial_state[1:2]
+            prefix.cu_seqlens = torch.tensor(
+                [0, length], dtype=torch.int32, device=DEVICE
+            )
+            _, expected_checkpoint = _kda_prefill_reference(prefix)
+            assert_close(
+                "packed checkpoint", expected_checkpoint[0], checkpoints[row], 0.03
+            )
