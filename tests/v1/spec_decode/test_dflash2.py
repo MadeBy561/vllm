@@ -1,14 +1,91 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm.model_executor.models.qwen3_dflash2 import _grouped_conv, _score_edges
+from vllm.v1.worker.gpu.spec_decode.dflash import utils as dflash_utils
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
+
+
+def test_dflash_loader_honors_draft_load_config(monkeypatch):
+    draft_load_config = object()
+    draft_model_config = SimpleNamespace(hf_config=SimpleNamespace())
+    speculative_config = SimpleNamespace(
+        attention_backend=None,
+        draft_load_config=draft_load_config,
+        draft_model_config=draft_model_config,
+        kv_cache_dtype=None,
+    )
+    vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(),
+        cache_config=SimpleNamespace(),
+        speculative_config=speculative_config,
+    )
+    loaded = SimpleNamespace(model=SimpleNamespace())
+    captured = {}
+
+    def fake_replace(config, **changes):
+        values = vars(config).copy()
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    def fake_get_model(**kwargs):
+        captured.update(kwargs)
+        return loaded
+
+    monkeypatch.setattr(dflash_utils, "replace", fake_replace)
+    monkeypatch.setattr(dflash_utils, "get_model", fake_get_model)
+    monkeypatch.setattr(
+        dflash_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=2),
+    )
+    monkeypatch.setattr(
+        "vllm.compilation.backends.set_model_tag",
+        lambda _tag: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_dflash.dflash_target_rope_is_neox_style",
+        lambda _model: None,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_dflash.dflash_has_any_non_causal",
+        lambda _config: True,
+    )
+
+    assert dflash_utils.load_dflash_model(SimpleNamespace(), vllm_config) is loaded
+    assert captured["load_config"] is draft_load_config
+
+
+def test_dflash_reset_attn_releases_cache_layout_state():
+    speculator = object.__new__(DFlashSpeculator)
+    cache_derived_fields = (
+        "model_state",
+        "kv_cache_config",
+        "attn_groups",
+        "attn_cg_support",
+        "block_tables",
+        "target_attn_groups",
+        "draft_kv_cache_group_ids",
+        "draft_kv_cache_group_id",
+        "_context_slot_mappings",
+        "_layer_group_idx",
+        "_group_causal",
+    )
+    for name in cache_derived_fields:
+        setattr(speculator, name, object())
+    speculator.query_cudagraph_manager = object()
+
+    speculator.reset_attn()
+
+    assert all(not hasattr(speculator, name) for name in cache_derived_fields)
+    assert speculator.query_cudagraph_manager is None
 
 
 @pytest.mark.parametrize("block_size", [5, 8])
@@ -33,6 +110,80 @@ def test_grouped_conv_matches_reference(block_size: int):
             ) * hidden_blocks[:, position - tap]
 
     torch.testing.assert_close(actual, expected.flatten(0, 1).flatten(-2))
+
+
+def test_dflash2_auxiliary_linears_use_draft_quantization(
+    monkeypatch, default_vllm_config
+):
+    """Every checkpoint-serialized DFlash2 linear receives its quant config."""
+    from torch import nn
+
+    import vllm.model_executor.models.qwen3_dflash2 as dflash2
+
+    class StubLinear(nn.Module):
+        def __init__(self, *args, quant_config=None, **kwargs):
+            super().__init__()
+            self.quant_config = quant_config
+
+    monkeypatch.setattr(dflash2, "ReplicatedLinear", StubLinear)
+    quant_config = object()
+    from vllm.config import set_current_vllm_config
+
+    with set_current_vllm_config(default_vllm_config):
+        grouped_conv = dflash2.DFlashGroupedConv(
+            hidden_size=16,
+            taps=2,
+            group_size=4,
+            block_size=8,
+            params_dtype=torch.float32,
+            quant_config=quant_config,
+            prefix="attention_conv",
+        )
+        selector = dflash2.CandidateSelector(
+            hidden_size=16,
+            vocab_size=32,
+            rank=4,
+            top_k=3,
+            params_dtype=torch.float32,
+            quant_config=quant_config,
+            prefix="candidate_selector",
+        )
+
+    assert grouped_conv.kernel_projection.quant_config is quant_config
+    assert selector.hidden_projection.quant_config is quant_config
+
+
+@pytest.mark.parametrize("mxfp8_layer", [0, 1])
+def test_dflash_context_projection_rejects_mixed_quantization(mxfp8_layer: int):
+    from torch import nn
+
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMxFp8LinearMethod,
+    )
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+
+    class UnreadableWeight:
+        def __getitem__(self, _key):
+            raise AssertionError("weights must not be read before validation")
+
+    mxfp8_method = object.__new__(ModelOptMxFp8LinearMethod)
+    methods = [None, None]
+    methods[mxfp8_layer] = mxfp8_method
+    layers_attn = [
+        SimpleNamespace(
+            qkv_proj=SimpleNamespace(
+                quant_method=method,
+                q_size=1,
+                weight=UnreadableWeight(),
+            )
+        )
+        for method in methods
+    ]
+    model = object.__new__(DFlashQwen3Model)
+    nn.Module.__init__(model)
+
+    with pytest.raises(ValueError, match="Every DFlash attention layer"):
+        model._build_context_kv_buffers(layers_attn, has_bias=False)
 
 
 def test_selector_edges_match_sequential_reference():

@@ -11,6 +11,36 @@ from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.v1.worker.gpu.spec_decode.utils import get_pp_safe_draft_load_config
 
 
+def _make_eagle_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+
+    if speculative_config.moe_backend is not None:
+        vllm_config = replace(
+            vllm_config,
+            kernel_config=replace(
+                vllm_config.kernel_config,
+                moe_backend=speculative_config.moe_backend,
+            ),
+        )
+    vllm_config = replace(
+        vllm_config,
+        attention_config=replace(
+            vllm_config.attention_config,
+            backend=speculative_config.attention_backend,
+        ),
+    )
+    if speculative_config.kv_cache_dtype is not None:
+        vllm_config = replace(
+            vllm_config,
+            cache_config=replace(
+                vllm_config.cache_config,
+                cache_dtype=speculative_config.kv_cache_dtype,
+            ),
+        )
+    return vllm_config
+
+
 def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
     """Share when the draft has no own copy, or its copy matches the target."""
 
@@ -73,6 +103,7 @@ def maybe_share_target_embed(
 def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
 
+    vllm_config = _make_eagle_draft_vllm_config(vllm_config)
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
@@ -141,6 +172,11 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 if sh is not None and hasattr(sh, "head"):
                     del sh.head
                     sh.head = target_lm_head
+
+    prepare_draft_lm_head = getattr(eagle_model, "prepare_draft_lm_head", None)
+    effective_draft_lm_head = getattr(eagle_model, "lm_head", None)
+    if prepare_draft_lm_head is not None and effective_draft_lm_head is not None:
+        prepare_draft_lm_head(effective_draft_lm_head)
 
     # MTP shares topk_indices_buffer with the target model. We update
     # every module in the draft that holds a buffer reference so that

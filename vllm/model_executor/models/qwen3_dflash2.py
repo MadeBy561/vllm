@@ -4,6 +4,7 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.library import wrap_triton
 
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
@@ -11,6 +12,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.triton_utils import tl, triton
 
 from .qwen3_dflash import (
     DFlashQwen3DecoderLayer,
@@ -18,6 +20,119 @@ from .qwen3_dflash import (
     DFlashQwen3Model,
 )
 from .utils import maybe_prefix
+
+
+@triton.jit
+def _round_to_bf16_rn(value):
+    """Materialize a BF16 RN boundary and prevent multiply-add contraction."""
+    return tl.inline_asm_elementwise(
+        "cvt.rn.bf16.f32 $0, $1;",
+        constraints="=h,f",
+        args=[value],
+        dtype=tl.bfloat16,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _dflash2_grouped_conv_taps2_kernel(
+    hidden_ptr,
+    delta_ptr,
+    base_ptr,
+    output_ptr,
+    numel,
+    delta_stride_row,
+    delta_stride_tap,
+    delta_stride_group,
+    HIDDEN_SIZE: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offsets < numel
+    rows = offsets // HIDDEN_SIZE
+    features = offsets - rows * HIDDEN_SIZE
+    groups = features // GROUP_SIZE
+
+    hidden0 = tl.load(hidden_ptr + offsets, mask=valid, other=0.0)
+    delta0 = tl.load(
+        delta_ptr + rows * delta_stride_row + groups * delta_stride_group,
+        mask=valid,
+        other=0.0,
+    )
+    base0 = tl.load(base_ptr + features, mask=valid, other=0.0)
+    coefficient0 = _round_to_bf16_rn(base0.to(tl.float32) + delta0.to(tl.float32))
+    output0 = _round_to_bf16_rn(coefficient0.to(tl.float32) * hidden0.to(tl.float32))
+
+    has_predecessor = valid & ((rows % BLOCK_SIZE) != 0)
+    hidden1 = tl.load(
+        hidden_ptr + offsets - HIDDEN_SIZE,
+        mask=has_predecessor,
+        other=0.0,
+    )
+    delta1 = tl.load(
+        delta_ptr
+        + rows * delta_stride_row
+        + delta_stride_tap
+        + groups * delta_stride_group,
+        mask=valid,
+        other=0.0,
+    )
+    base1 = tl.load(
+        base_ptr + HIDDEN_SIZE + features,
+        mask=valid,
+        other=0.0,
+    )
+    coefficient1 = _round_to_bf16_rn(base1.to(tl.float32) + delta1.to(tl.float32))
+    output1 = _round_to_bf16_rn(coefficient1.to(tl.float32) * hidden1.to(tl.float32))
+    output = _round_to_bf16_rn(output0.to(tl.float32) + output1.to(tl.float32))
+    tl.store(output_ptr + offsets, output, mask=valid)
+
+
+@torch.library.custom_op("vllm::dflash2_grouped_conv_taps2", mutates_args=())
+def _dflash2_grouped_conv_taps2(
+    hidden_states: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: int,
+    num_groups: int,
+    group_size: int,
+) -> torch.Tensor:
+    output = torch.empty_like(hidden_states)
+    hidden_size = num_groups * group_size
+    block = 256
+    wrap_triton(_dflash2_grouped_conv_taps2_kernel)[
+        (triton.cdiv(hidden_states.numel(), block),)
+    ](
+        hidden_states,
+        delta,
+        base,
+        output,
+        hidden_states.numel(),
+        delta.stride(0),
+        delta.stride(1),
+        delta.stride(2),
+        HIDDEN_SIZE=hidden_size,
+        GROUP_SIZE=group_size,
+        BLOCK_SIZE=block_size,
+        BLOCK=block,
+    )
+    return output
+
+
+@_dflash2_grouped_conv_taps2.register_fake
+def _dflash2_grouped_conv_taps2_fake(
+    hidden_states: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: int,
+    num_groups: int,
+    group_size: int,
+) -> torch.Tensor:
+    del delta, base, block_size, num_groups, group_size
+    return torch.empty_like(hidden_states)
 
 
 def _grouped_conv(
@@ -29,6 +144,31 @@ def _grouped_conv(
     group_size: int,
     taps: int,
 ) -> torch.Tensor:
+    if (
+        hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and delta.dtype == torch.bfloat16
+        and base.dtype == torch.bfloat16
+        and hidden_states.ndim == 2
+        and hidden_states.is_contiguous()
+        and base.is_contiguous()
+        and delta.ndim == 3
+        and delta.shape == (hidden_states.shape[0], taps, num_groups)
+        and delta.stride(2) == 1
+        and taps == 2
+        and group_size == 16
+        and block_size == 8
+        and hidden_states.shape[1] == num_groups * group_size
+    ):
+        return _dflash2_grouped_conv_taps2(
+            hidden_states,
+            delta,
+            base,
+            block_size,
+            num_groups,
+            group_size,
+        )
+
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
     output = coefficients[:, 0] * blocks
@@ -51,6 +191,7 @@ class DFlashGroupedConv(nn.Module):
         group_size: int,
         block_size: int,
         params_dtype: torch.dtype,
+        quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
         super().__init__()
@@ -71,7 +212,7 @@ class DFlashGroupedConv(nn.Module):
             2 * taps * self.num_groups,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "kernel_projection"),
             return_bias=False,
         )
@@ -130,6 +271,7 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             # Query tokens per request: the bonus token plus the mask tokens.
             block_size=1 + speculative_config.num_speculative_tokens,
             params_dtype=vllm_config.model_config.dtype,
+            quant_config=quant_config,
         )
         self.attention_conv = DFlashGroupedConv(
             **conv_args, prefix=maybe_prefix(prefix, "attention_conv")
@@ -193,6 +335,7 @@ class CandidateSelector(nn.Module):
         rank: int,
         top_k: int,
         params_dtype: torch.dtype,
+        quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
         super().__init__()
@@ -208,7 +351,7 @@ class CandidateSelector(nn.Module):
             rank,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "hidden_projection"),
             return_bias=False,
         )
@@ -259,6 +402,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 rank=int(draft_config["selector_rank"]),
                 top_k=int(draft_config["selector_top_k"]),
                 params_dtype=vllm_config.model_config.dtype,
+                quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "candidate_selector"),
             )
 

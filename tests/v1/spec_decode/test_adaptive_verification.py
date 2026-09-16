@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport
@@ -35,6 +37,7 @@ def make_manager(
     manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
+    manager.cost_scale = 1.0
     return manager
 
 
@@ -58,13 +61,85 @@ def test_resolve_adaptive_cudagraph_mode(mode, piecewise_capture_available, expe
     )
 
 
-def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(monkeypatch):
+@pytest.mark.parametrize("world_size,expected_budget", [(1, 0), (2, 1)])
+def test_confidence_snapshot_agrees_before_cpu_and_gpu_budgeting(
+    monkeypatch, world_size, expected_budget
+):
+    # One FP32 ULP across a utility threshold changes the graph's token count.
+    local = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(0.0))]])
+    leader = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(1.0))]])
+    manager = make_manager(local.numpy().copy(), np.array([1.0, 1.0, 1.5]))
+    manager.req_states.device = torch.device("cpu")
+    manager._confidence_probs = torch.empty_like(local)
+    manager._pending_resets = []
+
+    class CopyBuffer:
+        """Synchronous CPU double for a confidence snapshot transfer buffer."""
+
+        def __init__(self):
+            """Allocate independent source and destination snapshot storage."""
+            self.np = np.ones((1, 1), dtype=np.float32)
+            self.gpu = torch.empty_like(local)
+
+        def copy_to_cpu(self):
+            """Copy the synchronized snapshot into the CPU selection buffer."""
+            self.np[:] = self.gpu.numpy()
+
+    manager._stale_confidences = [CopyBuffer(), CopyBuffer()]
+    manager._copy_events = [
+        SimpleNamespace(synchronize=lambda: None, record=lambda: None) for _ in range(2)
+    ]
+    manager._copy_stream = SimpleNamespace(wait_stream=lambda _stream: None)
+    calls = []
+
+    def broadcast(tensor, src):
+        assert src == 0
+        calls.append(tensor)
+        tensor.copy_(leader)
+
+    monkeypatch.setattr(
+        adaptive_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=world_size, broadcast=broadcast),
+    )
+    monkeypatch.setattr(adaptive_module, "gpu_sync_allowed", nullcontext)
+    monkeypatch.setattr(adaptive_module.torch.cuda, "current_stream", lambda _: None)
+    monkeypatch.setattr(adaptive_module, "stream", lambda *_: nullcontext())
+    batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([0]))
+
+    # Two records expose the completed previous-step snapshot to CPU selection.
+    for _ in range(2):
+        manager.record_confidences(local, batch)
+    expected = leader if world_size > 1 else local
+    torch.testing.assert_close(manager._confidence_probs, expected, rtol=0, atol=0)
+    np.testing.assert_array_equal(
+        manager._stale_confidences[manager._stale_idx].np, expected.numpy()
+    )
+    assert manager.get_num_tokens({"low": 2}, {"low": [7]}) == 1 + expected_budget
+    assert len(calls) == (2 if world_size > 1 else 0)
+    assert local.item() < 0.5  # The caller's proposal confidence is not mutated.
+
+
+@pytest.mark.parametrize(
+    "target_support,varlen_decode,allowed",
+    [
+        (AttentionCGSupport.ALWAYS, False, True),
+        (AttentionCGSupport.UNIFORM_BATCH, True, True),
+        (AttentionCGSupport.UNIFORM_BATCH, False, False),
+        (AttentionCGSupport.NEVER, True, False),
+    ],
+)
+def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(
+    monkeypatch, target_support, varlen_decode, allowed
+):
     class Backend:
         @classmethod
         def supports_device_cpu_query_lens_mismatch(cls):
             return True
 
     class Builder:
+        supports_varlen_decode_cudagraph = varlen_decode
+
         def __init__(self, support):
             self.support = support
 
@@ -82,7 +157,7 @@ def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(monkeypatc
 
     groups = [
         [
-            group("target", AttentionCGSupport.ALWAYS),
+            group("target", target_support),
             group("draft", AttentionCGSupport.UNIFORM_BATCH),
         ]
     ]
@@ -96,7 +171,7 @@ def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(monkeypatc
         lambda *_args, **_kwargs: created,
     )
 
-    manager = maybe_create_adaptive_verification_manager(
+    kwargs = dict(
         enable_adaptive_verification=True,
         attn_groups=groups,
         attn_cg_support=runner_support,
@@ -108,8 +183,58 @@ def test_manager_scopes_varlen_check_without_weakening_runner_cg_mode(monkeypatc
         target_layer_names={"target"},
     )
 
-    assert manager is created
+    if allowed:
+        assert maybe_create_adaptive_verification_manager(**kwargs) is created
+    else:
+        with pytest.raises(ValueError, match="variable-length decode"):
+            maybe_create_adaptive_verification_manager(**kwargs)
     assert runner_support.min_cg_support == AttentionCGSupport.UNIFORM_BATCH
+
+
+def test_glm53_adaptive_manager_accepts_real_target_backends(monkeypatch):
+    from vllm.models.glm5next.nvidia.kda import Glm5NextKDAAttentionBackend
+    from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+        B12xGLM5NextMLASparseBackend,
+        B12xMLASparseBackend,
+    )
+
+    backends = [Glm5NextKDAAttentionBackend, B12xGLM5NextMLASparseBackend]
+    groups = []
+    for index, backend in enumerate(backends):
+        builder = object.__new__(backend.get_builder_cls())
+        groups.append(
+            SimpleNamespace(
+                layer_names=[f"target.{index}"],
+                backend=backend,
+                kv_cache_spec=None,
+                get_metadata_builder=lambda _index, builder=builder: builder,
+            )
+        )
+    created = object()
+    monkeypatch.setattr(
+        adaptive_module, "AdaptiveVerificationManager", lambda *_a, **_kw: created
+    )
+    assert (
+        maybe_create_adaptive_verification_manager(
+            enable_adaptive_verification=True,
+            attn_groups=[groups],
+            attn_cg_support=AttentionCGSupportInfo(
+                AttentionCGSupport.UNIFORM_BATCH, None
+            ),
+            req_states=object(),
+            query_start_loc=object(),
+            num_bonus_tokens=1,
+            max_total_logits=32,
+            vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(model_type="glm5_next_text")
+                )
+            ),
+            target_layer_names={"target.0", "target.1"},
+        )
+        is created
+    )
+    assert not B12xMLASparseBackend.supports_device_cpu_query_lens_mismatch()
 
 
 def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():
@@ -131,14 +256,30 @@ def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():
     assert num_non_draft_tokens == {"low": 1, "high": 1}
 
 
+def test_cost_scale_controls_incremental_verification_cost():
+    manager = make_manager(
+        np.array([[0.9, 0.9]], dtype=np.float32),
+        np.array([1.0, 1.0, 1.5, 2.0]),
+    )
+
+    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 3
+
+    manager.cost_scale = 3.0
+    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 1
+
+
 def test_profiled_batches_seed_cost_curves_via_consumer():
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
     manager.req_states = SimpleNamespace(max_num_batched_tokens=4096, max_num_reqs=64)
     manager.num_speculative_steps = 7
     manager.num_bonus_tokens = 1
-    curves: dict[str, list[tuple[int, float]]] = {}
-    manager.set_cost_curves = lambda draft, verify: curves.update(
-        draft=draft, verify=verify
+    curves: dict[str, object] = {}
+    manager.set_cost_curves = lambda draft, verify, *, verify_curves_by_num_reqs=None: (
+        curves.update(
+            draft=draft,
+            verify=verify,
+            verify_by_reqs=verify_curves_by_num_reqs,
+        )
     )
 
     timings = [
@@ -166,6 +307,60 @@ def test_profiled_batches_seed_cost_curves_via_consumer():
     # count they would land inside the captured range and, once made monotonic,
     # smear that eager cost across every larger request count.
     assert curves["draft"] == [(1, 1.0), (128, 1.0)]
+    assert curves["verify_by_reqs"] == {1: [(8, 8.0)], 128: [(1024, 1024.0)]}
+
+
+def test_budget_uses_request_specific_full_graph_costs():
+    manager = make_manager(
+        np.array([[0.9, 0.9]], dtype=np.float32),
+        np.array([1.0, 1.0, 100.0, 100.0]),
+    )
+    manager.verify_cost_tables_by_num_reqs = {1: np.ones(4)}
+
+    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 3
+    assert manager._batch_budget is not None
+    assert manager._batch_budget[2] == 2
+
+
+def test_sparse_full_graph_costs_follow_request_padding(monkeypatch):
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager.req_states = SimpleNamespace(max_num_reqs=32, max_num_batched_tokens=512)
+    manager._cudagraph_limit = 256
+    monkeypatch.setattr(
+        adaptive_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(broadcast_object=lambda value, src: value),
+    )
+    full_curves = {
+        1: [(1, 1.0), (2, 1.1), (4, 1.2), (8, 1.3)],
+        2: [(2, 2.0), (4, 2.1), (8, 2.2), (16, 2.3)],
+        4: [(4, 4.0)],
+        8: [(8, 8.0)],
+        16: [(16, 16.0)],
+        24: [(24, 24.0)],
+        32: [(32, 32.0), (64, 64.0), (128, 128.0), (256, 256.0)],
+    }
+    manager.set_cost_curves(
+        [(1, 1.0), (32, 1.0)],
+        [(8, 1.0), (256, 256.0), (384, 768.0), (512, 1024.0)],
+        verify_curves_by_num_reqs=full_curves,
+    )
+    tables = manager.verify_cost_tables_by_num_reqs
+    # A four-request graph cannot serve 32 verification rows. Its single
+    # profiled point must not make every larger padded graph cost 4 ms.
+    assert tables[4][4] == 4.0
+    assert tables[4][5] == 8.0
+    assert tables[4][32] == 32.0
+    assert tables[16][17] == 24.0
+    assert tables[24][192] == 256.0
+    # There is no exact twelve-request graph: use compatible padded shapes.
+    assert tables[12][12] == 16.0
+    assert tables[12][25] == 32.0
+    # Keep the exact C1/C2 specializations and the measured eager tail.
+    assert tables[1][8] == 1.3
+    assert tables[2][16] == 2.3
+    for table in tables.values():
+        np.testing.assert_array_equal(table[257:], manager.cost_tables[1][257:])
 
 
 def test_compact_batch_preserves_totals_and_bounds():
@@ -298,3 +493,113 @@ def test_zero_budget_keeps_one_grammar_row_per_scheduled_draft():
     # (request, position) keys, so the kernel can mask rows the compacted
     # device layout no longer has room for.
     assert mapping == [0, 1, 2, 3, 4, 5, 6]
+
+
+def _run_tp_confidence_consistency(rank, port):
+    import torch
+    import torch.distributed as dist
+
+    from tests.utils import init_test_distributed_environment
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        get_tp_group,
+    )
+
+    device = torch.device("cuda", rank)
+    torch.accelerator.set_device_index(rank)
+    with set_current_vllm_config(VllmConfig()), torch.no_grad():
+        try:
+            init_test_distributed_environment(2, 1, rank, str(port), local_rank=rank)
+            state = SimpleNamespace(
+                device=device,
+                max_num_reqs=2,
+                num_speculative_steps=5,
+                req_id_to_index={"r": 0, "s": 1},
+                num_computed_tokens_np=np.array([100, 100], dtype=np.int32),
+                prefill_len=SimpleNamespace(np=np.ones(2, dtype=np.int32)),
+            )
+            manager = AdaptiveVerificationManager(
+                state,
+                torch.zeros(3, dtype=torch.int32, device=device),
+                num_bonus_tokens=1,
+                max_total_logits=6,
+            )
+            manager.add_request(0)
+            manager.add_request(1)
+            manager.cost_tables = (
+                np.array([0.0, 0.2, 0.2]),
+                np.array([0.0, 0.9, 1.0, 1.48, 1.48, 3.0, 3.0]),
+            )
+            batch = SimpleNamespace(
+                num_reqs=1,
+                idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
+            )
+            confidence = torch.tensor(
+                [[0.8, 0.6, 0.502 if rank == 0 else 0.498, 0.2, 0.2]],
+                dtype=torch.float32,
+                device=device,
+            )
+            # Publish through the real GPU/D2H path twice to consume a landed
+            # stale slot. Small rank-local differences straddle a graph budget.
+            for _ in range(2):
+                manager.record_confidences(confidence, batch)
+            tokens = manager.get_num_tokens({"r": 6}, {"r": [1] * 5})
+            counts = [None, None]
+            dist.all_gather_object(counts, tokens, group=get_tp_group().cpu_group)
+            assert counts == [4, 4], counts
+            manager.reallocate_drafts(["r"], batch.idx_mapping)
+            torch.accelerator.synchronize(device)
+            assert manager.query_start_loc[:2].tolist() == [0, 4]
+
+            # A shared total is insufficient: each request's GPU allocation
+            # must agree too, even when local confidence rankings are reversed.
+            manager._max_total_logits = 3
+            manager.cost_tables = (
+                np.array([0.0, 0.2, 0.2]),
+                np.array([0.0, 0.9, 1.0, 1.1, 3.0, 3.0, 3.0]),
+            )
+            batch = SimpleNamespace(
+                num_reqs=2,
+                idx_mapping=torch.tensor([0, 1], dtype=torch.int32, device=device),
+            )
+            confidence = torch.tensor(
+                [[0.9, 0.1, 0.1, 0.1, 0.1], [0.4, 0.1, 0.1, 0.1, 0.1]]
+                if rank == 0
+                else [[0.1, 0.1, 0.1, 0.1, 0.1], [0.9, 0.1, 0.1, 0.1, 0.1]],
+                dtype=torch.float32,
+                device=device,
+            )
+            for _ in range(2):
+                manager.record_confidences(confidence, batch)
+            assert (
+                manager.get_num_tokens({"r": 6, "s": 6}, {"r": [1] * 5, "s": [1] * 5})
+                == 3
+            )
+            manager.reallocate_drafts(["r", "s"], batch.idx_mapping)
+            torch.accelerator.synchronize(device)
+            boundaries = [None, None]
+            dist.all_gather_object(
+                boundaries,
+                manager.query_start_loc.tolist(),
+                group=get_tp_group().cpu_group,
+            )
+            assert boundaries == [[0, 2, 3], [0, 2, 3]]
+        finally:
+            torch.accelerator.synchronize(device)
+            destroy_model_parallel()
+            destroy_distributed_environment()
+
+
+@pytest.mark.distributed(num_gpus=2)
+def test_tp_confidence_publication_keeps_graph_and_request_budgets_consistent():
+    import torch
+
+    from tests.utils import get_open_port
+
+    if not torch.accelerator.is_available() or torch.accelerator.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    torch.multiprocessing.spawn(
+        _run_tp_confidence_consistency, args=(get_open_port(),), nprocs=2, join=True
+    )

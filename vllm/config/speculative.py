@@ -48,6 +48,7 @@ MTPModelTypes = Literal[
     "exaone4_5_mtp",
     "qwen3_next_mtp",
     "qwen4_exp_mtp",
+    "qwen3_8_flash_next_mtp",
     "qwen3_5_mtp",
     "longcat_flash_mtp",
     "bailing_hybrid_v3_mtp",
@@ -483,6 +484,17 @@ class SpeculativeConfig:
     inclusive batch-size range.
     """
 
+    adaptive_speculative_tokens_window: int | None = Field(default=None, ge=1)
+    """Number of speculative verification steps to average before adapting
+    the speculative-token count from accepted draft lengths. ``None`` disables
+    acceptance-length adaptation. ``num_speculative_tokens`` remains the upper
+    bound."""
+
+    adaptive_speculative_tokens_initial: int | None = Field(default=None, ge=1)
+    """Initial speculative-token count for acceptance-length adaptation.
+    Defaults to ``num_speculative_tokens`` and requires
+    ``adaptive_speculative_tokens_window``."""
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
@@ -539,6 +551,12 @@ class SpeculativeConfig:
     enable_adaptive_verification: bool = False
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
+
+    adaptive_verification_cost_scale: float = Field(default=1.0, gt=0.0)
+    """Scale the incremental target-verification cost used by DSpark adaptive
+    verification. Values above 1.0 trim more aggressively; values below 1.0
+    retain more drafts. The unavoidable zero-draft verification cost is not
+    scaled."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
@@ -851,6 +869,26 @@ class SpeculativeConfig:
                 }
             )
 
+        if hf_config.model_type in {
+            "qwen3_8_flash_next",
+            "qwen3_8_flash_next_text",
+        }:
+            hf_config.model_type = "qwen3_8_flash_next_mtp"
+        if hf_config.model_type == "qwen3_8_flash_next_mtp":
+            text_config = get_hf_text_config(hf_config)
+            n_predict = getattr(
+                text_config,
+                "mtp_num_hidden_layers",
+                getattr(text_config, "num_nextn_predict_layers", None),
+            )
+            hf_config.update(
+                {
+                    "hc_mult": int(text_config.hc_count),
+                    "n_predict": n_predict,
+                    "architectures": ["Qwen3_8FlashNextMTP"],
+                }
+            )
+
         architectures = getattr(hf_config, "architectures", []) or []
         if initial_architecture == "BailingMoeV3VLForConditionalGeneration":
             quantization_config = getattr(hf_config, "quantization_config", None)
@@ -1050,6 +1088,13 @@ class SpeculativeConfig:
                 {"n_predict": n_predict, "architectures": ["Glm5NextMTPModel"]}
             )
 
+        if hf_config.model_type == "glm5_next":
+            hf_config.model_type = "glm5_next_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["Glm5NextMTPModel"]}
+            )
+
         return hf_config
 
     @staticmethod
@@ -1171,6 +1216,36 @@ class SpeculativeConfig:
 
         if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
+
+        if (
+            self.adaptive_speculative_tokens_initial is not None
+            and self.adaptive_speculative_tokens_window is None
+        ):
+            raise ValueError(
+                "adaptive_speculative_tokens_initial requires "
+                "adaptive_speculative_tokens_window."
+            )
+
+        if self.adaptive_speculative_tokens_window is not None:
+            unsupported_methods = {
+                "ngram",
+                "ngram_gpu",
+                "suffix",
+                "custom_class",
+            }
+            if self.method in unsupported_methods:
+                raise ValueError(
+                    "adaptive_speculative_tokens_window is only supported with "
+                    "model-backed speculative decoding methods."
+                )
+            if (
+                self.target_model_config is not None
+                and self.target_model_config.is_diffusion
+            ):
+                raise ValueError(
+                    "adaptive_speculative_tokens_window is not supported with "
+                    "diffusion models."
+                )
 
         if self.method in ("ngram", "ngram_gpu"):
             # Set default values if not provided
@@ -1415,6 +1490,8 @@ class SpeculativeConfig:
                     not in self.draft_model_config.architectures
                     and "Gemma4DSparkModel" not in self.draft_model_config.architectures
                     and "K3DSparkModel" not in self.draft_model_config.architectures
+                    and "Glm53DSparkForCausalLM"
+                    not in self.draft_model_config.architectures
                 ):
                     # DeepSeek-V4(.1) DSpark reuses the full target config
                     # and its weights ship in the target checkpoint.
@@ -1476,7 +1553,8 @@ class SpeculativeConfig:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
                     elif (
-                        self.num_speculative_tokens > n_predict
+                        self.method not in ("dflash", "dspark")
+                        and self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
                     ):
                         # Ensure divisibility for MTP module reuse.
@@ -1570,6 +1648,23 @@ class SpeculativeConfig:
                 "Adaptive verification estimates per-position acceptance from "
                 "the draft logits, which use_local_argmax_reduction never "
                 "materializes. Disable one of them."
+            )
+
+        if self.adaptive_verification_cost_scale != 1.0 and (
+            self.method != "dspark" or not self.enable_adaptive_verification
+        ):
+            raise ValueError(
+                "adaptive_verification_cost_scale requires DSpark adaptive verification"
+            )
+
+        if (
+            self.adaptive_speculative_tokens_initial is not None
+            and self.num_speculative_tokens is not None
+            and self.adaptive_speculative_tokens_initial > self.num_speculative_tokens
+        ):
+            raise ValueError(
+                "adaptive_speculative_tokens_initial must not exceed "
+                "num_speculative_tokens."
             )
 
         return self
@@ -1914,7 +2009,16 @@ class SpeculativeConfig:
 
     def use_eagle_block_drop(self) -> bool:
         """Whether volatile trailing cache blocks should be discarded."""
-        return self.use_eagle() and not self.disable_eagle_block_drop
+        return (
+            self.use_eagle_preserves_target_kv_cache()
+            and not self.disable_eagle_block_drop
+        )
+
+    def use_eagle_preserves_target_kv_cache(self) -> bool:
+        # Only eagle-family drafters share (and pollute via lookahead KV
+        # write) the target's full-attention KV cache groups; DFlash/DSpark
+        # draft from their own KV cache and never write target blocks.
+        return self.method in ("eagle", "eagle3", "mtp")
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
@@ -1922,8 +2026,17 @@ class SpeculativeConfig:
     def use_dspark(self) -> bool:
         return self.method == "dspark"
 
-    def uses_dynamic_speculative_decoding(self) -> bool:
+    def uses_batch_size_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
+
+    def uses_acceptance_length_adaptation(self) -> bool:
+        return self.adaptive_speculative_tokens_window is not None
+
+    def uses_dynamic_speculative_decoding(self) -> bool:
+        return (
+            self.uses_batch_size_dynamic_speculative_decoding()
+            or self.uses_acceptance_length_adaptation()
+        )
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

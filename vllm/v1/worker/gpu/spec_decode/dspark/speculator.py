@@ -27,11 +27,15 @@ from typing import Any
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+    sample_greedy_markov,
+    scratch_shape,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 logger = init_logger(__name__)
@@ -80,6 +84,36 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
         self.use_confidence_head: bool = False
+        draft_vocab = max(
+            self.draft_model_config.hf_config.vocab_size,
+            getattr(self.draft_model_config.hf_config, "draft_vocab_size", None) or 0,
+        )
+        shape = scratch_shape(self.max_num_reqs, draft_vocab)
+        self._greedy_partial_values = torch.empty(
+            shape, dtype=torch.float32, device=device
+        )
+        self._greedy_partial_indices = torch.empty(
+            shape, dtype=torch.int32, device=device
+        )
+
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        config = super().attn_vllm_config
+        if self.draft_model_config.hf_config.model_type != "glm53_dspark":
+            return config
+        # The draft's sliding-window MLA geometry differs from the GLM verifier.
+        config.model_config = self.draft_model_config
+        config.quant_config = None
+        config.attention_config = replace(
+            config.attention_config,
+            backend=self.speculative_config.attention_backend,
+        )
+        if self.speculative_config.kv_cache_dtype is not None:
+            config.cache_config = replace(
+                config.cache_config,
+                cache_dtype=self.speculative_config.kv_cache_dtype,
+            )
+        return config
 
     def load_draft_model(
         self,
@@ -185,11 +219,26 @@ class DSparkSpeculator(DFlashSpeculator):
             if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
             bias = self.model.markov_bias(markov_embed)
-            logits_i = base_logits[:, i] + bias
-            draft_sampled_i = self._sample_logits(
-                logits_i, idx_map[:, i], sample_pos[:, i], i
-            )
-            self.draft_tokens[:num_reqs, i] = draft_sampled_i
+            if (
+                self.draft_logits is None
+                and self.model.draft_id_to_target_id is None
+                and base_logits.dtype == bias.dtype
+                and self.acceptance_estimator is None
+            ):
+                draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                sample_greedy_markov(
+                    base_logits[:, i],
+                    bias,
+                    draft_sampled_i,
+                    self._greedy_partial_values,
+                    self._greedy_partial_indices,
+                )
+            else:
+                logits_i = base_logits[:, i] + bias
+                draft_sampled_i = self._sample_logits(
+                    logits_i, idx_map[:, i], sample_pos[:, i], i
+                )
+                self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
         if self.use_confidence_head:
