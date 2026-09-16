@@ -256,10 +256,14 @@ def get_deepseek_v41_structural_tag(
 
     del builtin_tools, reasoning, token_suffix
 
-    # Compatibility with xgrammar releases without the V4.1 builtin. This constrains
-    # tool names and DSML/value syntax only. Parameter names, presence, uniqueness
-    # and value schemas remain unconstrained, including for strict=true. The request
-    # layer still uses strict to decide whether auto tool choice activates a grammar.
+    if any(getattr(tool.function, "strict", None) is True for tool in tools):
+        raise ValueError(
+            "DeepSeek V4.1 strict tool schemas require a grammar backend with "
+            "spaced DSML parameter-schema support. The installed backend only "
+            "supports V4.1 tool names and syntax; set strict=false to use "
+            "non-strict tool calling."
+        )
+
     parameter = TagFormat(
         begin='<｜DSML｜ parameter name="',
         content=SequenceFormat(
@@ -296,7 +300,12 @@ def get_deepseek_v41_structural_tag(
         tags=[
             TagFormat(
                 begin=f'<｜DSML｜ invoke name="{tool.function.name}">\n',
-                content=StarFormat(content=parameter),
+                content=OrFormat(
+                    elements=[
+                        PlusFormat(content=parameter),
+                        ConstStringFormat(value="\n"),
+                    ]
+                ),
                 end=f"{_V41_INVOKE_END}\n",
             )
             for tool in tools
