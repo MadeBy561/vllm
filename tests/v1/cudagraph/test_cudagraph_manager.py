@@ -401,6 +401,37 @@ def test_planned_token_counts_include_speculative_decode_rows(monkeypatch):
     assert 12 not in target_only.planned_token_counts()
 
 
+def test_b12x_weights_prepare_adaptive_graph_counts_before_kv_initialization(
+    monkeypatch,
+):
+    from vllm.model_executor.warmup.b12x_prepare import b12x_workload
+
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=8,
+        capture_sizes=[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64],
+        num_speculative_tokens=7,
+        varlen_decode=True,
+    )
+    config = manager.vllm_config
+    config.speculative_config.num_speculative_tokens = 7
+    config.speculative_config.enable_adaptive_verification = True
+    worker = SimpleNamespace(
+        vllm_config=config,
+        scheduler_config=config.scheduler_config,
+        model_config=SimpleNamespace(dtype=torch.bfloat16, max_model_len=1048576),
+        model_runner=SimpleNamespace(decode_query_len=8, cudagraph_manager=None),
+    )
+    weights = b12x_workload(worker, stage="weights")
+    worker.model_runner.cudagraph_manager = manager
+    state = b12x_workload(worker, stage="state")
+    assert 14 not in config.compilation_config.cudagraph_capture_sizes
+    assert 14 in weights.fixed_token_counts
+    assert set(manager.planned_token_counts()) <= set(weights.fixed_token_counts)
+    assert weights.token_counts == state.token_counts
+    assert weights.fixed_token_counts == state.fixed_token_counts
+
+
 def test_varlen_decode_captures_dense_low_concurrency_product(monkeypatch):
     decode_query_len = 8
     manager = _make_spec_decode_manager(

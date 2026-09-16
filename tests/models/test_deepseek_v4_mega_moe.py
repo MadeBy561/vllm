@@ -555,7 +555,11 @@ def test_deepseek_v4_drafter_pwal_hooks_finalize_mega_moe():
 
     dspark = SimpleNamespace(
         _finalize_moe=lambda: calls.append("dspark"),
+        logits_processor=SimpleNamespace(
+            prepare_b12x_vocab_projection=lambda head: calls.append(head)
+        ),
         model=SimpleNamespace(
+            markov_head=SimpleNamespace(markov_w2="dspark_markov"),
             finalize_mhc_broadcast_weights=lambda: calls.append("dspark_mhc"),
             layers=[
                 SimpleNamespace(
@@ -568,7 +572,14 @@ def test_deepseek_v4_drafter_pwal_hooks_finalize_mega_moe():
     )
     DSparkDeepseekV4ForCausalLM.process_weights_after_loading(dspark)
 
-    assert calls == ["mtp", "mtp_b12x", "dspark", "dspark_mhc", "dspark_b12x"]
+    assert calls == [
+        "mtp",
+        "mtp_b12x",
+        "dspark_markov",
+        "dspark",
+        "dspark_mhc",
+        "dspark_b12x",
+    ]
 
 
 @pytest.mark.skipif(

@@ -121,3 +121,44 @@ def test_mtp_routing_ids_match_local_hidden_rows(monkeypatch, num_tokens, rank, 
         inputs_embeds=torch.zeros(num_tokens, 2),
     )
     assert result.shape == (num_tokens, 2)
+
+
+def test_aligner_declares_named_tensor_parallel_collectives(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.models.deepseek_v4.common import vision
+    from vllm.utils.b12x import B12xWorkload
+
+    describers = []
+    monkeypatch.setattr(vision, "is_vit_use_data_parallel", lambda _heads: False)
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(
+        parallel_state,
+        "register_b12x_collective_describer",
+        lambda owner, describe: describers.append((owner, describe)),
+    )
+    config = SimpleNamespace(
+        vision_n_heads=2, vision_downsample_ratio=3, vision_dim=16, hidden_size=32
+    )
+    aligner = vision.DeepseekV4Aligner(config, prefix="model.aligner")
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(1, 8),
+        fixed_token_counts=(1,),
+        output_dtype=torch.bfloat16,
+        max_tokens=8,
+        max_seqs=1,
+        max_model_len=8,
+    )
+    assert aligner.w1.prefix == "model.aligner.w1"
+    [(owner, describe)] = describers
+    assert owner is aligner.w2
+    invocations = describe(workload)
+    assert [(call.name, call.shape, call.dtype) for call in invocations] == [
+        ("model.aligner.w2.row_all_reduce.m1", (1, 32), torch.bfloat16),
+        ("model.aligner.w2.row_all_reduce.m8", (8, 32), torch.bfloat16),
+    ]

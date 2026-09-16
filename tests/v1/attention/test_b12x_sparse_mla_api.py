@@ -15,7 +15,6 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.model_executor.layers.attention.mla_attention import (
-    MLAAttention,
     _canonicalize_sparse_mla_kv_cache_dtype,
     _maybe_view_mla_cache_as_fp8,
     _uses_packed_sparse_mla_workspace,
@@ -377,7 +376,6 @@ def test_b12x_glm_dsa_binds_nvfp4_fp8_rope_record() -> None:
 
     with pytest.raises(ValueError, match="page_size, 368"):
         impl.bind_kv_cache(torch.empty((2, 64, 432), dtype=torch.uint8))
-
 
 
 def test_b12x_nvfp4_run_options_match_each_glm_record_abi() -> None:
@@ -1000,8 +998,6 @@ def test_glm_dcp_compaction_preserves_tail_order_on_graph_replay(
             assert torch.equal(valid_counts.cpu(), expected_counts)
 
 
-
-
 def test_b12x_glm_dsa_nvfp4_cache_writer_keeps_rope() -> None:
     calls: list[tuple[torch.Tensor, ...]] = []
     impl = object.__new__(B12xMLASparseImpl)
@@ -1030,8 +1026,6 @@ def test_b12x_glm_dsa_nvfp4_cache_writer_keeps_rope() -> None:
     assert actual_cache is kv_cache
     assert torch.equal(actual_slots, slots)
     assert actual_scale is scale
-
-
 
 
 def test_b12x_glm5_next_full_ckv_bind_requires_geometry_finalization() -> None:
@@ -1114,6 +1108,7 @@ def test_b12x_sparse_mla_routes_only_planned_decode_rows(
 
     assert impl._use_decode_execution(metadata, num_tokens) is expected_decode
 
+
 def test_b12x_sparse_mla_declares_plans_once_and_prepares_in_place(
     monkeypatch,
 ) -> None:
@@ -1142,8 +1137,13 @@ def test_b12x_sparse_mla_declares_plans_once_and_prepares_in_place(
 
     monkeypatch.setattr(impl, "_declare_plan", declare)
     workload = B12xWorkload(
-        stage="state", token_counts=(2, 4, 8), fixed_token_counts=(),
-        output_dtype=torch.bfloat16, max_tokens=8, max_seqs=1, max_model_len=8,
+        stage="state",
+        token_counts=(2, 4, 8),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=8,
+        max_seqs=1,
+        max_model_len=8,
     )
 
     (unit,) = impl.get_b12x_preparation_units(impl, workload)
@@ -1194,12 +1194,12 @@ def test_b12x_sparse_mla_plan_lookup_declares_unplanned_decode_rows_once(
         declared.append((mode, rows))
         return f"caps:{mode}:{rows}", _FakePlan()
 
+    def make_prepare_call(state, caps):
+        prepare_calls.append((state, caps))
+        return "layer-call"
+
     monkeypatch.setattr(impl, "_declare_plan", declare)
-    monkeypatch.setattr(
-        impl,
-        "_make_prepare_call",
-        lambda state, caps: prepare_calls.append((state, caps)) or "layer-call",
-    )
+    monkeypatch.setattr(impl, "_make_prepare_call", make_prepare_call)
     monkeypatch.setattr(
         preparation, "prepare_default", lambda request: prepared.append(request)
     )
@@ -1229,8 +1229,6 @@ def test_b12x_sparse_mla_plan_key_is_exact_for_decode_rows() -> None:
 
     assert impl._plan_key(decode, 11) == ("decode", 11)
     assert impl._plan_key(prefill, 37) == ("extend", 128)
-
-
 
 
 def _bare_glm_selector_metadata_builder() -> B12xMLASparseMetadataBuilder:
@@ -1628,12 +1626,8 @@ def test_b12x_non_compressed_indexer_exposes_scores_for_dcp(monkeypatch) -> None
     assert torch.count_nonzero(scores != 0.5) == 0
 
 
-
-
-
 def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
     calls: dict[str, Any] = {}
-
 
     def bind(bound_plan, **kwargs):
         calls["bind_plan"] = bound_plan
@@ -1691,3 +1685,699 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
     ]
 
 
+def _deepseek_v4_wo_layer(device, groups=2, heads_per_group=8, rank=128, hidden=256):
+    layer = b12x_mla.DeepseekV4B12xAttention.__new__(b12x_mla.DeepseekV4B12xAttention)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "test.deepseek_v4.wo"
+    layer.indexer = None
+    layer.n_local_groups = groups
+    layer.n_local_heads = groups * heads_per_group
+    layer.head_dim, layer.nope_head_dim, layer.rope_head_dim = 512, 448, 64
+    layer.hidden_size, layer.o_lora_rank = hidden, rank
+    layer._b12x_wo_plans = {}
+    layer._b12x_wo_projection_weights = None
+    layer.compress_ratio = 1
+    layer.swa_cache_layer = SimpleNamespace(kv_cache=torch.empty(0))
+    layer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.empty(32, 64, dtype=torch.bfloat16, device=device)
+    )
+    group_width = heads_per_group * layer.head_dim
+    layer.wo_a = SimpleNamespace(
+        weight=torch.empty(
+            groups * rank, group_width, dtype=torch.float8_e4m3fn, device=device
+        ),
+        weight_scale_inv=torch.ones(
+            groups * (rank // 128), group_width // 128, device=device
+        ),
+    )
+    layer.wo_b = SimpleNamespace(
+        weight=torch.empty(
+            hidden, groups * rank, dtype=torch.float8_e4m3fn, device=device
+        ),
+        weight_scale_inv=torch.ones(hidden // 128, groups * rank // 128, device=device),
+        reduce_results=False,
+        tp_size=1,
+    )
+    return layer
+
+
+@pytest.mark.parametrize("eager_only", [False, True])
+def test_deepseek_v4_wo_declares_exact_rows_before_profiling(monkeypatch, eager_only):
+    from dataclasses import replace
+
+    from b12x.gemm import wo_projection
+
+    from vllm.utils.b12x import B12xWorkload
+
+    layer = _deepseek_v4_wo_layer(torch.device("cpu"))
+    layer._b12x_wo_projection_weights = SimpleNamespace(
+        groups=2, group_width=4096, rank=128, hidden=256
+    )
+    monkeypatch.setattr(b12x_mla, "_require_b12x_wo_projection", lambda: wo_projection)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(1, 4, 8, 17),
+        fixed_token_counts=(1, 4, 8),
+        output_dtype=torch.bfloat16,
+        max_tokens=17,
+        max_seqs=4,
+        max_model_len=32,
+        eager_only=eager_only,
+    )
+    (unit,) = layer.get_b12x_preparation_units(layer, workload)
+    assert unit.stage == "weights" and unit.autotune is not eager_only
+    assert tuple(request.plan.query.max_tokens for request in unit.requests) == (
+        1,
+        4,
+        8,
+        17,
+    )
+    assert all(request.plan.prepared is None for request in unit.requests)
+    for request in unit.requests:
+        query = request.plan.query
+        assert query.operation == "inv_rope" and not query.dynamic_tokens
+        assert (query.heads_per_group, query.nope_dim, query.rope_dim) == (8, 448, 64)
+        assert query.positions_dtype == "int64" and query.cos_sin_dtype == "bfloat16"
+    (repeated,) = layer.get_b12x_preparation_units(layer, workload)
+    assert all(a.plan is b.plan for a, b in zip(unit.requests, repeated.requests))
+    assert (
+        layer.get_b12x_preparation_units(layer, replace(workload, stage="state")) == ()
+    )
+
+
+def test_deepseek_v4_wo_fake_execution_does_not_materialize_native_plans():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm.utils.torch_utils import _encode_layer_name
+
+    layer = _deepseek_v4_wo_layer(torch.device("cpu"))
+    layer._b12x_wo_projection_weights = object()
+    layer._b12x_wo_layer_name = _encode_layer_name(layer.prefix)
+    with FakeTensorMode(allow_non_fake_inputs=True):
+        source = torch.empty(17, 32, 512, dtype=torch.bfloat16)[:, :16]
+        positions = torch.empty(17, dtype=torch.int64)
+        output = layer._o_proj(source, positions)
+    assert output.shape == (17, 256) and output.dtype == torch.bfloat16
+    assert layer._b12x_wo_plans == {}
+
+
+@pytest.mark.parametrize("groups,heads_per_group", [(1, 1), (2, 8)])
+@torch.no_grad()
+def test_deepseek_v4_wo_preparation_runs_and_replays_native_projection(
+    groups,
+    heads_per_group,
+):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x WO projection requires SM12x")
+    from b12x.gemm import wo_projection
+    from b12x.preparation import PreparationSession
+
+    from vllm.model_executor.warmup.b12x_prepare import _units_from_modules
+    from vllm.utils.b12x import B12xWorkload, get_b12x_scratch_buffers
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+        reset_workspace_manager,
+    )
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    torch.manual_seed(419)
+    layer = _deepseek_v4_wo_layer(device, groups, heads_per_group)
+    for projection in (layer.wo_a, layer.wo_b):
+        weight = torch.randn(projection.weight.shape, device=device)
+        projection.weight.copy_(
+            (weight / weight.shape[1] ** 0.5).to(projection.weight.dtype)
+        )
+    table = layer.rotary_emb.cos_sin_cache
+    angles = torch.randn(32, 32, device=device)
+    table.copy_(torch.cat((angles.cos(), angles.sin()), dim=-1))
+    layer.setup_b12x_wo_projection()
+    counts = (1, 4, 8, 17)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=counts,
+        fixed_token_counts=counts[:-1],
+        output_dtype=torch.bfloat16,
+        max_tokens=counts[-1],
+        max_seqs=4,
+        max_model_len=32,
+    )
+    allocated = torch.accelerator.memory_allocated(device)
+    units = tuple(_units_from_modules(layer, workload))
+    assert torch.accelerator.memory_allocated(device) == allocated
+    assert len(units) == 1 and len(units[0].requests) == len(counts)
+    source = torch.randn(
+        17, max(32, layer.n_local_heads), 512, device=device, dtype=torch.bfloat16
+    )
+    source = source[:, : layer.n_local_heads]
+    positions = torch.arange(17, dtype=torch.int64, device=device)
+    init_workspace_manager(device)
+    try:
+        with PreparationSession(
+            device=device, autotune=False, compile_workers=2
+        ) as session:
+            session.prepare(units[0].requests)
+            for plan in layer._b12x_wo_plans.values():
+                get_b12x_scratch_buffers(plan)
+            session.freeze()
+            current_workspace_manager().lock()
+            for rows in counts:
+                plan = layer._b12x_wo_plans[rows]
+                assert plan.prepared is not None
+                scratch = tuple(
+                    torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                    for spec in plan.scratch_specs()
+                )
+                binding = wo_projection.bind_inv_rope(
+                    plan,
+                    scratch=scratch,
+                    o=source[:rows],
+                    positions=positions[:rows],
+                    cos_sin_cache=table,
+                    weights=layer._b12x_wo_projection_weights,
+                    heads_per_group=heads_per_group,
+                    nope_dim=448,
+                    rope_dim=64,
+                )
+                expected = wo_projection.run_inv_rope(
+                    binding=binding, plan=plan
+                ).clone()
+                actual = layer._o_proj(source[:rows], positions[:rows])
+                assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                for buffer in get_b12x_scratch_buffers(plan):
+                    buffer.fill_(213)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                graph = torch.cuda.CUDAGraph()
+                try:
+                    with session.capture(), torch.cuda.graph(graph):
+                        replayed = layer._o_proj(source[:rows], positions[:rows])
+                    pointer = replayed.data_ptr()
+                    source[:rows].neg_()
+                    positions[:rows].add_(1).remainder_(table.shape[0])
+                    replayed.fill_(float("nan"))
+                    allocated = torch.accelerator.memory_allocated(device)
+                    graph.replay()
+                    torch.accelerator.synchronize(device)
+                    assert torch.accelerator.memory_allocated(device) == allocated
+                    assert replayed.data_ptr() == pointer
+                    expected = wo_projection.run_inv_rope(binding=binding, plan=plan)
+                    torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
+                    assert (
+                        torch.isfinite(replayed).all()
+                        and torch.count_nonzero(replayed) > 0
+                    )
+                finally:
+                    graph.reset()
+            with pytest.raises(RuntimeError, match="frozen"):
+                layer._o_proj(source[:3], positions[:3])
+    finally:
+        reset_workspace_manager()
+
+
+@pytest.mark.parametrize("first_layer", [False, True])
+def test_deepseek_v4_mhc_prepares_layers_without_broadcast(monkeypatch, first_layer):
+    from b12x.norm import mhc
+
+    from vllm.utils.b12x import B12xWorkload
+
+    monkeypatch.setattr(b12x_mla, "_require_b12x_mhc", lambda: mhc)
+    hidden = 4096
+    layer = torch.nn.Module()
+    for name in ("hc_attn_fn", "hc_ffn_fn"):
+        setattr(layer, name, torch.empty(24, 4 * hidden, dtype=torch.float32))
+    layer.hc_ffn_fn_bf16 = torch.empty(24, 4 * hidden, dtype=torch.bfloat16)
+    layer.hc_attn_fn_broadcast = (
+        torch.empty(24, hidden, dtype=torch.float32) if first_layer else None
+    )
+    for name in ("hc_attn_scale", "hc_ffn_scale"):
+        setattr(layer, name, torch.empty(3, dtype=torch.float32))
+    for name in ("hc_attn_base", "hc_ffn_base"):
+        setattr(layer, name, torch.empty(24, dtype=torch.float32))
+    for name in ("attn_norm", "ffn_norm"):
+        setattr(
+            layer,
+            name,
+            SimpleNamespace(
+                weight=torch.empty(hidden, dtype=torch.bfloat16), variance_epsilon=1e-6
+            ),
+        )
+    owner = b12x_mla.B12xMHCResidual(
+        hidden_size=hidden, hc_mult=4, rms_eps=1e-6, hc_eps=1e-6, sinkhorn_iters=20
+    )
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(1, 8, 4096),
+        fixed_token_counts=(1, 8),
+        output_dtype=torch.bfloat16,
+        max_tokens=4096,
+        max_seqs=8,
+        max_model_len=8192,
+    )
+    (unit,) = owner.get_b12x_preparation_units(layer, workload)
+    plans = [request.plan for request in unit.requests]
+    for rows in workload.token_counts:
+        for operation in ("post_pre", "post_pre_bf16", "post"):
+            plan = owner._plan_for(operation, rows)
+            assert any(plan is candidate for candidate in plans)
+            assert plan.prepared is None
+            assert plan.query.max_tokens == rows
+            assert plan.query.operation == (
+                "post_pre" if operation == "post_pre_bf16" else operation
+            )
+            assert plan.query.has_fn_bf16 == (operation == "post_pre_bf16")
+        if first_layer:
+            assert owner._plan_for("pre", rows).query.operation == "pre"
+    assert any(plan.query.operation == "pre" for plan in plans) == first_layer
+
+
+def _deepseek_v4_mla_layer(device, compress_ratio):
+    from vllm.utils.b12x import B12xWorkload
+
+    layer = b12x_mla.DeepseekV4B12xAttention.__new__(b12x_mla.DeepseekV4B12xAttention)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "test.deepseek_v4.mla"
+    layer.indexer = None
+    layer._b12x_cache_page_views = {}
+    layer._b12x_mla_plans = {}
+    layer.compress_ratio = compress_ratio
+    layer.padded_heads = 16
+    layer.window_size = 128
+    layer.max_image_tokens = 64
+    layer.max_model_len = 32768
+    layer.scale = 512**-0.5
+    layer.attn_sink = torch.zeros(16, dtype=torch.float32, device=device)
+    layer.swa_cache_layer = SimpleNamespace(
+        block_size=64,
+        kv_cache=torch.empty((2, 64 * 584 + 128), dtype=torch.uint8, device=device),
+    )
+    layer.kv_cache = torch.empty(
+        (2, (256 // compress_ratio) * 584 + 128), dtype=torch.uint8, device=device
+    )
+    layer.topk_indices_buffer = torch.empty(17, 32, dtype=torch.int32, device=device)
+    layer.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=256),
+        speculative_config=SimpleNamespace(
+            use_dspark=lambda: True, num_speculative_tokens=3
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=17, max_num_seqs=2),
+    )
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(1, 4, 8, 17),
+        fixed_token_counts=(1, 4, 8),
+        output_dtype=torch.bfloat16,
+        max_tokens=17,
+        max_seqs=2,
+        max_model_len=32768,
+    )
+    return layer, workload
+
+
+@pytest.mark.parametrize("compress_ratio", [1, 4, 128])
+def test_deepseek_v4_mla_declares_pool_layout_and_metadata_variants(
+    monkeypatch, compress_ratio
+):
+    from b12x.attention import compressed_sparse_mla as mla
+
+    monkeypatch.setattr(b12x_mla, "_require_b12x_compressed_sparse_mla", lambda: mla)
+    layer, workload = _deepseek_v4_mla_layer("cpu", compress_ratio)
+    (unit,) = layer.get_b12x_preparation_units(layer, workload)
+    assert unit.stage == "state"
+    queries = [request.plan.query for request in unit.requests]
+    assert {q.query_rows for q in queries if q.mode == "decode"} == set(range(1, 9))
+    assert {q.query_rows for q in queries if q.mode == "extend"} == {17}
+    expected_index_widths = (
+        {0} if compress_ratio == 1 else {32} if compress_ratio == 4 else {128, 256}
+    )
+    assert {q.indexed_width for q in queries} == expected_index_widths
+    for query in queries:
+        assert query.swa_cache_stride == layer.swa_cache_layer.kv_cache.stride()
+        assert query.swa_cache_shape == (2, 64 * 584)
+        assert query.swa_page_size == 64
+        assert query.attn_sink_present and query.output_mode == "provided"
+        assert query.q_shape == (query.query_rows, 16, 512)
+        assert query.indexed_cache_present == (compress_ratio > 1)
+        if compress_ratio > 1:
+            assert query.indexed_cache_stride == layer.kv_cache.stride()
+            assert query.indexed_page_size == 256 // compress_ratio
+    assert all(request.plan.prepared is None for request in unit.requests)
+    (again,) = layer.get_b12x_preparation_units(layer, workload)
+    assert all(a.plan is b.plan for a, b in zip(unit.requests, again.requests))
+    layer.swa_cache_layer.kv_cache = layer.swa_cache_layer.kv_cache.clone()
+    (replaced,) = layer.get_b12x_preparation_units(layer, workload)
+    assert all(a.plan is not b.plan for a, b in zip(unit.requests, replaced.requests))
+
+
+@pytest.mark.parametrize(
+    "compress_ratio,high_pages", [(1, False), (4, False), (128, True)]
+)
+@pytest.mark.parametrize("autotune", [False, True])
+@torch.no_grad()
+def test_deepseek_v4_mla_preparation_restores_cache_and_replays(
+    compress_ratio, high_pages, autotune, tmp_path
+):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x compressed MLA requires SM12x")
+    from b12x.attention._shared.mla.compressed_reference import (
+        compressed_sparse_mla_page_nbytes,
+        compressed_sparse_mla_reference,
+    )
+    from b12x.preparation import PreparationSession
+
+    from vllm.models.deepseek_v4.common.ops import quantize_and_insert_k_cache
+    from vllm.utils.b12x import get_b12x_scratch_buffers
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+        reset_workspace_manager,
+    )
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    torch.manual_seed(614)
+    layer, workload = _deepseek_v4_mla_layer(device, compress_ratio)
+    cache_data = []
+    for page_size in (64,) if compress_ratio == 1 else (64, 256 // compress_ratio):
+        stride = compressed_sparse_mla_page_nbytes(page_size) + 128
+        base = 2**31 // stride + 1 if high_pages else 0
+        pool = torch.empty((base + 2, stride), dtype=torch.uint8, device=device)
+        touched = min(pool.shape[0], (256 + page_size - 1) // page_size)
+        pool[:touched].fill_(37)
+        snapshot = pool[:touched].clone()
+        count = min(32, 2 * page_size)
+        source = torch.randn(count, 512, dtype=torch.bfloat16, device=device) * 0.25
+        slots = torch.arange(count, dtype=torch.int64, device=device) + base * page_size
+        cache_data.append((pool, snapshot, page_size, base, source, slots))
+    layer.swa_cache_layer.kv_cache = cache_data[0][0]
+    if compress_ratio > 1:
+        layer.kv_cache = cache_data[1][0]
+    allocated = torch.accelerator.memory_allocated(device)
+    (unit,) = layer.get_b12x_preparation_units(layer, workload)
+    assert torch.accelerator.memory_allocated(device) == allocated
+    init_workspace_manager(device)
+    try:
+        with PreparationSession(
+            device=device, autotune=autotune, compile_workers=2, cache_dir=tmp_path
+        ) as session:
+            session.prepare(unit.requests)
+            for pool, saved, _, _, _, _ in cache_data:
+                torch.testing.assert_close(
+                    pool[: saved.shape[0]], saved, rtol=0, atol=0
+                )
+            references = []
+            for pool, _, page_size, base, source, slots in cache_data:
+                quantize_and_insert_k_cache(source, pool, slots, page_size)
+                reference = torch.zeros(
+                    (2, compressed_sparse_mla_page_nbytes(page_size)),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                reference[:, : page_size * 584].copy_(
+                    pool[base : base + 2, : page_size * 584]
+                )
+                references.append(reference)
+            for plan in layer._b12x_mla_plans.values():
+                get_b12x_scratch_buffers(plan)
+            session.freeze()
+            current_workspace_manager().lock()
+            indexed_widths = (
+                (0,)
+                if compress_ratio == 1
+                else (32,)
+                if compress_ratio == 4
+                else (128, 256)
+            )
+            cases = [
+                ("decode", 3, 128, indexed_widths[0]),
+                (
+                    "decode",
+                    8,
+                    b12x_mla.get_dspark_swa_index_width(layer.window_size, 3),
+                    indexed_widths[-1],
+                ),
+                ("extend", 7, 192, indexed_widths[0]),
+                ("extend", 17, 192, indexed_widths[-1]),
+            ]
+            for mode, rows, swa_width, indexed_width in cases:
+                query = (
+                    torch.randn(rows, 16, 512, dtype=torch.bfloat16, device=device)
+                    * 0.25
+                )
+                output = torch.empty_like(query)
+                indices, lengths = [], []
+                for width, (_, _, _, _, _, slots) in zip(
+                    (swa_width, indexed_width), cache_data
+                ):
+                    ids = torch.full(
+                        (rows, width), -1, dtype=torch.int32, device=device
+                    )
+                    ids[:, : slots.numel()] = slots.to(torch.int32)
+                    indices.append(ids)
+                    lengths.append(
+                        torch.full(
+                            (rows,), slots.numel(), dtype=torch.int32, device=device
+                        )
+                    )
+                indexed_indices = indices[1] if compress_ratio > 1 else None
+                plan = layer._b12x_mla_plan(mode, rows, indices[0], indexed_indices)
+
+                def run(
+                    query=query,
+                    output=output,
+                    indices=indices,
+                    lengths=lengths,
+                    indexed_indices=indexed_indices,
+                    plan=plan,
+                ):
+                    b12x_mla._run_compressed_sparse_mla(
+                        q=query,
+                        output=output,
+                        attn_sink=layer.attn_sink,
+                        scale=layer.scale,
+                        swa_k_cache=layer._get_cache_page_view(
+                            cache_data[0][0], 64, "swa_k_cache"
+                        ),
+                        swa_indices=indices[0],
+                        swa_lens=lengths[0],
+                        swa_page_size=64,
+                        indexed_k_cache=(
+                            layer._get_cache_page_view(
+                                cache_data[1][0],
+                                256 // compress_ratio,
+                                "indexed_k_cache",
+                            )
+                            if compress_ratio > 1
+                            else None
+                        ),
+                        indexed_indices=indexed_indices,
+                        indexed_lens=lengths[1] if compress_ratio > 1 else None,
+                        indexed_page_size=256 // compress_ratio
+                        if compress_ratio > 1
+                        else None,
+                        plan=plan,
+                    )
+
+                def reference(query=query, indices=indices, lengths=lengths):
+                    relative = [
+                        torch.where(ids >= 0, ids - base * page_size, ids)
+                        for ids, (_, _, page_size, base, _, _) in zip(
+                            indices, cache_data
+                        )
+                    ]
+                    return compressed_sparse_mla_reference(
+                        query,
+                        references[0],
+                        relative[0],
+                        lengths[0],
+                        sm_scale=layer.scale,
+                        attn_sink=layer.attn_sink,
+                        swa_page_size=64,
+                        extra_k_cache=references[1] if compress_ratio > 1 else None,
+                        extra_indices=relative[1] if compress_ratio > 1 else None,
+                        extra_topk_lengths=lengths[1] if compress_ratio > 1 else None,
+                        extra_page_size=256 // compress_ratio
+                        if compress_ratio > 1
+                        else None,
+                    )
+
+                run()
+                expected = reference()
+                torch.testing.assert_close(
+                    output.float(), expected.float(), rtol=0.02, atol=0.01
+                )
+                assert torch.isfinite(output).all() and torch.count_nonzero(output) > 0
+                graph = torch.cuda.CUDAGraph()
+                try:
+                    with session.capture(), torch.cuda.graph(graph):
+                        run()
+                    query.neg_()
+                    for ids, lens in zip(indices, lengths):
+                        ids[:, 0].add_(1)
+                        lens[0] = 1
+                    expected = reference()
+                    output.fill_(float("nan"))
+                    pointer = output.data_ptr()
+                    allocated = torch.accelerator.memory_allocated(device)
+                    graph.replay()
+                    torch.accelerator.synchronize(device)
+                    assert output.data_ptr() == pointer
+                    assert torch.accelerator.memory_allocated(device) == allocated
+                    torch.testing.assert_close(
+                        output.float(), expected.float(), rtol=0.02, atol=0.01
+                    )
+                finally:
+                    graph.reset()
+    finally:
+        reset_workspace_manager()
+
+
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+@pytest.mark.parametrize("autotune", [False, True])
+@torch.no_grad()
+def test_deepseek_v4_indexer_prepares_replicated_heads_and_live_cache(
+    mode, autotune, tmp_path
+):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x DSA indexing requires SM12x")
+    from dataclasses import replace
+
+    from b12x.attention.dsa_indexer.reference import (
+        pack_index_k_cache_reference,
+        unpack_index_k_cache_reference,
+    )
+    from b12x.preparation import PreparationSession
+
+    from vllm.model_executor.warmup.b12x_prepare import _units_from_modules
+    from vllm.utils.b12x import set_b12x_preparation_provider
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+        reset_workspace_manager,
+    )
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    torch.manual_seed(413)
+    layer, workload = _deepseek_v4_mla_layer(device, 4)
+    workload = replace(
+        workload,
+        max_tokens=128,
+        max_seqs=8,
+        max_model_len=1048576,
+        speculative_tokens=7,
+        token_counts=(1, 8, 64, 128),
+        fixed_token_counts=(1, 8, 64),
+    )
+    layer.indexer = torch.nn.Module()
+    layer.indexer.n_head = 64
+    layer.indexer.k_cache = torch.nn.Module()
+    layer.indexer.k_cache.prefix = "test.deepseek_v4.indexer"
+    layer.indexer.k_cache.kv_cache = torch.empty(0)
+    indexer = b12x_indexer.B12xC4SparseIndexer(
+        layer.indexer.k_cache,
+        128,
+        "ue8m0",
+        512,
+        128,
+        262144,
+        262144,
+        torch.empty((64, 512), dtype=torch.int32, device=device),
+        skip_k_cache_insert=True,
+        compress_ratio=4,
+    )
+    layer.indexer.indexer_op = indexer
+    set_b12x_preparation_provider(layer, layer)
+    stride = 64 * 132 + 192
+    high_page = 2**31 // stride + 1
+    pool = torch.empty((high_page + 16, stride), dtype=torch.uint8, device=device)
+    cache = pool[:, : 64 * 132].view(-1, 64, 132)
+    pool[:16].fill_(37)
+    saved_pages = pool[:16].clone()
+    packed = pack_index_k_cache_reference(torch.randn(1024, 128, device=device))
+    decoded = unpack_index_k_cache_reference(packed, num_tokens=1024).float()
+    cache[high_page:].copy_(packed.reshape(16, 64, 132))
+    layer.indexer.k_cache.kv_cache = cache
+    allocated = torch.accelerator.memory_allocated(device)
+    units = tuple(_units_from_modules(layer, workload))
+    assert torch.accelerator.memory_allocated(device) == allocated
+    (unit,) = (unit for unit in units if unit.name == "B12xC4SparseIndexer")
+    for request in unit.requests:
+        query = request.plan.query
+        assert query.num_q_heads == 64
+        assert query.max_k_rows == 262144
+        assert query.operands["index_k_cache"]["strides"] == (stride, 1)
+        assert request.plan.prepared is None
+    rows = 64 if mode == "decode" else 17
+    q = torch.randn(rows, 64, 128, device=device).to(torch.float8_e4m3fn)
+    weights = torch.rand(rows, 64, device=device)
+    lengths = torch.full((rows,), 1024, dtype=torch.int32, device=device)
+    base_table = torch.arange(
+        high_page, high_page + 16, dtype=torch.int32, device=device
+    )[None].repeat(rows, 1)
+    pages = base_table[:1].expand(rows, 16) if mode == "prefill" else base_table
+    output = torch.empty((rows, 512), dtype=torch.int32, device=device)
+
+    def run(live_rows):
+        indexer.run_paged_topk(
+            q=q[:live_rows],
+            weights=weights[:live_rows],
+            kv_cache=cache,
+            seq_lens=lengths[:live_rows],
+            block_table=pages[:live_rows],
+            output=output[:live_rows],
+            shared_page_table=mode == "prefill",
+        )
+
+    def expected(live_rows):
+        slots = (pages[:live_rows] - high_page).to(torch.int64)[
+            :, :, None
+        ] * 64 + torch.arange(64, device=device)
+        keys = decoded[slots.reshape(live_rows, 1024)]
+        logits = torch.einsum("rhd,rkd->rhk", q[:live_rows].float(), keys)
+        scores = (logits.relu_() * weights[:live_rows, :, None]).sum(dim=1)
+        scores.masked_fill_(
+            torch.arange(1024, device=device)[None] >= lengths[:live_rows, None],
+            -float("inf"),
+        )
+        return scores.topk(512, dim=1).indices.to(torch.int32).sort(dim=1).values
+
+    init_workspace_manager(device)
+    try:
+        with PreparationSession(
+            device=device, autotune=autotune, cache_dir=tmp_path
+        ) as session:
+            session.prepare(unit.requests)
+            torch.testing.assert_close(pool[:16], saved_pages, rtol=0, atol=0)
+            for plan in indexer._plans.values():
+                current_workspace_manager().get_simultaneous(
+                    *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
+                )
+            current_workspace_manager().lock()
+            session.freeze()
+            for live_rows in (1, 3, rows):
+                run(live_rows)
+                torch.testing.assert_close(
+                    output[:live_rows].sort(dim=1).values,
+                    expected(live_rows),
+                    rtol=0,
+                    atol=0,
+                )
+            graph = torch.cuda.CUDAGraph()
+            try:
+                with session.capture(), torch.cuda.graph(graph):
+                    run(3)
+                q.copy_((-q.float()).to(q.dtype))
+                lengths[0] = 768
+                base_table[:, [0, 1]] = base_table[:, [1, 0]]
+                reference = expected(3)
+                output.fill_(-1)
+                allocated = torch.accelerator.memory_allocated(device)
+                graph.replay()
+                torch.accelerator.synchronize(device)
+                assert torch.accelerator.memory_allocated(device) == allocated
+                torch.testing.assert_close(
+                    output[:3].sort(dim=1).values, reference, rtol=0, atol=0
+                )
+            finally:
+                graph.reset()
+    finally:
+        reset_workspace_manager()

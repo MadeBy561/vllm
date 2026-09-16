@@ -12,12 +12,11 @@ hand the units' requests to one ``PreparationSession`` per worker.
 
 from __future__ import annotations
 
+import os
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import replace
-from typing import TYPE_CHECKING
-
-import os
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 
@@ -33,6 +32,9 @@ from vllm.utils.b12x import (
 )
 
 if TYPE_CHECKING:
+    from b12x.preparation import PreparationRequest
+
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
     from vllm.v1.worker.gpu_worker import Worker
 
 logger = init_logger(__name__)
@@ -47,13 +49,19 @@ if os.environ.get("B12X_HANG_DUMP"):
 
     _dump_target = os.environ["B12X_HANG_DUMP"]
     if os.path.isdir(_dump_target):
-        _dump_file = open(os.path.join(_dump_target, f"{os.getpid()}.txt"), "w")
-        faulthandler.register(signal.SIGUSR1, file=_dump_file, all_threads=True, chain=True)
+        _dump_file = os.open(
+            os.path.join(_dump_target, f"{os.getpid()}.txt"),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o666,
+        )
+        faulthandler.register(
+            signal.SIGUSR1, file=_dump_file, all_threads=True, chain=True
+        )
     else:
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=True)
 
 
-def b12x_native_supported(worker: "Worker") -> bool:
+def b12x_native_supported(worker: Worker) -> bool:
     return (
         has_b12x()
         and current_platform.is_cuda()
@@ -61,13 +69,13 @@ def b12x_native_supported(worker: "Worker") -> bool:
     )
 
 
-def _draft_lane(worker: "Worker") -> int:
+def _draft_lane(worker: Worker) -> int:
     runner = worker.model_runner
     return int(getattr(runner, "_draft_workspace_lane", 0) or 0)
 
 
 def _planned_decode_counts(
-    worker: "Worker", *, capture_sizes: tuple[int, ...], speculative_tokens: int
+    worker: Worker, *, capture_sizes: tuple[int, ...], speculative_tokens: int
 ) -> tuple[int, ...]:
     """Token counts of the decode graphs the runner will capture.
 
@@ -75,19 +83,37 @@ def _planned_decode_counts(
     stage serves every graph, and a count that first appears in the state
     stage would reach a weight-only family after its winners were chosen. The
     graph manager knows the exact set once the KV cache exists; before that
-    the uniform-decode rounding is derived from the same configuration.
+    uniform and variable-length decode counts follow the same configuration.
     """
     runner = worker.model_runner
     manager = getattr(runner, "cudagraph_manager", None)
     planned_counts = getattr(manager, "planned_token_counts", None)
     if callable(planned_counts):
         return tuple(int(count) for count in planned_counts() if int(count) > 0)
-    query_len = int(getattr(runner, "decode_query_len", 0) or 0) or 1 + int(speculative_tokens)
+    query_len = int(getattr(runner, "decode_query_len", 0) or 0) or 1 + int(
+        speculative_tokens
+    )
     if query_len <= 1 or not capture_sizes:
         return ()
     compilation = worker.vllm_config.compilation_config
-    limit = int(getattr(compilation, "max_cudagraph_capture_size", None) or max(capture_sizes))
+    limit = int(
+        getattr(compilation, "max_cudagraph_capture_size", None) or max(capture_sizes)
+    )
     max_reqs = int(worker.scheduler_config.max_num_seqs)
+    spec = worker.vllm_config.speculative_config
+    if spec is not None and getattr(spec, "enable_adaptive_verification", False):
+        from vllm.v1.worker.gpu.cudagraph_utils import dense_varlen_decode_shapes
+
+        return tuple(
+            sorted(
+                {
+                    tokens
+                    for _, tokens in dense_varlen_decode_shapes(
+                        max_reqs, query_len, limit
+                    )
+                }
+            )
+        )
     counts = set()
     for size in capture_sizes:
         rounded = -(-int(size) // query_len) * query_len
@@ -96,7 +122,7 @@ def _planned_decode_counts(
     return tuple(sorted(counts))
 
 
-def b12x_workload(worker: "Worker", *, stage: str, lane: int = 0) -> B12xWorkload:
+def b12x_workload(worker: Worker, *, stage: str, lane: int = 0) -> B12xWorkload:
     """Describe the serving shapes of one stage without constructing plans."""
     compilation = worker.vllm_config.compilation_config
     capture_sizes = tuple(compilation.cudagraph_capture_sizes or ())
@@ -107,10 +133,14 @@ def b12x_workload(worker: "Worker", *, stage: str, lane: int = 0) -> B12xWorkloa
         compile_range.end for compile_range in compilation.get_compile_ranges()
     )
     spec = worker.vllm_config.speculative_config
-    speculative_tokens = 0 if spec is None else int(getattr(spec, "num_speculative_tokens", 0))
+    speculative_tokens = (
+        0 if spec is None else int(getattr(spec, "num_speculative_tokens", 0))
+    )
     max_tokens = int(worker.scheduler_config.max_num_batched_tokens)
     planned = _planned_decode_counts(
-        worker, capture_sizes=capture_sizes, speculative_tokens=speculative_tokens,
+        worker,
+        capture_sizes=capture_sizes,
+        speculative_tokens=speculative_tokens,
     )
     token_counts = b12x_preparation_token_counts(
         max_tokens=max_tokens,
@@ -120,22 +150,36 @@ def b12x_workload(worker: "Worker", *, stage: str, lane: int = 0) -> B12xWorkloa
         speculative_tokens=speculative_tokens,
     )
     if spec is not None and getattr(spec, "enable_adaptive_verification", False):
-        from vllm.v1.worker.gpu.spec_decode.adaptive_verification import preparation_tail_sizes
+        from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+            preparation_tail_sizes,
+        )
 
-        token_counts = tuple(sorted({
-            *token_counts, *preparation_tail_sizes(capture_sizes, max_tokens),
-        }))
+        token_counts = tuple(
+            sorted(
+                {
+                    *token_counts,
+                    *preparation_tail_sizes(capture_sizes, max_tokens),
+                }
+            )
+        )
     if getattr(worker, "use_v2_model_runner", False):
         from vllm.v1.worker.gpu.warmup import warmup_prefill_shape
 
         prompt_len, max_reqs = warmup_prefill_shape(
             max_num_seqs=int(worker.scheduler_config.max_num_seqs),
             max_num_batched_tokens=max_tokens,
-            decode_query_len=int(worker.model_runner.decode_query_len),
+            decode_query_len=int(
+                cast("GPUModelRunner", worker.model_runner).decode_query_len
+            ),
         )
-        token_counts = tuple(sorted({
-            *token_counts, *(prompt_len * reqs for reqs in range(1, max_reqs + 1)),
-        }))
+        token_counts = tuple(
+            sorted(
+                {
+                    *token_counts,
+                    *(prompt_len * reqs for reqs in range(1, max_reqs + 1)),
+                }
+            )
+        )
     fixed = {int(count) for count in (*capture_sizes, *compile_sizes, *planned)}
     fixed_token_counts = tuple(
         count for count in token_counts if count in fixed and count < max_tokens
@@ -144,7 +188,7 @@ def b12x_workload(worker: "Worker", *, stage: str, lane: int = 0) -> B12xWorkloa
     if dtype not in (torch.bfloat16, torch.float16):
         dtype = torch.bfloat16
     return B12xWorkload(
-        stage=stage,
+        stage=cast(Literal["weights", "state"], stage),
         token_counts=token_counts,
         fixed_token_counts=fixed_token_counts,
         output_dtype=dtype,
@@ -157,7 +201,9 @@ def b12x_workload(worker: "Worker", *, stage: str, lane: int = 0) -> B12xWorkloa
 
 
 def _module_workload(module: torch.nn.Module, workload: B12xWorkload) -> B12xWorkload:
-    extra = tuple(int(count) for count in getattr(module, "b12x_eager_token_counts", ()))
+    extra = tuple(
+        int(count) for count in getattr(module, "b12x_eager_token_counts", ())
+    )
     if not extra:
         return workload
     if getattr(module, "b12x_eager_only", False):
@@ -177,7 +223,10 @@ def _module_workload(module: torch.nn.Module, workload: B12xWorkload) -> B12xWor
 
 
 def _units_from_modules(
-    model: torch.nn.Module, workload: B12xWorkload, *, seen: set[int] | None = None,
+    model: torch.nn.Module,
+    workload: B12xWorkload,
+    *,
+    seen: set[int] | None = None,
 ) -> Iterable[B12xPreparationUnit]:
     if seen is None:
         seen = set()
@@ -201,14 +250,15 @@ def _units_from_modules(
         for unit in hook(module, scoped):
             if not isinstance(unit, B12xPreparationUnit):
                 raise TypeError(
-                    f"{type(provider).__qualname__} returned a non-unit preparation value"
+                    f"{type(provider).__qualname__} returned a non-unit "
+                    "preparation value"
                 )
             if scoped.eager_only and unit.autotune:
                 unit = replace(unit, autotune=False)
             yield unit
 
 
-def mark_b12x_eager_shapes(worker: "Worker") -> None:
+def mark_b12x_eager_shapes(worker: Worker) -> None:
     """Stamp multimodal encoder and connector modules with their profile rows.
 
     Those rows come from the encoder budget, are executed eagerly, and are
@@ -223,7 +273,9 @@ def mark_b12x_eager_shapes(worker: "Worker") -> None:
     from vllm.multimodal.encoder_budget import MultiModalBudget
 
     encoder_budget = MultiModalBudget(
-        worker.vllm_config, mm_registry, enable_cache=False,
+        worker.vllm_config,
+        mm_registry,
+        enable_cache=False,
     ).get_encoder_budget()
     if encoder_budget <= 0:
         return
@@ -247,7 +299,7 @@ def mark_b12x_eager_shapes(worker: "Worker") -> None:
             module.b12x_eager_only = True
 
 
-def _draft_workload(worker: "Worker", workload: B12xWorkload, *, lane: int):
+def _draft_workload(worker: Worker, workload: B12xWorkload, *, lane: int):
     """Include the parallel draft's query and sequential sampling row counts."""
     speculator = getattr(worker.model_runner, "speculator", None)
     query_len = int(getattr(speculator, "num_query_per_req", 0) or 0)
@@ -265,12 +317,16 @@ def _draft_workload(worker: "Worker", workload: B12xWorkload, *, lane: int):
     fixed = set(workload.fixed_token_counts)
     fixed.update(count for count in draft_counts if count < workload.max_tokens)
     return replace(
-        workload, token_counts=tuple(sorted(counts)),
-        fixed_token_counts=tuple(sorted(fixed)), lane=lane,
+        workload,
+        token_counts=tuple(sorted(counts)),
+        fixed_token_counts=tuple(sorted(fixed)),
+        lane=lane,
     )
 
 
-def collect_b12x_units(worker: "Worker", workload: B12xWorkload) -> list[B12xPreparationUnit]:
+def collect_b12x_units(
+    worker: Worker, workload: B12xWorkload
+) -> list[B12xPreparationUnit]:
     """Collect every unit of one stage from the model, the draft, and comms."""
     mark_b12x_eager_shapes(worker)
     units: list[B12xPreparationUnit] = []
@@ -289,7 +345,8 @@ def collect_b12x_units(worker: "Worker", workload: B12xWorkload) -> list[B12xPre
             draft_units = [scope_b12x_unit_calls(unit, lane) for unit in draft_units]
         units.extend(draft_units)
         workload = replace(
-            workload, token_counts=draft_workload.token_counts,
+            workload,
+            token_counts=draft_workload.token_counts,
             fixed_token_counts=draft_workload.fixed_token_counts,
         )
     for provider in b12x_unit_providers():
@@ -312,7 +369,9 @@ def collect_b12x_units(worker: "Worker", workload: B12xWorkload) -> list[B12xPre
     return units
 
 
-def _dump_declarations(units: Iterable[B12xPreparationUnit], workload: B12xWorkload) -> None:
+def _dump_declarations(
+    units: Iterable[B12xPreparationUnit], workload: B12xWorkload
+) -> None:
     """Append every declaration of this stage to the corpus file, if requested.
 
     ``VLLM_B12X_DUMP_QUERIES`` names a JSON-lines file. Each line records one
@@ -352,17 +411,25 @@ def _dump_declarations(units: Iterable[B12xPreparationUnit], workload: B12xWorkl
                 for request in unit.requests:
                     for plan in scalar_plans(request.plan):
                         contract = plan.contract
-                        handle.write(json.dumps(plain({
-                            "stage": workload.stage,
-                            "unit": unit.name,
-                            "request": request.name,
-                            "autotune": unit.autotune,
-                            "component": contract.component_id,
-                            "query_schema": contract.query_schema_version,
-                            "query": contract.encode_query(plan.query),
-                            "invocation": plan.invocation,
-                            "shared": bool(plan.shared),
-                        }), sort_keys=True) + "\n")
+                        handle.write(
+                            json.dumps(
+                                plain(
+                                    {
+                                        "stage": workload.stage,
+                                        "unit": unit.name,
+                                        "request": request.name,
+                                        "autotune": unit.autotune,
+                                        "component": contract.component_id,
+                                        "query_schema": contract.query_schema_version,
+                                        "query": contract.encode_query(plan.query),
+                                        "invocation": plan.invocation,
+                                        "shared": bool(plan.shared),
+                                    }
+                                ),
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        )
     except Exception:  # A diagnostic dump never interrupts preparation.
         logger.exception("b12x declaration dump to %s failed", path)
 
@@ -373,7 +440,8 @@ def b12x_batches(units: Iterable[B12xPreparationUnit], *, autotune: bool = True)
     With autotune disabled each rank compiles and primes its own defaults
     or explicit pins in the calling process.
     """
-    tuned, defaults = [], []
+    tuned: list[PreparationRequest] = []
+    defaults: list[PreparationRequest] = []
     for unit in units:
         (tuned if unit.autotune and autotune else defaults).extend(unit.requests)
     batches = []
@@ -384,7 +452,7 @@ def b12x_batches(units: Iterable[B12xPreparationUnit], *, autotune: bool = True)
     return batches
 
 
-def get_b12x_session(worker: "Worker"):
+def get_b12x_session(worker: Worker):
     """Return the worker's preparation session, creating it on first use."""
     session = getattr(worker, "_b12x_session", None)
     if session is not None and session.state != "CLOSED":
@@ -403,7 +471,9 @@ def get_b12x_session(worker: "Worker"):
             getattr(config.parallel_config, "decode_context_parallel_size", 1) or 1
         ),
         "draft_model": None if spec is None else str(getattr(spec, "model", None)),
-        "speculative_method": None if spec is None else str(getattr(spec, "method", None)),
+        "speculative_method": None
+        if spec is None
+        else str(getattr(spec, "method", None)),
     }
     session = PreparationSession(
         device=worker.device,
@@ -425,7 +495,7 @@ def get_b12x_session(worker: "Worker"):
     return session
 
 
-def begin_b12x_preparation(worker: "Worker", *, stage: str):
+def begin_b12x_preparation(worker: Worker, *, stage: str):
     """Start the world-coordinated preparation of one stage."""
     from vllm.distributed.parallel_state import get_world_group
     from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
@@ -436,12 +506,17 @@ def begin_b12x_preparation(worker: "Worker", *, stage: str):
         workload = b12x_workload(worker, stage=stage)
         batches = b12x_batches(
             collect_b12x_units(worker, workload),
-            autotune=(bool(worker.vllm_config.kernel_config.enable_b12x_autotune)
-                      and os.environ.get("B12X_AUTOTUNE", "1") != "0"),
+            autotune=(
+                bool(worker.vllm_config.kernel_config.enable_b12x_autotune)
+                and os.environ.get("B12X_AUTOTUNE", "1") != "0"
+            ),
         )
     session = get_b12x_session(worker) if batches else None
     return B12xPreparationCoordinator(
-        session, batches, global_rank=int(worker.rank), world_group=get_world_group(),
+        session,
+        batches,
+        global_rank=int(worker.rank),
+        world_group=get_world_group(),
         workspace=current_workspace_manager() if batches else None,
     )
 
@@ -463,13 +538,13 @@ class B12xPreparedBatch:
             self.session.release(plan)
 
 
-def prepare_b12x_profile(worker: "Worker", *, stage: str) -> B12xPreparedBatch:
+def prepare_b12x_profile(worker: Worker, *, stage: str) -> B12xPreparedBatch:
     """Prime profiling-pool plans with defaults in complete-world control rounds."""
     from vllm.distributed.parallel_state import get_world_group
     from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
     from vllm.v1.worker.workspace import current_workspace_manager
 
-    requests = ()
+    requests: tuple[PreparationRequest, ...] = ()
     if b12x_native_supported(worker):
         workload = b12x_workload(worker, stage=stage)
         units = collect_b12x_units(worker, workload)
@@ -478,8 +553,10 @@ def prepare_b12x_profile(worker: "Worker", *, stage: str) -> B12xPreparedBatch:
     fresh = tuple(request.plan for request in requests if request.plan.prepared is None)
     batch = B12xPreparedBatch(session, fresh)
     coordinator = B12xPreparationCoordinator(
-        session, [(requests, False)] if requests else [],
-        global_rank=int(worker.rank), world_group=get_world_group(),
+        session,
+        [(requests, False)] if requests else [],
+        global_rank=int(worker.rank),
+        world_group=get_world_group(),
         workspace=current_workspace_manager() if requests else None,
     )
     outcome = coordinator.status()

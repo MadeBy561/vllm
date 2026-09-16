@@ -124,7 +124,9 @@ class DeepseekV4ForConditionalGeneration(
             self.image_pad: nn.Parameter | None = None
             if image_enabled:
                 self.vision = DeepseekV4ViT(config)
-                self.aligner = DeepseekV4Aligner(config)
+                self.aligner = DeepseekV4Aligner(
+                    config, prefix=maybe_prefix(prefix, "aligner")
+                )
                 for name in (
                     "image_start",
                     "image_end",

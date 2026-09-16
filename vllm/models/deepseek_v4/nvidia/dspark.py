@@ -542,6 +542,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         flush_weight_transfers()
+        self.logits_processor.prepare_b12x_vocab_projection(
+            self.model.markov_head.markov_w2
+        )
         self._finalize_moe()
         self.model.finalize_mhc_broadcast_weights()
         for layer in self.model.layers:

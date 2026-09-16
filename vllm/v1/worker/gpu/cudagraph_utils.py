@@ -49,6 +49,18 @@ logger = init_logger(__name__)
 _DENSE_VARLEN_DECODE_MAX_REQS = 2
 
 
+def dense_varlen_decode_shapes(
+    max_num_reqs: int, decode_query_len: int, max_capture_tokens: int
+) -> tuple[tuple[int, int], ...]:
+    """Return request and token counts of exact variable-length decode graphs."""
+    return tuple(
+        (num_reqs, num_reqs * query_len)
+        for num_reqs in range(1, min(_DENSE_VARLEN_DECODE_MAX_REQS, max_num_reqs) + 1)
+        for query_len in range(1, decode_query_len + 1)
+        if num_reqs * query_len <= max_capture_tokens
+    )
+
+
 _DEBUG_GRAPH_MEMORY_ACCOUNTING = (
     os.getenv("VLLM_DEBUG_GRAPH_MEMORY_ACCOUNTING", "0") == "1"
 )
@@ -422,15 +434,12 @@ class CudaGraphManager:
             # per-request speculative width. The ordinary token ladder below
             # remains as the padded fallback for larger request counts and
             # heterogeneous low-concurrency totals.
-            dense_max_reqs = min(_DENSE_VARLEN_DECODE_MAX_REQS, self.max_num_reqs)
-            for num_active_loras, dense_num_reqs, query_len in product(
+            for num_active_loras, (dense_num_reqs, num_tokens) in product(
                 self.lora_capture_cases,
-                range(1, dense_max_reqs + 1),
-                range(1, self.decode_query_len + 1),
+                dense_varlen_decode_shapes(
+                    self.max_num_reqs, self.decode_query_len, max_cg_capture_size
+                ),
             ):
-                num_tokens = dense_num_reqs * query_len
-                if num_tokens > max_cg_capture_size:
-                    continue
                 desc = BatchExecutionDescriptor(
                     cg_mode=decode_mode,
                     num_tokens=num_tokens,
