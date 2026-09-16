@@ -48,6 +48,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
@@ -68,6 +69,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 logger = init_logger(__name__)
 
@@ -136,13 +138,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     ``get_padded_num_q_heads`` / ``_o_proj`` / ``backend_cls``) is provided by a
     subclass — ``DeepseekV4FlashMLAAttention`` /
     ``DeepseekV4FlashInferSM120Attention`` /
-    ``DeepseekV4FlashInferMLAAttention`` (CUDA) or
+    ``DeepseekV4FlashInferMLAAttention`` / ``DeepseekV4B12xAttention`` (CUDA) or
     ``DeepseekV4ROCMAiterMLAAttention`` (ROCm) — selected by the platform-specific
     deepseek_v4 model module. The base is never instantiated directly.
     """
 
     # Provided by the platform subclass.
     backend_cls: ClassVar[type[AttentionBackend]]
+    indexer_backend_cls: ClassVar[type[AttentionBackend]] = cast(
+        type[AttentionBackend], DeepseekV4IndexerBackend
+    )
+    indexer_op_cls: ClassVar[type[nn.Module]] = SparseAttnIndexer
     # Backend for the SWA cache layer; None uses the default SWA backend.
     swa_backend_cls: ClassVar[type[AttentionBackend] | None] = None
     # KV-cache per-token block format (both layouts are paged). True (default)
@@ -154,6 +160,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # workspace allocated in _forward_prefill and is also read by the dummy-run
     # path to pre-reserve that workspace.
     PREFILL_CHUNK_SIZE: ClassVar[int] = 4
+    _q_padded_scratch_by_key: ClassVar[
+        dict[tuple[str, int, int, torch.dtype, int, int], torch.Tensor]
+    ] = {}
 
     @classmethod
     @abstractmethod
@@ -236,7 +245,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Sink padded to the same head count, initialized to -inf (no sink
         # effect). Weight loading fills the first n_local_heads slots.
         self.attn_sink = nn.Parameter(
-            torch.full((self.padded_heads,), -float("inf"), dtype=torch.float32),
+            allocate_weights(
+                torch.full, (self.padded_heads,), -float("inf"), dtype=torch.float32
+            ),
             requires_grad=False,
         )
 
@@ -309,6 +320,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 compress_ratio=self.compress_ratio,
                 prefix=f"{prefix}.indexer",
                 aux_stream=indexer_aux_stream,
+                backend_cls=self.indexer_backend_cls,
+                indexer_op_cls=self.indexer_op_cls,
             )
 
         self._prepare_and_attn_fn = self._prepare_and_attn
@@ -330,6 +343,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+        self._q_padded_scratch_num_ubatches = (
+            2 if vllm_config.parallel_config.enable_dbo else 1
+        )
+        self._q_padded_scratch_dtype = vllm_config.model_config.dtype
 
         # Resolve the kv-cache dtype from this backend's block format. The same
         # resolution drives the SWA cache tensor dtype below.
@@ -462,6 +479,78 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
                     _COMPUTE_GLOBAL_TOPK_INDICES_AND_LENS_KERNEL.register_warmup()
                     _BUILD_FLASHINFER_MIXED_SPARSE_INDICES_KERNEL.register_warmup()
+
+    @staticmethod
+    def _q_padded_scratch_device_index(device: torch.device) -> int:
+        if device.index is not None:
+            return int(device.index)
+        if device.type == "cuda":
+            return int(torch.cuda.current_device())
+        return -1
+
+    @classmethod
+    def _reserve_q_padded_scratch_buffer(
+        cls,
+        num_tokens: int,
+        padded_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        ubatch_id: int,
+    ) -> torch.Tensor:
+        key = (
+            device.type,
+            cls._q_padded_scratch_device_index(device),
+            ubatch_id,
+            dtype,
+            padded_heads,
+            head_dim,
+        )
+        scratch = cls._q_padded_scratch_by_key.get(key)
+        if scratch is not None and scratch.shape[0] >= num_tokens:
+            return scratch
+
+        old_scratch = cls._q_padded_scratch_by_key.pop(key, None)
+        if old_scratch is not None:
+            del old_scratch
+            torch.accelerator.empty_cache()
+
+        scratch = torch.empty(
+            (num_tokens, padded_heads, head_dim),
+            dtype=dtype,
+            device=device,
+        )
+        cls._q_padded_scratch_by_key[key] = scratch
+        return scratch
+
+    def _get_q_padded_scratch(self, q: torch.Tensor) -> torch.Tensor:
+        num_tokens = q.shape[0]
+        reserved_tokens = max(num_tokens, int(self.max_num_batched_tokens))
+        scratch = self._reserve_q_padded_scratch_buffer(
+            reserved_tokens,
+            int(self.padded_heads),
+            int(self.head_dim),
+            q.dtype,
+            q.device,
+            dbo_current_ubatch_id(),
+        )
+        return scratch[:num_tokens]
+
+    def reserve_profile_scratch(self) -> None:
+        if self.kv_cache_torch_dtype != torch.uint8:
+            return
+        device = self.q_norm.weight.device
+        if device.type not in ("cuda", "xpu"):
+            return
+        for ubatch_id in range(self._q_padded_scratch_num_ubatches):
+            self._reserve_q_padded_scratch_buffer(
+                max(1, int(self.max_num_batched_tokens)),
+                int(self.padded_heads),
+                int(self.head_dim),
+                self._q_padded_scratch_dtype,
+                device,
+                ubatch_id,
+            )
 
     def forward(
         self,
@@ -753,6 +842,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if not isinstance(attn_metadata, dict):
             # Profile run: kernel doesn't fire; produce a padded tensor so
             # downstream FlashMLA gets the right shape.
+            if self.kv_cache_torch_dtype == torch.uint8:
+                return self._get_q_padded_scratch(q)
             if self.n_local_heads < self.padded_heads:
                 return F.pad(
                     q,
@@ -778,21 +869,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if cache_dtype == torch.uint8:
             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
             #   Q side:  per-head RMSNorm (no weight) + GPT-J RoPE, zero-filling
-            #            the padding head slots; the kernel allocates and returns
-            #            the padded q tensor.
+            #            the padding head slots into a reusable q buffer.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-            return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q_out = self._get_q_padded_scratch(q)
+            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert.out(
                 q,
                 kv,
+                q_out,
                 swa_kv_cache_2d,
                 swa_metadata.slot_mapping,
                 positions,
                 cos_sin_cache,
-                self.padded_heads,
                 self.eps,
                 swa_metadata.block_size,
             )
+            return q_out
 
         # Plain-row path: the [num_blocks, block_size, 512] cache stores the KV
         # row in its element dtype (no Q padding). bf16 rewrites q in place;
@@ -871,6 +963,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         prefix: str,
         cache_config: CacheConfig,
         compress_ratio: int = 1,
+        backend_cls: type[AttentionBackend] = DeepseekV4IndexerBackend,
     ):
         super().__init__()
         self.kv_cache = torch.tensor([])
@@ -879,6 +972,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.cache_config = cache_config
         self.dtype = dtype
         self.compress_ratio = compress_ratio
+        self.backend_cls = backend_cls
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -905,7 +999,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return DeepseekV4IndexerBackend
+        return self.backend_cls
 
 
 class DeepseekV4Indexer(nn.Module):
@@ -921,6 +1015,8 @@ class DeepseekV4Indexer(nn.Module):
         compress_ratio: int = 1,
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
+        backend_cls: type[AttentionBackend] = DeepseekV4IndexerBackend,
+        indexer_op_cls: type[nn.Module] = SparseAttnIndexer,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -1001,6 +1097,7 @@ class DeepseekV4Indexer(nn.Module):
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
             compress_ratio=self.compress_ratio,
+            backend_cls=backend_cls,
         )
         self.compressor = DeepseekCompressor(
             vllm_config=vllm_config,
@@ -1013,7 +1110,7 @@ class DeepseekV4Indexer(nn.Module):
             use_fp4_cache=self.use_fp4_kv,
         )
 
-        self.indexer_op = SparseAttnIndexer(
+        self.indexer_op = indexer_op_cls(
             self.k_cache,
             self.quant_block_size,
             self.scale_fmt,

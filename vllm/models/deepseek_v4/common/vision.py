@@ -210,7 +210,7 @@ class DeepseekV4ViT(nn.Module):
 class DeepseekV4Aligner(nn.Module):
     """Spatial merge (downsample_ratio x downsample_ratio) + MLP projector."""
 
-    def __init__(self, config):
+    def __init__(self, config, prefix: str = ""):
         super().__init__()
         use_data_parallel = is_vit_use_data_parallel(config.vision_n_heads)
         self.downsample_ratio = config.vision_downsample_ratio
@@ -221,6 +221,7 @@ class DeepseekV4Aligner(nn.Module):
             config.hidden_size,
             bias=True,
             quant_config=None,
+            prefix=f"{prefix}.w1",
             disable_tp=use_data_parallel,
         )
         self.w2 = RowParallelLinear(
@@ -228,6 +229,7 @@ class DeepseekV4Aligner(nn.Module):
             config.hidden_size,
             bias=True,
             quant_config=None,
+            prefix=f"{prefix}.w2",
             disable_tp=use_data_parallel,
         )
 
