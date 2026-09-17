@@ -56,7 +56,9 @@ def source_version(
         "get_version": get_version,
         "DEFAULT_DESCRIBE": DEFAULT_DESCRIBE,
         "_no_device": lambda: True,
-        "envs": SimpleNamespace(VLLM_TARGET_DEVICE="cpu"),
+        "envs": SimpleNamespace(
+            VLLM_TARGET_DEVICE="cpu", VLLM_SKIP_VERSION_SUFFIX=False
+        ),
         "ROOT_DIR": tmp_path,
         "VLLM_RS_BUILD_VERSION": "VLLM_RS_BUILD_VERSION",
     }

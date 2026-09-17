@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Both serving source branches use the same wheel builder and artifact identity."""
+"""Serving families share a source-addressed wheel builder and container trigger."""
 
 from pathlib import Path
 
@@ -16,6 +16,8 @@ def test_source_channel_triggers_share_one_builder():
     assert workflow["on"]["push"]["branches"] == [
         "dev/jovian-judgement",
         "integration/beta",
+        "dev/karmic-kraken",
+        "integration/karmic-kraken-beta",
     ]
     assert "paths" not in workflow["on"]["push"]
     assert "workflow_dispatch" in workflow["on"]
@@ -28,5 +30,7 @@ def test_source_channel_triggers_share_one_builder():
     notification = jobs["notify-container"]
     assert notification["needs"] == "build-beta"
     assert "integration/beta" in notification["if"]
+    for branch in workflow["on"]["push"]["branches"]:
+        assert f"refs/heads/{branch}" in notification["if"]
     assert "LIL_CONTAINER_DISPATCH_ENABLED" in notification["if"]
     assert notification["permissions"] == {}
