@@ -13,6 +13,7 @@ ARG BUILD_JOBS=64
 ARG SOURCE_DATE_EPOCH
 ARG UV_SHA256
 ARG VLLM_BUILD_CUTLASS_SCALED_MM_C2X
+ARG DEPENDENCY_RECIPE
 ENV PATH=/build-venv/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
@@ -48,13 +49,14 @@ assert torch.version.cuda == "13.4"
 assert torch._C._GLIBCXX_USE_CXX11_ABI
 PY
 
-RUN --mount=type=cache,id=lil-vllm-native-cu134-torch214-sm120,target=/src/vllm/build,sharing=locked \
-    --mount=type=cache,id=lil-vllm-fetchcontent-cu134,target=/tmp/vllm-fetchcontent,sharing=locked \
-    --mount=type=cache,id=lil-vllm-generated-cu134-torch214-sm120,target=/tmp/vllm-generated,sharing=locked \
+RUN --mount=type=cache,id=lil-vllm-native-cu134-torch214-sm120-${DEPENDENCY_RECIPE},target=/src/vllm/build,sharing=locked \
+    --mount=type=cache,id=lil-vllm-fetchcontent-cu134-${DEPENDENCY_RECIPE},target=/tmp/vllm-fetchcontent,sharing=locked \
+    --mount=type=cache,id=lil-vllm-generated-cu134-torch214-sm120-${DEPENDENCY_RECIPE},target=/tmp/vllm-generated,sharing=locked \
     --mount=type=cache,id=lil-vllm-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=lil-vllm-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=lil-vllm-rust-target,target=/src/vllm/rust/target,sharing=locked \
     --mount=type=cache,id=lil-wheel-uv,target=/root/.cache/uv,sharing=locked \
+    test "${#DEPENDENCY_RECIPE}" -eq 40 && \
     SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
     BUILD_JOBS="${BUILD_JOBS}" \
     tools/jovian_wheel_release/build_vllm_wheel.sh

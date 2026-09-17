@@ -16,6 +16,9 @@ lock_value() {
 
 source_commit=$(git -C "${repo_root}" rev-parse HEAD)
 source_tree=$(git -C "${repo_root}" rev-parse 'HEAD^{tree}')
+# FetchContent applies tracked patches inside dependency checkouts. Different
+# recipes cannot safely share those mutable checkouts or their native objects.
+dependency_recipe=$(git -C "${repo_root}" rev-parse HEAD:cmake/external_projects)
 source_date_epoch=$(git -C "${repo_root}" show -s --format=%ct HEAD)
 repository=${GITHUB_REPOSITORY:-local-inference-lab/vllm}
 release_tag=${VLLM_RELEASE_TAG:-"vllm-jovian-cu134-beta-${source_commit}"}
@@ -38,6 +41,7 @@ docker buildx build \
   --build-arg "UV_SHA256=$(lock_value uv.sha256)" \
   --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
   --build-arg "BUILD_JOBS=${build_jobs}" \
+  --build-arg "DEPENDENCY_RECIPE=${dependency_recipe}" \
   --build-arg "VLLM_BUILD_CUTLASS_SCALED_MM_C2X=$(lock_value build.cutlass-scaled-mm-c2x)" \
   --target export \
   --output "type=local,dest=${output_dir}/raw" \
