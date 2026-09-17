@@ -528,6 +528,55 @@ def test_b12x_mxfp8_dequantizes_before_serving_plan_preparation(out_dtype) -> No
     assert layer.b12x_linear.plan is None
 
 
+@pytest.mark.parametrize("in_features", [160, 256])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_b12x_mxfp8_dequantizes_weights_before_plan_preparation(
+    in_features, out_dtype
+) -> None:
+    from vllm.model_executor.kernels.linear.b12x_blockscaled import (
+        B12xBlockscaledLinear,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        get_and_maybe_dequant_weights,
+    )
+
+    values = torch.tensor([-0.001953125, -0.5, 1.0, 448.0]).repeat(2, 64)
+    values = values.to(torch.float8_e4m3fn)
+    scales = torch.tensor(
+        [
+            [0, 124, 126, 127, 128, 129, 130, 131],
+            [131, 130, 129, 128, 127, 126, 124, 0],
+        ],
+        dtype=torch.uint8,
+    )
+    packed = types.SimpleNamespace(
+        weight=types.SimpleNamespace(values=values, scale_rows=scales.unsqueeze(0)),
+        in_features=in_features,
+        padded_in_features=256,
+        out_features=2,
+    )
+    holder = B12xBlockscaledLinear(
+        packed, recipe="mxfp8", activation_mode="auto", layer_name="kv_b_proj"
+    )
+    layer = types.SimpleNamespace(
+        weight=torch.empty(0, dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(0, dtype=torch.uint8),
+        input_size_per_partition=in_features,
+        b12x_mxfp8_packed_weight=packed,
+        quant_method=types.SimpleNamespace(
+            apply=lambda layer, x, bias: holder.run(x, bias)
+        ),
+    )
+
+    actual = get_and_maybe_dequant_weights(layer, out_dtype=out_dtype)
+    expected = torch.ldexp(
+        values.float(), (scales.int() - 127).repeat_interleave(32, dim=-1)
+    )[:, :in_features].to(out_dtype)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert holder.plan is None
+
+
 def test_b12x_mxfp8_reload_reuses_packed_tensor_addresses(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear.mxfp8.b12x as b12x_mod
 
