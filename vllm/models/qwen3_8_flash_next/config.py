@@ -23,15 +23,8 @@ class Qwen3_8FlashNextVisionConfig(Qwen4ExpVisionConfig):
 class Qwen3_8FlashNextTextConfig(Qwen4ExpTextConfig):
     model_type = "qwen3_8_flash_next_text"
 
-    def __init__(
-        self,
-        ple_embedding_dtype: str | None = None,
-        index_share_for_mtp_iteration: bool = True,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self.ple_embedding_dtype = ple_embedding_dtype or "bfloat16"
-        self.index_share_for_mtp_iteration = index_share_for_mtp_iteration
 
 
 class Qwen3_8FlashNextConfig(Qwen4ExpConfig):

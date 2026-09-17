@@ -259,7 +259,6 @@ class B12xMxFp4LinearKernel(MxFp4LinearKernel):
                 key=(prefix, tuple(sorted(plans))),
                 requests=tuple(requests),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 

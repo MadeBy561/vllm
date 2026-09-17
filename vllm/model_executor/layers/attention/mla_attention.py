@@ -1718,7 +1718,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 key=(self._b12x_query_prefix, tuple(sorted(plans))),
                 requests=tuple(requests),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 

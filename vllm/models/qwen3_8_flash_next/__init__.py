@@ -1,42 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qwen3.8-Flash-Next model package."""
+"""Compatibility names for checkpoints published before Qwen4Exp."""
 
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from .model import (
-        Qwen3_8FlashNextForCausalLM,
-        Qwen3_8FlashNextForConditionalGeneration,
-    )
-    from .mtp import Qwen3_8FlashNextMTP
+from typing import Any
 
 
 def __getattr__(name: str) -> Any:
-    if name == "Qwen3_8FlashNextMTP":
-        from .mtp import Qwen3_8FlashNextMTP
-
-        return Qwen3_8FlashNextMTP
     if name in {
         "Qwen3_8FlashNextForCausalLM",
         "Qwen3_8FlashNextForConditionalGeneration",
+        "Qwen3_8FlashNextMTP",
     }:
-        from .model import (
-            Qwen3_8FlashNextForCausalLM,
-            Qwen3_8FlashNextForConditionalGeneration,
-        )
+        from vllm.models import qwen4_exp
 
-        return {
-            "Qwen3_8FlashNextForCausalLM": Qwen3_8FlashNextForCausalLM,
-            "Qwen3_8FlashNextForConditionalGeneration": (
-                Qwen3_8FlashNextForConditionalGeneration
-            ),
-        }[name]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-__all__ = [
-    "Qwen3_8FlashNextForCausalLM",
-    "Qwen3_8FlashNextForConditionalGeneration",
-    "Qwen3_8FlashNextMTP",
-]
+        return getattr(qwen4_exp, name.replace("Qwen3_8FlashNext", "Qwen4Exp"))
+    raise AttributeError(name)

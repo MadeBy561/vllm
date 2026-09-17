@@ -157,11 +157,33 @@ class Executor(ABC):
 
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
         """Initialize the KV caches on the underlying workers."""
+        from vllm.platforms import current_platform
+        from vllm.utils.b12x import has_b12x
+
+        self._b12x_state_tuned_before_allocation = False
+        if (
+            has_b12x()
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
+            try:
+                initialized: list[bool] = self.collective_rpc(
+                    "initialize_b12x_tuning_cache", args=(kv_cache_configs,)
+                )
+                if any(initialized):
+                    self._run_b12x_preparation(stage="state")
+                    self._b12x_state_tuned_before_allocation = True
+            finally:
+                self.collective_rpc("release_b12x_tuning_cache")
         self.collective_rpc("initialize_from_config", args=(kv_cache_configs,))
 
     def compile_or_warm_up_model(self) -> None:
         """Compile/warm up the model and capture cudagraphs on workers."""
-        self._run_b12x_preparation(stage="state")
+        self._run_b12x_preparation(
+            stage="bind"
+            if getattr(self, "_b12x_state_tuned_before_allocation", False)
+            else "state"
+        )
         compilation_times: list[CompilationTimes] = self.collective_rpc(
             "compile_or_warm_up_model"
         )
@@ -246,11 +268,15 @@ class Executor(ABC):
 
                     output = PreparationOutput(local_output.put).start()
                     stream = output.stream or stream
-                phase_number = {"weights": 1, "state": 2}[stage]
+                phase_number = {"weights": 1, "state": 2, "bind": 2}[stage]
                 display = PreparationDisplay(
                     global_rank=0,
                     stream=stream,
-                    title=f"b12x / kernel autotuning (phase {phase_number}/2)",
+                    title=(
+                        "b12x / binding serving buffers"
+                        if stage == "bind"
+                        else f"b12x / kernel autotuning (phase {phase_number}/2)"
+                    ),
                     cancel_available=bool(
                         getattr(self, "_b12x_keyboard", None)
                         and self._b12x_keyboard.active

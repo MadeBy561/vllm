@@ -226,7 +226,6 @@ class _AttentionHelpers:
                 key=(attn.prefix, attn.capacity),
                 requests=tuple(requests),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
             attn._wo_preparation_unit(workload),
         )
@@ -908,7 +907,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 key=(self.prefix, token_counts),
                 requests=tuple(requests),
                 stage="state",
-                autotune=not workload.eager_only,
             ),
         )
 
@@ -1663,7 +1661,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             key=(self.prefix, token_counts),
             requests=tuple(requests),
             stage="weights",
-            autotune=not workload.eager_only,
         )
 
     def _wo_plan(self, rows: int, *, is_prefill: bool = False):

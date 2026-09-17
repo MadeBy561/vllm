@@ -139,7 +139,6 @@ class _Linear(nn.Module):
                 key=(id(self), capacities),
                 requests=tuple(requests),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 
@@ -569,7 +568,6 @@ class DeepseekV4ViT(nn.Module):
                 key=(id(self), self.config.vision_dim, self.config.vision_n_heads),
                 requests=requests,
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 
@@ -719,7 +717,6 @@ class DeepseekV4Aligner(nn.Module):
                 key=(id(self), self.hidden_size, self.out_dim, self.downsample_ratio),
                 requests=requests,
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 

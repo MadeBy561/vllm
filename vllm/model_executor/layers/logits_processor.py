@@ -134,6 +134,11 @@ class LogitsProcessor(PluggableLayer):
             return
         owner = getattr(lm_head, "_b12x_vocab_projection_owner", None)
         if owner is not None:
+            owner._b12x_vocab_heads.update(self._b12x_vocab_heads)
+            for head_id, plans in self._b12x_vocab_plans.items():
+                shared_plans = owner._b12x_vocab_plans.setdefault(head_id, {})
+                for rows, plan in plans.items():
+                    shared_plans.setdefault(rows, plan)
             self._b12x_vocab_plans = owner._b12x_vocab_plans
             self._b12x_vocab_heads = owner._b12x_vocab_heads
             return
@@ -237,7 +242,6 @@ class LogitsProcessor(PluggableLayer):
                         key=(id(self), head_id, tuple(sorted(plans))),
                         requests=tuple(requests),
                         stage="weights",
-                        autotune=not workload.eager_only,
                     )
                 )
         return tuple(units)

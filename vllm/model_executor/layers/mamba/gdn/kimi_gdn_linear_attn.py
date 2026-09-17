@@ -891,7 +891,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     key=(self._b12x_preparation_prefix, "kda-decode"),
                     requests=(request,),
                     stage="state",
-                    autotune=not workload.eager_only,
                 )
             )
         if self._b12x_prefill_plan is not None:
@@ -906,7 +905,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     key=(self._b12x_preparation_prefix, "kda-prefill"),
                     requests=(request,),
                     stage="state",
-                    autotune=not workload.eager_only,
                 )
             )
         return tuple(units)

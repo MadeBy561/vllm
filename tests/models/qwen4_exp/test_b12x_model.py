@@ -14,16 +14,17 @@ import vllm.distributed.parallel_state as parallel_state
 import vllm.distributed.utils as distributed_utils
 import vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn as gdn_module
 import vllm.model_executor.offloader as offloader
-import vllm.models.qwen3_8_flash_next.hyperconnection as hyperconnection_module
-import vllm.models.qwen3_8_flash_next.model as model_module
-import vllm.models.qwen3_8_flash_next.nvidia.qsa as qsa_module
-import vllm.models.qwen3_8_flash_next.ple_layer as ple_layer_module
+import vllm.models.qwen4_exp.nvidia.b12x_ple as ple_embedding_module
+import vllm.models.qwen4_exp.nvidia.b12x_qsa as qsa_module
+import vllm.models.qwen4_exp.nvidia.hyperconnection as hyperconnection_module
+import vllm.models.qwen4_exp.nvidia.model as model_module
+import vllm.models.qwen4_exp.nvidia.ple_layer as ple_layer_module
 from vllm.config.compilation import CompilationMode
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
     _resolve_gdn_decode_kernel,
 )
-from vllm.models.qwen3_8_flash_next.ple_layer import Qwen3_8FlashNextPLELayer
+from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLELayer
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -53,9 +54,7 @@ def test_ple_embedding_preparation_runs_materialized_state() -> None:
         _bind_embedding_state=lambda state, capacity: binding,
     )
     state = Mock()
-    factory = ple_layer_module.Qwen3_8FlashNextNGramEmbedding._embedding_prepare_call(
-        owner, 8
-    )
+    factory = ple_embedding_module.B12xNGramEmbedding._embedding_prepare_call(owner, 8)
 
     call = factory(state)
     call.run()
@@ -66,7 +65,7 @@ def test_ple_embedding_preparation_runs_materialized_state() -> None:
 def test_ple_profile_without_attention_metadata_preserves_live_dataflow(
     monkeypatch,
 ) -> None:
-    layer = Qwen3_8FlashNextPLELayer.__new__(Qwen3_8FlashNextPLELayer)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(layer)
     layer._out = torch.full((5, 2, 3), float("nan"))
     residual = torch.empty((3, 2, 3))
@@ -101,6 +100,7 @@ def test_hyperconnection_consumes_projection_views_without_staging(monkeypatch):
     )
     nn.Module.__init__(layer)
     layer.use_combine = True
+    object.__setattr__(layer, "_workspace", object())
     layer.lora_rank, layer.hc_count = 8, 4
     merged = torch.arange(64, dtype=torch.bfloat16).reshape(4, 16)
     layer.input_mix_weight_down_block_inject = lambda x: merged
@@ -240,14 +240,14 @@ def test_hyperconnection_declares_one_capacity_per_operation(monkeypatch):
 
 
 def test_mtp_compaction_selector_reuses_aot_callable_across_draft_phases():
-    from vllm.models.qwen3_8_flash_next.mtp import (
-        Qwen3_8FlashNextMultiTokenPredictor,
+    from vllm.models.qwen4_exp.nvidia.mtp import (
+        Qwen4ExpMultiTokenPredictor,
     )
 
     predictor = SimpleNamespace(
         _decode_output_indices=torch.zeros(1, dtype=torch.int64)
     )
-    select = Qwen3_8FlashNextMultiTokenPredictor.set_prefill_output_indices
+    select = Qwen4ExpMultiTokenPredictor.set_prefill_output_indices
     source = torch.arange(32).reshape(4, 8)
     tail = torch.tensor([3])
     select(predictor, tail)
@@ -265,8 +265,8 @@ def test_mtp_compaction_selector_reuses_aot_callable_across_draft_phases():
 
 
 def test_mtp_feedback_candidates_share_bounded_trial_storage(monkeypatch):
-    from vllm.models.qwen3_8_flash_next.mtp import (
-        Qwen3_8FlashNextMultiTokenPredictor,
+    from vllm.models.qwen4_exp.nvidia.mtp import (
+        Qwen4ExpMultiTokenPredictor,
     )
 
     class FakeWorkspaceManager:
@@ -298,9 +298,7 @@ def test_mtp_feedback_candidates_share_bounded_trial_storage(monkeypatch):
     monkeypatch.setattr(
         "vllm.v1.worker.workspace.current_workspace_manager", lambda: manager
     )
-    predictor = Qwen3_8FlashNextMultiTokenPredictor.__new__(
-        Qwen3_8FlashNextMultiTokenPredictor
-    )
+    predictor = Qwen4ExpMultiTokenPredictor.__new__(Qwen4ExpMultiTokenPredictor)
     nn.Module.__init__(predictor)
     predictor.hidden_size = 16
     predictor.hc_count = 2
@@ -336,9 +334,7 @@ def test_mtp_feedback_candidates_share_bounded_trial_storage(monkeypatch):
 @pytest.mark.parametrize("indices", [[0], [3], [0, 3]])
 def test_mtp_compaction_preserves_attention_rows_and_selected_outputs(indices):
     """Cache-producing attention sees every row; tokenwise MLP sees only tails."""
-    layer = model_module.Qwen3_8FlashNextDecoderLayer.__new__(
-        model_module.Qwen3_8FlashNextDecoderLayer
-    )
+    layer = model_module.Qwen4ExpDecoderLayer.__new__(model_module.Qwen4ExpDecoderLayer)
     nn.Module.__init__(layer)
     layer.ple = None
     layer.layer_type = "full_attention"
@@ -397,7 +393,7 @@ def test_attention_projection_overlap_replays_with_changed_inputs(
     op = (
         torch.ops.vllm.qwen_gdn_input_projections
         if kind == "gdn"
-        else torch.ops.vllm.qwen3_8_flash_next_qsa_input_projections
+        else torch.ops.vllm.qwen4_exp_b12x_qsa_input_projections
     )
     stream = torch.cuda.Stream()
     monkeypatch.setattr(module, "aux_stream", lambda: stream)
@@ -457,7 +453,7 @@ def test_b12x_projection_overlap_preserves_scratch(monkeypatch, num_tokens, kind
     op = (
         torch.ops.vllm.qwen_gdn_input_projections
         if kind == "gdn"
-        else torch.ops.vllm.qwen3_8_flash_next_qsa_input_projections
+        else torch.ops.vllm.qwen4_exp_b12x_qsa_input_projections
     )
     widths = (4096, 24) if kind == "gdn" else (3584, 640)
     x = torch.randn(num_tokens, 2560, device=device, dtype=torch.bfloat16)
@@ -529,8 +525,8 @@ def test_b12x_projection_overlap_preserves_scratch(monkeypatch, num_tokens, kind
 
                 from vllm.utils.b12x import get_b12x_scratch_buffers
 
-                owner = qsa_module.Qwen3_8FlashNextQSAAttention.__new__(
-                    qsa_module.Qwen3_8FlashNextQSAAttention
+                owner = qsa_module.Qwen4ExpQSAAttention.__new__(
+                    qsa_module.Qwen4ExpQSAAttention
                 )
                 nn.Module.__init__(owner)
                 owner.skip_topk = False
@@ -563,8 +559,8 @@ def test_b12x_projection_overlap_preserves_scratch(monkeypatch, num_tokens, kind
                 owner._qsa_binding_for_workload = lambda **kwargs: context
                 owner._prepare_qsa_metadata = lambda *args: staged
                 owner._shared_qsa_rope_positions = lambda *args: positions
-                metadata = qsa_module.Qwen3_8FlashNextQSAMetadata.__new__(
-                    qsa_module.Qwen3_8FlashNextQSAMetadata
+                metadata = qsa_module.Qwen4ExpQSAMetadata.__new__(
+                    qsa_module.Qwen4ExpQSAMetadata
                 )
                 metadata.num_actual_tokens = metadata.max_query_len = num_tokens
                 metadata.max_seq_len = num_tokens
@@ -576,7 +572,7 @@ def test_b12x_projection_overlap_preserves_scratch(monkeypatch, num_tokens, kind
                 def op(value, *args):
                     if not torch.cuda.is_current_stream_capturing():
                         return serial_op(value, *args)
-                    qkv = torch.ops.vllm.qwen3_8_flash_next_qsa_project_inputs(
+                    qkv = torch.ops.vllm.qwen4_exp_b12x_qsa_project_inputs(
                         positions,
                         value,
                         owner._selected_positions,
@@ -632,9 +628,9 @@ def test_b12x_projection_overlap_preserves_scratch(monkeypatch, num_tokens, kind
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("num_tokens", [4, 32])
-def test_ple_prefetch_joins_before_embedding_consumers(monkeypatch, num_tokens) -> None:
-    embedding = ple_layer_module.Qwen3_8FlashNextNGramEmbedding.__new__(
-        ple_layer_module.Qwen3_8FlashNextNGramEmbedding
+def test_ple_lookup_replays_with_changed_inputs(monkeypatch, num_tokens) -> None:
+    embedding = ple_embedding_module.B12xNGramEmbedding.__new__(
+        ple_embedding_module.B12xNGramEmbedding
     )
     nn.Module.__init__(embedding)
     embedding.owner_prefix = "test.ple"
@@ -647,13 +643,11 @@ def test_ple_prefetch_joins_before_embedding_consumers(monkeypatch, num_tokens) 
         embedding._embedding_out[: ids.numel()].copy_(table[rows])
 
     embedding._run_embedding = lookup
-    stream = torch.cuda.Stream()
-    monkeypatch.setattr(ple_layer_module, "_get_prefetch_stream", lambda: stream)
     monkeypatch.setattr(
-        ple_layer_module, "get_tensor_model_parallel_world_size", lambda: 1
+        ple_embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
     )
     monkeypatch.setattr(
-        ple_layer_module,
+        ple_embedding_module,
         "get_forward_context",
         lambda: SimpleNamespace(
             no_compile_layers={"test.ple": SimpleNamespace(ple_embedding=embedding)}
@@ -662,9 +656,8 @@ def test_ple_prefetch_joins_before_embedding_consumers(monkeypatch, num_tokens) 
 
     @torch.compile(fullgraph=True)
     def forward(ids, query_start_loc, history, hidden):
-        embedding.prefetch(ids, query_start_loc, history)
         hidden = hidden * 2
-        return embedding(ids, query_start_loc, history, wait_for=hidden) + hidden
+        return embedding(ids, query_start_loc, history) + hidden
 
     ids = torch.zeros(num_tokens, dtype=torch.int64, device="cuda")
     query_start_loc = torch.tensor([0, num_tokens], dtype=torch.int32, device="cuda")
@@ -697,15 +690,17 @@ def test_disk_ple_preparation_refreshes_graph_output(tmp_path, monkeypatch) -> N
         file_source_tensor,
         safetensors_file_sources,
     )
-    from vllm.models.qwen3_8_flash_next.model_state import (
-        Qwen3_8FlashNextModelState,
+    from vllm.models.qwen4_exp.nvidia.model_state import (
+        Qwen4ExpModelState,
     )
     from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
     monkeypatch.setattr(
-        ple_layer_module, "get_tensor_model_parallel_world_size", lambda: 1
+        ple_embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
     )
-    monkeypatch.setattr(ple_layer_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        ple_embedding_module, "get_tensor_model_parallel_rank", lambda: 0
+    )
     config = SimpleNamespace(
         ngram_size=3,
         heads_per_ngram=1,
@@ -718,7 +713,7 @@ def test_disk_ple_preparation_refreshes_graph_output(tmp_path, monkeypatch) -> N
     )
 
     def make_embedding(memory):
-        return ple_layer_module.Qwen3_8FlashNextNGramEmbedding(
+        return ple_embedding_module.B12xNGramEmbedding(
             config,
             64,
             0,
@@ -748,7 +743,7 @@ def test_disk_ple_preparation_refreshes_graph_output(tmp_path, monkeypatch) -> N
         for name, source in safetensors_file_sources(str(path)).items()
     )
     resident.load_weights(weights.items())
-    ple_layer_module.flush_weight_transfers()
+    ple_embedding_module.flush_weight_transfers()
     from b12x.preparation import PreparationSession
 
     from vllm.utils.b12x import B12xWorkload
@@ -769,7 +764,7 @@ def test_disk_ple_preparation_refreshes_graph_output(tmp_path, monkeypatch) -> N
         requests = tuple(request for unit in units for request in unit.requests)
         session.prepare(requests)
 
-    state = Qwen3_8FlashNextModelState.__new__(Qwen3_8FlashNextModelState)
+    state = Qwen4ExpModelState.__new__(Qwen4ExpModelState)
     state.uses_ngram_embedding = True
     state.disk_embeddings = (embedding,)
     state.ngram_context = torch.empty(2, 2, dtype=torch.int64, device="cuda")
@@ -906,7 +901,7 @@ def test_ple_cpu_offload_env_alias(monkeypatch, enabled, backend) -> None:
         monkeypatch.delenv("VLLM_PLE_CPU_OFFLOAD", raising=False)
     else:
         monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", enabled)
-    assert ple_layer_module._resolve_ple_table_memory(None) == backend
+    assert ple_embedding_module._resolve_ple_table_memory(None) == backend
 
 
 @pytest.mark.parametrize(
@@ -918,20 +913,21 @@ def test_ple_table_memory_env_overrides_cpu_offload_flag(
 ) -> None:
     monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", legacy_flag)
     monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", policy)
-    assert ple_layer_module._resolve_ple_table_memory(None) == backend
+    assert ple_embedding_module._resolve_ple_table_memory(None) == backend
 
 
 def test_ple_table_memory_env_rejects_backend_names(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "io_uring")
     with pytest.raises(ValueError, match="VLLM_PLE_TABLE_MEMORY"):
-        ple_layer_module._resolve_ple_table_memory(None)
+        ple_embedding_module._resolve_ple_table_memory(None)
 
 
 def test_qwen3_8_prefers_b12x_gdn_unless_explicitly_overridden(monkeypatch) -> None:
     config = SimpleNamespace(
         additional_config={},
+        kernel_config=SimpleNamespace(linear_backend="b12x", moe_backend="b12x"),
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(model_type="qwen3_8_flash_next_text")
+            hf_text_config=SimpleNamespace(model_type="qwen4_exp_text")
         ),
     )
     monkeypatch.delenv("VLLM_GDN_DECODE_KERNEL", raising=False)
@@ -940,7 +936,7 @@ def test_qwen3_8_prefers_b12x_gdn_unless_explicitly_overridden(monkeypatch) -> N
     assert _resolve_gdn_decode_kernel(config) == ("cuda", False)
 
     monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "triton")
-    config.model_config.hf_text_config.model_type = "qwen3_8_flash_next_text"
+    config.model_config.hf_text_config.model_type = "qwen4_exp_text"
     assert _resolve_gdn_decode_kernel(config) == ("triton", True)
 
     config.additional_config["gdn_decode_kernel"] = "b12x"
@@ -951,7 +947,7 @@ def test_explicit_ple_table_memory_overrides_env_alias(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
     monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "disk")
     assert (
-        ple_layer_module._resolve_ple_table_memory({"ple_table_memory": "device"})
+        ple_embedding_module._resolve_ple_table_memory({"ple_table_memory": "device"})
         == "device"
     )
 
@@ -962,18 +958,20 @@ def test_ple_registers_request_dependent_piecewise_splitting_ops_once() -> None:
         splitting_ops=[],
     )
 
-    ple_layer_module._register_ple_compilation_context(
+    ple_embedding_module._register_ple_compilation_context(
         compilation_config,
         "model.layers.1.ple",
         nn.Identity(),
     )
-    ple_layer_module._register_ple_compilation_context(
+    ple_embedding_module._register_ple_compilation_context(
         compilation_config,
         "model.layers.5.ple",
         nn.Identity(),
     )
 
-    assert compilation_config.splitting_ops == list(ple_layer_module._PLE_SPLITTING_OPS)
+    assert compilation_config.splitting_ops == list(
+        ple_embedding_module._PLE_SPLITTING_OPS
+    )
     assert set(compilation_config.static_forward_context) == {
         "model.layers.1.ple",
         "model.layers.5.ple",
@@ -996,8 +994,8 @@ def test_decoder_layer_factory_accepts_make_layers_prefix(monkeypatch) -> None:
             self,
             _vllm_config,
             layer_type: str,
-            _workspace,
             *,
+            workspace,
             prefix: str,
         ) -> None:
             super().__init__()
@@ -1016,7 +1014,7 @@ def test_decoder_layer_factory_accepts_make_layers_prefix(monkeypatch) -> None:
     pp_group = FakePPGroup()
     monkeypatch.setattr(model_module, "VocabParallelEmbedding", FakeEmbedding)
     monkeypatch.setattr(model_module, "HyperConnectionWorkspace", FakeWorkspace)
-    monkeypatch.setattr(model_module, "Qwen3_8FlashNextDecoderLayer", FakeDecoderLayer)
+    monkeypatch.setattr(model_module, "Qwen4ExpDecoderLayer", FakeDecoderLayer)
     monkeypatch.setattr(model_module, "get_pp_group", lambda: pp_group)
     monkeypatch.setattr(parallel_state, "get_pp_group", lambda: pp_group)
     monkeypatch.setattr(
@@ -1037,6 +1035,7 @@ def test_decoder_layer_factory_accepts_make_layers_prefix(monkeypatch) -> None:
         rms_norm_eps=1e-6,
     )
     vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(linear_backend="b12x", moe_backend="b12x"),
         model_config=SimpleNamespace(
             hf_text_config=text_config,
             dtype=torch.bfloat16,
@@ -1049,7 +1048,7 @@ def test_decoder_layer_factory_accepts_make_layers_prefix(monkeypatch) -> None:
         speculative_config=None,
     )
 
-    model = model_module.Qwen3_8FlashNextModel(
+    model = model_module.Qwen4ExpModel(
         vllm_config=vllm_config,
         prefix="model",
     )
@@ -1072,7 +1071,7 @@ def test_ple_bind_uses_installed_execution_and_exact_aligned_page_stride(
         dtypes=dtypes,
         mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
     )
-    layer = Qwen3_8FlashNextPLELayer.__new__(Qwen3_8FlashNextPLELayer)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(layer)
     layer._state_caps = object()
     layer._preparation_prefix = "model.layers.1.ple"
@@ -1135,7 +1134,7 @@ def test_ple_bind_uses_installed_execution_and_exact_aligned_page_stride(
 def test_ple_preparation_invocation_preserves_aligned_page_stride(
     monkeypatch,
 ) -> None:
-    layer = Qwen3_8FlashNextPLELayer.__new__(Qwen3_8FlashNextPLELayer)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(layer)
     layer._residual = torch.empty(4, 2, 3)
     layer._key = torch.empty_like(layer._residual)
@@ -1436,8 +1435,8 @@ def test_sm120_flashinfer_gdn_int32_offsets_match_int64(boundaries):
 def test_ple_embedding_reuses_capacity_for_live_token_counts(
     monkeypatch,
 ) -> None:
-    layer = ple_layer_module.Qwen3_8FlashNextNGramEmbedding.__new__(
-        ple_layer_module.Qwen3_8FlashNextNGramEmbedding
+    layer = ple_embedding_module.B12xNGramEmbedding.__new__(
+        ple_embedding_module.B12xNGramEmbedding
     )
     nn.Module.__init__(layer)
     layer.requires_disk_preparation = False
@@ -1463,7 +1462,7 @@ def test_ple_embedding_reuses_capacity_for_live_token_counts(
         return object()
 
     monkeypatch.setattr(
-        ple_layer_module, "_b12x_module", lambda _name: SimpleNamespace(bind=bind)
+        ple_embedding_module, "_b12x_module", lambda _name: SimpleNamespace(bind=bind)
     )
 
     layer._bind_embedding(8)
@@ -1479,7 +1478,7 @@ def test_ple_embedding_reuses_capacity_for_live_token_counts(
 
 
 def test_ple_state_prepare_call_restores_the_staging_buffers_it_overwrites(monkeypatch):
-    layer = Qwen3_8FlashNextPLELayer.__new__(Qwen3_8FlashNextPLELayer)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(layer)
     layer.eps = 1e-6
     layer._state_caps = object()

@@ -6,6 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_ROOT="${VLLM_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 B12X_ROOT="${B12X_ROOT:-/home/luke/projects/b12x}"
+B12X_COMPILE_CACHE_DIR="${B12X_COMPILE_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/b12x/compile/vllm-tp2}"
 SPARK_ROOT="${SPARK_ROOT:-/home/luke/projects/spark-vllm-docker}"
 CLUSTER_LAUNCHER="${CLUSTER_LAUNCHER:-${SPARK_ROOT}/launch-cluster.sh}"
 
@@ -52,7 +53,7 @@ case "${SPECULATOR}" in
   *) default_num_speculative_tokens=5 ;;
 esac
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-${default_num_speculative_tokens}}"
-MTP_MOE_BACKEND="${MTP_MOE_BACKEND:-humming}"
+MTP_MOE_BACKEND="${MTP_MOE_BACKEND:-b12x}"
 MTP_ATTENTION_BACKEND="${MTP_ATTENTION_BACKEND:-B12X}"
 KDA_PREFILL_BACKEND="${KDA_PREFILL_BACKEND:-b12x}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-B12X}"
@@ -281,6 +282,7 @@ fi
 bind_paths=(
   "${VLLM_ROOT}"
   "${B12X_ROOT}"
+  "${B12X_COMPILE_CACHE_DIR}"
   "${MODEL_PATH}"
   "${CLUSTER_LAUNCHER}"
 )
@@ -524,8 +526,13 @@ if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" \
   exit 1
 fi
 
+mkdir -p -- "${B12X_COMPILE_CACHE_DIR}"
+printf -v remote_cache_dir '%q' "${B12X_COMPILE_CACHE_DIR}"
+ssh "${ssh_opts[@]}" "${WORKER_IP}" "mkdir -p -- ${remote_cache_dir}"
+
 mount_args="-v ${VLLM_ROOT}:${VLLM_ROOT}"
 mount_args+=" -v ${B12X_ROOT}:${B12X_ROOT}"
+mount_args+=" -v ${B12X_COMPILE_CACHE_DIR}:${B12X_COMPILE_CACHE_DIR}"
 mount_args+=" -v ${MODEL_PATH}:${MODEL_PATH}:ro"
 if ((dflash2_enabled)); then
   mount_args+=" -v ${DFLASH2_MOUNT_ROOT}:${DFLASH2_MOUNT_ROOT}:ro"
@@ -554,13 +561,17 @@ cluster_args=(
   --env "TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas"
   --env "CUDA_VISIBLE_DEVICES=0"
   --env "CUTE_DSL_ARCH=sm_121a"
+  --env "B12X_COMPILE_CACHE_DIR=${B12X_COMPILE_CACHE_DIR}"
+  --env "B12X_WEIGHTS_COMPILE_WORKERS=${B12X_WEIGHTS_COMPILE_WORKERS:-${B12X_COMPILE_WORKERS:-16}}"
+  --env "B12X_STATE_COMPILE_WORKERS=${B12X_STATE_COMPILE_WORKERS:-${B12X_COMPILE_WORKERS:-16}}"
+  --env "B12X_BIND_COMPILE_WORKERS=${B12X_BIND_COMPILE_WORKERS:-${B12X_COMPILE_WORKERS:-4}}"
   --env "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
   --env "SAFETENSORS_FAST_GPU=1"
   --env "OMP_NUM_THREADS=16"
   --env "VLLM_WORKER_MULTIPROC_METHOD=spawn"
   --env "HF_HUB_OFFLINE=1"
   --env "TRANSFORMERS_OFFLINE=1"
-  --env "VLLM_PLUGINS=${VLLM_PLUGINS:-}"
+  --env "VLLM_PLUGINS=${VLLM_PLUGINS:-b12x_loader}"
   --env "VLLM_SSM_CONV_STATE_LAYOUT=DS"
   --env "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=${VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE}"
   --env "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE=${VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE}"
@@ -638,7 +649,7 @@ vllm_command=(
   --moe-backend "${MOE_BACKEND}"
   --linear-backend "${LINEAR_BACKEND}"
   --no-enable-flashinfer-autotune
-  --load-format fastsafetensors
+  --load-format b12x
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}"
   --max-model-len "${MAX_MODEL_LEN}"

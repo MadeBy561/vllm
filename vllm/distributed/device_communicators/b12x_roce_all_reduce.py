@@ -203,6 +203,7 @@ class B12xRoceAllReduce:
             return ()
         from b12x.comm import roce
         from b12x.comm.roce import _preparation
+        from b12x.preparation import CollectiveRequirement
 
         query = roce.query_from_runtime(
             self._runtime,
@@ -233,6 +234,10 @@ class B12xRoceAllReduce:
         request = self._plan.request(
             name=self._request_name(),
             prepare_call=prepare,
+            collective=CollectiveRequirement(
+                key=self._request_name(),
+                ranks=tuple(sorted(self.global_ranks)),
+            ),
         )
         return (
             B12xPreparationUnit(
@@ -240,7 +245,6 @@ class B12xRoceAllReduce:
                 key=(self.global_ranks,),
                 requests=(request,),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 

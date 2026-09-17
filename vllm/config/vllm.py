@@ -610,6 +610,8 @@ class VllmConfig:
             in (
                 "qwen3_8_flash_next_text",
                 "qwen3_8_flash_next",
+                "qwen4_exp_text",
+                "qwen4_exp",
                 "glm5_next_text",
                 "glm5_next",
             )
@@ -634,6 +636,17 @@ class VllmConfig:
                 or model.hf_text_config.model_type in ("glm5_next_text", "glm5_next")
             )
             and parallel.prefill_context_parallel_size == 1
+            and (
+                model.hf_text_config.model_type
+                not in (
+                    "qwen4_exp",
+                    "qwen4_exp_text",
+                    "qwen3_8_flash_next",
+                    "qwen3_8_flash_next_text",
+                )
+                or self.kernel_config.linear_backend == "b12x"
+                or self.kernel_config.moe_backend == "b12x"
+            )
             and self.external_boundary_checkpoint_adapter_available
             and cache.kv_offloading_size is None
         )

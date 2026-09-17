@@ -29,6 +29,44 @@ def _progress(*, done=False, pending=False, ready=()):
     )
 
 
+@pytest.mark.parametrize("failure", [False, True])
+def test_state_tuning_releases_temporary_pools_before_serving_allocation(
+    monkeypatch, failure
+):
+    """A tuning failure also frees temporary state and prevents serving allocation."""
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr("vllm.utils.b12x.has_b12x", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_platform, "is_device_capability_family", lambda _: True)
+    events = []
+
+    def rpc(method, **kwargs):
+        events.append(method)
+        return [True, True]
+
+    def prepare(*, stage):
+        events.append(stage)
+        if failure:
+            raise RuntimeError("failed tuning")
+
+    executor = SimpleNamespace(collective_rpc=rpc, _run_b12x_preparation=prepare)
+    if failure:
+        with pytest.raises(RuntimeError, match="failed tuning"):
+            Executor.initialize_from_config(executor, [object(), object()])
+    else:
+        Executor.initialize_from_config(executor, [object(), object()])
+        assert executor._b12x_state_tuned_before_allocation
+    expected = [
+        "initialize_b12x_tuning_cache",
+        "state",
+        "release_b12x_tuning_cache",
+    ]
+    if not failure:
+        expected.append("initialize_from_config")
+    assert events == expected
+
+
 class _Result:
     def __init__(self, events):
         self.events = events

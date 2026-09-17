@@ -144,6 +144,7 @@ def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int 
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.model_executor.warmup.b12x_prepare import B12xPreparedBatch
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -254,7 +255,9 @@ class Worker(WorkerBase):
         # the worker-local registry while publishing native resources.
         self._b12x_session = None
         self._b12x_stage: str | None = None
-        self._b12x_profile_batch = None
+        self._b12x_profile_batch: B12xPreparedBatch | None = None
+        self._b12x_tuning_batch: B12xPreparedBatch | None = None
+        self._b12x_tuning_cache = False
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
 
@@ -861,6 +864,22 @@ class Worker(WorkerBase):
                 self.model_runner, "_init_kv_zero_meta"
             ):
                 self.model_runner._init_kv_zero_meta()
+
+    def initialize_b12x_tuning_cache(
+        self, kv_cache_configs: list[KVCacheConfig]
+    ) -> bool:
+        from vllm.model_executor.warmup.b12x_prepare import (
+            initialize_b12x_tuning_cache,
+        )
+
+        with set_current_vllm_config(self.vllm_config):
+            return initialize_b12x_tuning_cache(self, kv_cache_configs[self.rank])
+
+    def release_b12x_tuning_cache(self) -> None:
+        from vllm.model_executor.warmup.b12x_prepare import release_b12x_tuning_cache
+
+        with set_current_vllm_config(self.vllm_config):
+            release_b12x_tuning_cache(self)
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:

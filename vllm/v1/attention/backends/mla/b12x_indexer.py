@@ -576,7 +576,6 @@ class B12xSparseIndexer(nn.Module):
                 key=self._preparation_prefix,
                 requests=tuple(requests),
                 stage="state",
-                autotune=not workload.eager_only,
             ),
         )
 

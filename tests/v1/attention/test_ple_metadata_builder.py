@@ -14,12 +14,12 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.models.qwen3_8_flash_next.ple_attn import (
+from vllm.models.qwen4_exp.nvidia.ple_attn import (
     PLEAttentionBackend,
     PLEAttentionMetadataBuilder,
     PLEGraphInputs,
 )
-from vllm.models.qwen3_8_flash_next.ple_layer import Qwen3_8FlashNextPLELayer
+from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLELayer
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -49,7 +49,10 @@ def _builder(num_spec):
 
 
 def test_ple_backend_does_not_change_short_conv_capability():
-    assert Qwen3_8FlashNextPLELayer.get_attn_backend(None) is PLEAttentionBackend
+    assert (
+        Qwen4ExpPLELayer.get_attn_backend(SimpleNamespace(_use_b12x=True))
+        is PLEAttentionBackend
+    )
     assert (
         PLEAttentionMetadataBuilder.get_cudagraph_support(None, None)
         == AttentionCGSupport.ALWAYS
@@ -149,7 +152,7 @@ def test_ple_layer_graph_staging_uses_runtime_contents(device_type):
         has_initial_states_p=torch.tensor([False, True], device=device),
         num_accepted_tokens=torch.tensor([2], dtype=torch.int32, device=device),
     )
-    layer = Qwen3_8FlashNextPLELayer.__new__(Qwen3_8FlashNextPLELayer)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
     layer.max_seqs, layer.max_tokens = 4, 256
     for name, tensor in vars(inputs).items():
@@ -222,7 +225,7 @@ def test_ple_padded_graph_initializes_poisoned_state_before_decode(monkeypatch):
     device = torch.device("cuda", torch.accelerator.current_device_index())
     tokens, streams, hidden, history = 256, 2, 128, 9
     inputs = PLEGraphInputs(4, tokens, device)
-    layer = Qwen3_8FlashNextPLELayer.__new__(Qwen3_8FlashNextPLELayer)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
     layer.max_seqs, layer.max_tokens = 4, tokens
     for name, tensor in vars(inputs).items():

@@ -117,14 +117,14 @@ def test_glm5next_kda_reuses_captured_metadata_after_reordering(monkeypatch) -> 
         builder.vllm_config.cache_config.mamba_cache_mode = "align"
     state = _bare_model_state()
     state.vllm_config = builders[0].vllm_config
-    state.max_model_len = 4096
+    state.model_config = state.vllm_config.model_config
+    state.vllm_config.model_config.max_model_len = 4096
     state.selector_is_prefilling = CpuGpuBuffer(
         8, dtype=torch.bool, device=torch.device("cpu"), pin_memory=False
     )
     state._align_mode = True
     state._aligned_metadata_groups = state._aligned_metadata_ctx = None
     state._aligned_metadata_builders = []
-    state._gdn_spec_accepted_tokens = torch.ones(8, dtype=torch.int32)
     state.recoverssm = None
     state._get_mamba_group_info = lambda _: ([0, 1], None)
     indices = torch.arange(64, dtype=torch.int32).reshape(2, 8, 4)
@@ -169,6 +169,7 @@ def test_glm5next_kda_reuses_captured_metadata_after_reordering(monkeypatch) -> 
             groups,
             kv_config,
             for_capture=for_capture,
+            ubatch_idx=0,
         )
 
     captured = prepare(for_capture=True)
@@ -183,10 +184,11 @@ def test_glm5next_kda_reuses_captured_metadata_after_reordering(monkeypatch) -> 
                 captured[str(i)].spec_state_indices_tensor, indices[i, :1]
             )
             assert captured[str(i)].num_accepted_tokens.item() == accepted
-        assert (
-            current["0"].num_accepted_tokens.data_ptr()
-            == current["1"].num_accepted_tokens.data_ptr()
-        )
+            assert (
+                current[str(i)].num_accepted_tokens.data_ptr()
+                == captured[str(i)].num_accepted_tokens.data_ptr()
+                == builders[i].num_accepted_tokens.data_ptr()
+            )
 
 
 def test_glm5next_draft_metadata_preserves_first_step_acceptance() -> None:

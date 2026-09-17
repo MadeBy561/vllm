@@ -740,7 +740,6 @@ class B12xPcieAllReduce:
                 key=(self.global_ranks, tuple(sorted(routes.items()))),
                 requests=tuple(requests),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 

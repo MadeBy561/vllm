@@ -32,6 +32,8 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
 
     def __init__(
         self,
+        ple_embedding_dtype: str | None = None,
+        index_share_for_mtp_iteration: bool = True,
         hc_count: int = 4,
         hc_lowrank: int = 320,
         ple_layer_ids: list[int] | None = None,
@@ -73,6 +75,8 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         self.rope_parameters = rope_parameters or normalized_rope_parameters
         self.rope_theta = rope_theta
 
+        self.ple_embedding_dtype = ple_embedding_dtype or "bfloat16"
+        self.index_share_for_mtp_iteration = index_share_for_mtp_iteration
         self.hc_count = hc_count
         self.hc_lowrank = hc_lowrank
         self.ple_layer_ids = ple_layer_ids or []

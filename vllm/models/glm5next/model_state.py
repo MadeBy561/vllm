@@ -267,7 +267,9 @@ class Glm5NextModelState(MambaHybridModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        ubatch_idx: int = 0,
     ) -> dict[str, Any]:
+        assert ubatch_idx == 0, "DBO is not supported"
         # This is the MambaHybridModelState construction with only the metadata
         # object specialized. Keeping it package-local avoids a GLM hook in the
         # generic model runner.

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""B12x QSA owner for Qwen3.8-Flash-Next on NVIDIA SM12x."""
+"""B12x QSA owner for Qwen4Exp on NVIDIA SM12x."""
 
 from __future__ import annotations
 
@@ -73,14 +73,14 @@ from vllm.v1.worker.workspace import (
     use_preallocated_workspace,
 )
 
-from ..common.qsa_cache import (
+from ..common.b12x_qsa_cache import (
     canonical_qsa_rope_positions,
     qsa_compressed_cache_view,
     qsa_logical_positions,
     qsa_padded_page_size_bytes,
 )
-from ..config import Qwen3_8FlashNextTextConfig
-from .indexer_qsa import QSAIndexer
+from ..config import Qwen4ExpTextConfig
+from .b12x_indexer_qsa import QSAIndexer
 
 _QSA_COMPRESS_RATIO = 4
 _QSA_INDEX_HEAD_DIM = 128
@@ -89,8 +89,8 @@ _QSA_INDEX_HEAD_DIM = 128
 # that is valid for every supported runtime configuration.
 _QSA_MANAGER_BLOCK_ALIGNMENT = 8
 _QSA_MAX_SPECULATIVE_TOKENS = 4
-_QSA_SPLITTING_OP = "vllm::qwen3_8_flash_next_qsa_with_output"
-_QSA_PROJECTED_READ_OP = "vllm::qwen3_8_flash_next_qsa_run_projected"
+_QSA_SPLITTING_OP = "vllm::qwen4_exp_b12x_qsa_with_output"
+_QSA_PROJECTED_READ_OP = "vllm::qwen4_exp_b12x_qsa_run_projected"
 
 
 def _qsa_prefill_context_capacities(
@@ -134,7 +134,7 @@ def _without_modelopt_fp4(
 
 
 @dataclass
-class Qwen3_8FlashNextQSAMetadata(B12xPagedMetadata):
+class Qwen4ExpQSAMetadata(B12xPagedMetadata):
     """Main-cache metadata plus persistent selector-state ownership."""
 
     request_ids: torch.Tensor | None = None
@@ -171,7 +171,7 @@ class _QSAContextPlan:
     prepared_plan: Any | None = None
 
 
-class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
+class Qwen4ExpQSAMetadataBuilder(B12xPagedMetadataBuilder):
     """Build QSA metadata without introducing another KV-cache owner."""
 
     requires_qsa_metadata: ClassVar[bool] = True
@@ -213,7 +213,7 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
         qsa_state_is_fresh: torch.Tensor | None = None,
         qsa_num_accepted_tokens: torch.Tensor | None = None,
         qsa_is_prefilling: torch.Tensor | None = None,
-    ) -> Qwen3_8FlashNextQSAMetadata:
+    ) -> Qwen4ExpQSAMetadata:
         del common_prefix_len, fast_build
         cm = common_attn_metadata
         num_reqs = int(cm.seq_lens.shape[0])
@@ -242,7 +242,7 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
         num_mapped_tokens = int(cm.query_start_loc_cpu[-1])
         if num_mapped_tokens < cm.num_actual_tokens:
             request_ids[num_mapped_tokens:].fill_(-1)
-        return Qwen3_8FlashNextQSAMetadata(
+        return Qwen4ExpQSAMetadata(
             num_actual_tokens=cm.num_actual_tokens,
             max_query_len=cm.max_query_len,
             query_start_loc=cm.query_start_loc,
@@ -262,7 +262,7 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
         self,
         metadata: B12xPagedMetadata,
     ) -> None:
-        qsa_metadata = cast(Qwen3_8FlashNextQSAMetadata, metadata)
+        qsa_metadata = cast(Qwen4ExpQSAMetadata, metadata)
         if qsa_metadata.qsa_num_accepted_tokens is None:
             raise RuntimeError(
                 "QSA draft decode metadata requires accepted-token counts"
@@ -274,8 +274,8 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
         metadata: B12xPagedMetadata,
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
-    ) -> Qwen3_8FlashNextQSAMetadata:
-        if not isinstance(metadata, Qwen3_8FlashNextQSAMetadata):
+    ) -> Qwen4ExpQSAMetadata:
+        if not isinstance(metadata, Qwen4ExpQSAMetadata):
             raise TypeError(f"expected QSA metadata, got {type(metadata)!r}")
         # build_attn_metadata applies this ownership rule during capture too;
         # replay therefore reads the first builder's live request-state buffers.
@@ -286,7 +286,7 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
         )
 
 
-class Qwen3_8FlashNextQSABackend(B12xPagedAttentionBackend):
+class Qwen4ExpQSABackend(B12xPagedAttentionBackend):
     """Sparse QSA backend using one padded, unsplit BLHNC manager page."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
@@ -315,12 +315,12 @@ class Qwen3_8FlashNextQSABackend(B12xPagedAttentionBackend):
         )
 
     @classmethod
-    def get_impl_cls(cls) -> type[Qwen3_8FlashNextQSAImpl]:
-        return Qwen3_8FlashNextQSAImpl
+    def get_impl_cls(cls) -> type[Qwen4ExpQSAImpl]:
+        return Qwen4ExpQSAImpl
 
     @staticmethod
-    def get_builder_cls() -> type[Qwen3_8FlashNextQSAMetadataBuilder]:
-        return Qwen3_8FlashNextQSAMetadataBuilder
+    def get_builder_cls() -> type[Qwen4ExpQSAMetadataBuilder]:
+        return Qwen4ExpQSAMetadataBuilder
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -376,9 +376,9 @@ class Qwen3_8FlashNextQSABackend(B12xPagedAttentionBackend):
     ) -> str | None:
         del use_sparse, device_capability
         if dtype != torch.bfloat16:
-            return "Qwen3.8-Flash-Next QSA requires BF16 queries"
+            return "Qwen4Exp QSA requires BF16 queries"
         if kv_cache_dtype not in (None, "auto", "bfloat16", "fp8", "fp8_e4m3"):
-            return "Qwen3.8-Flash-Next QSA requires BF16 or FP8 E4M3 KV cache"
+            return "Qwen4Exp QSA requires BF16 or FP8 E4M3 KV cache"
         if use_mla or has_sink or use_mm_prefix:
             return "QSA does not support MLA, attention sinks, or MM-prefix attention"
         if not cls.supports_block_size(block_size):
@@ -392,7 +392,7 @@ class Qwen3_8FlashNextQSABackend(B12xPagedAttentionBackend):
         return None
 
 
-class Qwen3_8FlashNextQSAImpl(AttentionImpl[Qwen3_8FlashNextQSAMetadata]):
+class Qwen4ExpQSAImpl(AttentionImpl[Qwen4ExpQSAMetadata]):
     """Native vLLM main-K/V writer for the merged QSA owner."""
 
     is_sparse: ClassVar[bool] = True
@@ -493,7 +493,7 @@ class Qwen3_8FlashNextQSAImpl(AttentionImpl[Qwen3_8FlashNextQSAMetadata]):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: Qwen3_8FlashNextQSAMetadata,
+        attn_metadata: Qwen4ExpQSAMetadata,
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
@@ -676,7 +676,7 @@ def _stage_qsa_rope_positions_kernel(
     )
 
 
-class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
+class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
     """Merged main attention, selector state, and b12x QSA transaction."""
 
     supports_dcp = False
@@ -685,7 +685,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         self,
         *,
         vllm_config: VllmConfig,
-        config: Qwen3_8FlashNextTextConfig,
+        config: Qwen4ExpTextConfig,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
@@ -805,8 +805,8 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
 
-        self.attn_backend = Qwen3_8FlashNextQSABackend
-        self.impl = Qwen3_8FlashNextQSAImpl(
+        self.attn_backend = Qwen4ExpQSABackend
+        self.impl = Qwen4ExpQSAImpl(
             self.num_heads,
             self.head_dim,
             self.scaling,
@@ -1179,7 +1179,6 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
                 key=self._b12x_preparation_prefix,
                 requests=tuple(requests),
                 stage="state",
-                autotune=not workload.eager_only,
             ),
         )
 
@@ -1195,7 +1194,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             assert compressed_cache is not None
             assert main_block_table is not None
             assert compressed_block_table is not None
-            impl = cast(Qwen3_8FlashNextQSAImpl, self.impl)
+            impl = cast(Qwen4ExpQSAImpl, self.impl)
             main_k, main_v = impl._kv_cache_views(self.kv_cache)
             rows = min(
                 caps.max_q_rows,
@@ -1417,7 +1416,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
                 "QSA max_num_batched_tokens must cover the largest verifier batch"
             )
 
-        impl = cast(Qwen3_8FlashNextQSAImpl, self.impl)
+        impl = cast(Qwen4ExpQSAImpl, self.impl)
         main_k_cache, main_v_cache = impl._kv_cache_views(kv_cache)
         compressed_cache = qsa_compressed_cache_view(
             kv_cache,
@@ -1575,7 +1574,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         overlap: bool = False,
         state: Any | None = None,
     ):
-        impl = cast(Qwen3_8FlashNextQSAImpl, self.impl)
+        impl = cast(Qwen4ExpQSAImpl, self.impl)
         main_k_cache, main_v_cache = impl._kv_cache_views(self.kv_cache)
         rope_cos, rope_sin = self.rotary_emb.cos_sin_cache.chunk(2, dim=-1)
         rows = context.caps.max_q_rows if output is None else int(output.shape[0])
@@ -1647,7 +1646,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
 
     @staticmethod
     def _require_qsa_metadata(
-        metadata: Qwen3_8FlashNextQSAMetadata,
+        metadata: Qwen4ExpQSAMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         fields = (
             metadata.request_ids,
@@ -1704,7 +1703,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
 
     def _stage_runtime_metadata(
         self,
-        metadata: Qwen3_8FlashNextQSAMetadata,
+        metadata: Qwen4ExpQSAMetadata,
         rows: int,
         *,
         row_capacity: int,
@@ -1813,7 +1812,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
 
     def _prepare_qsa_metadata(
         self,
-        metadata: Qwen3_8FlashNextQSAMetadata,
+        metadata: Qwen4ExpQSAMetadata,
         rows: int,
         main_block_table: torch.Tensor,
         compressed_block_table: torch.Tensor,
@@ -1909,7 +1908,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             output.zero_()
             return
         metadata = raw.get(self.layer_name)
-        if not isinstance(metadata, Qwen3_8FlashNextQSAMetadata):
+        if not isinstance(metadata, Qwen4ExpQSAMetadata):
             raise TypeError("QSA MTP selected read requires QSA metadata")
         rows = int(metadata.num_actual_tokens)
         if rows == 0:
@@ -1942,7 +1941,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             compressed_block_table=context.compressed_block_table,
         )
         self._b12x_diagnostic_request_ids = staged.request_ids
-        impl = cast(Qwen3_8FlashNextQSAImpl, self.impl)
+        impl = cast(Qwen4ExpQSAImpl, self.impl)
         impl.do_kv_cache_update(
             self, key[:rows], value[:rows], self.kv_cache, metadata.slot_mapping[:rows]
         )
@@ -1987,7 +1986,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
     def _parallel_selector_metadata(
         self,
         projected_rows: int,
-    ) -> Qwen3_8FlashNextQSAMetadata | None:
+    ) -> Qwen4ExpQSAMetadata | None:
         # V2 uses runtime mode NONE inside its outer full-graph capture.
         # PIECEWISE cannot carry a pending selector across the read-op boundary.
         if (
@@ -2002,7 +2001,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             raw = raw[0]
         metadata = raw.get(self.layer_name) if isinstance(raw, dict) else None
         if (
-            not isinstance(metadata, Qwen3_8FlashNextQSAMetadata)
+            not isinstance(metadata, Qwen4ExpQSAMetadata)
             or not 0 < metadata.num_actual_tokens <= projected_rows
             or metadata.max_query_len > 1 + self.max_speculative_tokens
         ):
@@ -2086,7 +2085,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             rows=rows,
             max_seq_len=int(metadata.max_seq_len),
         )
-        impl = cast(Qwen3_8FlashNextQSAImpl, self.impl)
+        impl = cast(Qwen4ExpQSAImpl, self.impl)
         impl.do_kv_cache_update(
             self,
             key[:rows],
@@ -2121,7 +2120,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
     def _run_b12x_qsa(
         self,
         *,
-        metadata: Qwen3_8FlashNextQSAMetadata,
+        metadata: Qwen4ExpQSAMetadata,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -2149,7 +2148,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         rope_positions = self._shared_qsa_rope_positions(
             positions, staged.request_ids, rows
         )
-        impl = cast(Qwen3_8FlashNextQSAImpl, self.impl)
+        impl = cast(Qwen4ExpQSAImpl, self.impl)
         impl.do_kv_cache_update(
             self,
             key[:rows],
@@ -2194,7 +2193,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             output.zero_()
             return
         metadata = raw_metadata.get(self.layer_name)
-        if not isinstance(metadata, Qwen3_8FlashNextQSAMetadata):
+        if not isinstance(metadata, Qwen4ExpQSAMetadata):
             raise TypeError(
                 f"{self.layer_name} expected QSA metadata, got "
                 f"{type(metadata).__name__}"
@@ -2238,7 +2237,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
     ) -> torch.Tensor:
         if self.overlap_input_projections or self._share_mtp_indices:
             layer_name = _encode_layer_name(self.layer_name)
-            qkv = torch.ops.vllm.qwen3_8_flash_next_qsa_project_inputs(
+            qkv = torch.ops.vllm.qwen4_exp_b12x_qsa_project_inputs(
                 positions,
                 hidden_states,
                 self._selected_positions,
@@ -2251,7 +2250,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             key = key.view(rows, self.num_kv_heads, self.head_dim)
             value = value.view(rows, self.num_kv_heads, self.head_dim)
             output = torch.empty_like(query)
-            torch.ops.vllm.qwen3_8_flash_next_qsa_run_projected(
+            torch.ops.vllm.qwen4_exp_b12x_qsa_run_projected(
                 positions,
                 hidden_states,
                 query,
@@ -2273,7 +2272,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         output = torch.empty_like(query)
         layer_name = _encode_layer_name(self.layer_name)
         if current_platform.opaque_attention_op():
-            torch.ops.vllm.qwen3_8_flash_next_qsa_with_output(
+            torch.ops.vllm.qwen4_exp_b12x_qsa_with_output(
                 positions,
                 query,
                 key,
@@ -2284,7 +2283,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
                 layer_name,
             )
         else:
-            qwen3_8_flash_next_qsa_with_output(
+            qwen4_exp_b12x_qsa_with_output(
                 positions,
                 query,
                 key,
@@ -2323,7 +2322,7 @@ def _qsa_project_inputs_fake(
 
 
 direct_register_custom_op(
-    op_name="qwen3_8_flash_next_qsa_project_inputs",
+    op_name="qwen4_exp_b12x_qsa_project_inputs",
     op_func=_qsa_project_inputs,
     # This buffer is also the ordering token for the hidden selector inputs.
     mutates_args=["selected_positions"],
@@ -2361,7 +2360,7 @@ def _qsa_run_projected_fake(
 
 
 direct_register_custom_op(
-    op_name="qwen3_8_flash_next_qsa_run_projected",
+    op_name="qwen4_exp_b12x_qsa_run_projected",
     op_func=_qsa_run_projected,
     mutates_args=["output", "selected_positions"],
     fake_impl=_qsa_run_projected_fake,
@@ -2412,13 +2411,13 @@ def _qsa_input_projections_fake(
 
 
 direct_register_custom_op(
-    op_name="qwen3_8_flash_next_qsa_input_projections",
+    op_name="qwen4_exp_b12x_qsa_input_projections",
     op_func=_qsa_input_projections,
     fake_impl=_qsa_input_projections_fake,
 )
 
 
-def qwen3_8_flash_next_qsa_with_output(
+def qwen4_exp_b12x_qsa_with_output(
     positions: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -2432,8 +2431,8 @@ def qwen3_8_flash_next_qsa_with_output(
 
     resolved_name = _resolve_layer_name(layer_name)
     layer = get_forward_context().no_compile_layers[resolved_name]
-    if not isinstance(layer, Qwen3_8FlashNextQSAAttention):
-        raise TypeError(f"{resolved_name} is not a Qwen3.8-Flash-Next QSA owner")
+    if not isinstance(layer, Qwen4ExpQSAAttention):
+        raise TypeError(f"{resolved_name} is not a Qwen4Exp QSA owner")
     layer._run_qsa(
         positions,
         query,
@@ -2445,7 +2444,7 @@ def qwen3_8_flash_next_qsa_with_output(
     )
 
 
-def _qwen3_8_flash_next_qsa_with_output_fake(
+def _qwen4_exp_b12x_qsa_with_output_fake(
     positions: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -2468,20 +2467,20 @@ def _qwen3_8_flash_next_qsa_with_output_fake(
 
 
 direct_register_custom_op(
-    op_name="qwen3_8_flash_next_qsa_with_output",
-    op_func=qwen3_8_flash_next_qsa_with_output,
+    op_name="qwen4_exp_b12x_qsa_with_output",
+    op_func=qwen4_exp_b12x_qsa_with_output,
     mutates_args=["output"],
-    fake_impl=_qwen3_8_flash_next_qsa_with_output_fake,
+    fake_impl=_qwen4_exp_b12x_qsa_with_output_fake,
 )
 
 
 __all__ = [
     "QSAIndexer",
-    "Qwen3_8FlashNextQSAAttention",
-    "Qwen3_8FlashNextQSABackend",
-    "Qwen3_8FlashNextQSAImpl",
-    "Qwen3_8FlashNextQSAMetadata",
-    "Qwen3_8FlashNextQSAMetadataBuilder",
+    "Qwen4ExpQSAAttention",
+    "Qwen4ExpQSABackend",
+    "Qwen4ExpQSAImpl",
+    "Qwen4ExpQSAMetadata",
+    "Qwen4ExpQSAMetadataBuilder",
     "apply_qsa_rope",
-    "qwen3_8_flash_next_qsa_with_output",
+    "qwen4_exp_b12x_qsa_with_output",
 ]

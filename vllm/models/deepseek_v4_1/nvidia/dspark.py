@@ -162,7 +162,6 @@ class _ContextKVProjection:
                 key=(id(self), self.capacities),
                 requests=requests,
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 

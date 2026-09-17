@@ -1926,7 +1926,7 @@ def test_deepseek_v4_wo_declares_exact_rows_before_profiling(monkeypatch, eager_
         eager_only=eager_only,
     )
     (unit,) = layer.get_b12x_preparation_units(layer, workload)
-    assert unit.stage == "weights" and unit.autotune is not eager_only
+    assert unit.stage == "weights" and unit.autotune is True
     assert tuple(request.plan.query.max_tokens for request in unit.requests) == (
         1,
         4,

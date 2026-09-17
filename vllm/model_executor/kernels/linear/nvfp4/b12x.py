@@ -379,7 +379,6 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
                 key=(prefix, "serialized", tuple(sorted(plans))),
                 requests=tuple(requests),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 

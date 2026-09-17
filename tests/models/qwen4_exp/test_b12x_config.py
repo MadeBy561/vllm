@@ -61,14 +61,18 @@ def test_qwen4_alias_uses_qwen4_text_config() -> None:
 
 @pytest.mark.parametrize(
     ("configured_dtype", "expected_dtype"),
-    [(None, "bfloat16"), ("bfloat16", "bfloat16"), ("float8_e4m3fn", "float8_e4m3fn")],
+    [
+        (None, "bfloat16"),
+        ("bfloat16", "bfloat16"),
+        ("float8_e4m3fn", "float8_e4m3fn"),
+        ("nvfp4", "nvfp4"),
+    ],
 )
+@pytest.mark.parametrize("config_cls", [Qwen3_8FlashNextTextConfig, Qwen4ExpTextConfig])
 def test_ple_embedding_storage_dtype_is_preserved(
-    configured_dtype: str | None, expected_dtype: str
+    configured_dtype: str | None, expected_dtype: str, config_cls
 ) -> None:
-    config = Qwen3_8FlashNextTextConfig(
-        **_TEXT_CONFIG, ple_embedding_dtype=configured_dtype
-    )
+    config = config_cls(**_TEXT_CONFIG, ple_embedding_dtype=configured_dtype)
 
     assert config.ple_embedding_dtype == expected_dtype
 
@@ -96,9 +100,15 @@ def test_model_registry_packages() -> None:
         "Qwen4ExpForConditionalGeneration",
     )
     assert _SPECULATIVE_DECODING_MODELS["Qwen3_8FlashNextMTP"] == (
-        "vllm.models.qwen3_8_flash_next",
-        "Qwen3_8FlashNextMTP",
+        "vllm.models.qwen4_exp",
+        "Qwen4ExpMTP",
     )
+    for registry, suffix in (
+        (_TEXT_GENERATION_MODELS, "ForCausalLM"),
+        (_MULTIMODAL_MODELS, "ForConditionalGeneration"),
+        (_SPECULATIVE_DECODING_MODELS, "MTP"),
+    ):
+        assert registry[f"Qwen3_8FlashNext{suffix}"] == registry[f"Qwen4Exp{suffix}"]
 
 
 @pytest.mark.parametrize(
@@ -151,12 +161,8 @@ def test_mtp_override_recognizes_outer_and_text_types(
 
     config = SpeculativeConfig.hf_config_override(config)
 
-    if architecture.startswith("Qwen4"):
-        assert config.model_type == "qwen4_exp_mtp"
-        assert config.architectures == ["Qwen4ExpMTP"]
-    else:
-        assert config.model_type == "qwen3_8_flash_next_mtp"
-        assert config.architectures == ["Qwen3_8FlashNextMTP"]
+    assert config.model_type == "qwen4_exp_mtp"
+    assert config.architectures == ["Qwen4ExpMTP"]
     assert config.n_predict == 2
     assert config.hc_mult == 4
 

@@ -298,7 +298,6 @@ class NgramHashState(nn.Module):
                 key=(id(self.layout), workload.max_tokens),
                 requests=requests,
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 
@@ -823,14 +822,12 @@ class Engram(nn.Module):
                 key=(id(self), workload.max_tokens),
                 requests=(request,),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
             B12xPreparationUnit(
                 name="EngramMix",
                 key=(id(self), workload.max_tokens),
                 requests=mix_requests,
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 

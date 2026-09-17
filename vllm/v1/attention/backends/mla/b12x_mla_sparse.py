@@ -1562,7 +1562,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 key=self._preparation_prefix(),
                 requests=tuple(requests),
                 stage="state",
-                autotune=not workload.eager_only,
             ),
         )
 

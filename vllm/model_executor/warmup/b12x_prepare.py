@@ -4,8 +4,9 @@
 
 The ``weights`` stage runs after model load and before memory profiling. It
 selects, compiles, and primes every plan that depends only on weights or
-communicators. The ``state`` stage runs after the KV and state pools exist and
-prepares the plans that depend on them. Both stages collect one unit per
+communicators. The ``state`` stage tunes against temporary pools before serving
+KV allocation. A final ``bind`` pass primes plans on the serving pools.
+Both stages collect one unit per
 layer from ``layer.b12x_preparation_provider.get_b12x_preparation_units`` and
 hand the units' requests to one ``PreparationSession`` per worker.
 """
@@ -253,16 +254,13 @@ def _units_from_modules(
                     f"{type(provider).__qualname__} returned a non-unit "
                     "preparation value"
                 )
-            if scoped.eager_only and unit.autotune:
-                unit = replace(unit, autotune=False)
             yield unit
 
 
 def mark_b12x_eager_shapes(worker: Worker) -> None:
     """Stamp multimodal encoder and connector modules with their profile rows.
 
-    Those rows come from the encoder budget, are executed eagerly, and are
-    never captured, so their plans are prepared with default configurations.
+    Those rows come from the encoder budget and are tuned for eager execution.
     """
     model = worker.get_model()
     mm_registry = getattr(worker.model_runner, "mm_registry", None)
@@ -476,11 +474,6 @@ def get_b12x_session(worker: Worker):
         device=worker.device,
         autotune=bool(config.kernel_config.enable_b12x_autotune),
         namespace=namespace,
-        # Compile workers are host processes that never touch CUDA, so the pool
-        # is sized against host cores rather than against the device. The count
-        # is per rank: a node runs this many compiler processes for each local
-        # rank it hosts.
-        compile_workers=16,
     )
     if session.autotune and os.environ.get("B12X_AUTOTUNE", "1") != "0":
         from vllm.distributed.parallel_state import get_tp_group
@@ -500,7 +493,7 @@ def begin_b12x_preparation(worker: Worker, *, stage: str):
 
     batches = []
     if b12x_native_supported(worker):
-        workload = b12x_workload(worker, stage=stage)
+        workload = b12x_workload(worker, stage="state" if stage == "bind" else stage)
         batches = b12x_batches(
             collect_b12x_units(worker, workload),
             autotune=(
@@ -509,6 +502,29 @@ def begin_b12x_preparation(worker: Worker, *, stage: str):
             ),
         )
     session = get_b12x_session(worker) if batches else None
+    if getattr(worker, "_b12x_tuning_cache", False):
+        worker._b12x_tuning_batch = B12xPreparedBatch(
+            session,
+            (
+                request.plan
+                for requests, _ in batches
+                for request in requests
+                if request.plan.prepared is None
+            ),
+        )
+    if session is not None:
+        budget_stage = stage
+        if stage == "state" and not getattr(worker, "_b12x_tuning_cache", False):
+            budget_stage = "bind"
+        compile_workers = os.environ.get(f"B12X_{budget_stage.upper()}_COMPILE_WORKERS")
+        session.configure_compile_workers(
+            None if compile_workers is None else int(compile_workers)
+        )
+        logger.info(
+            "b12x %s preparation uses %d compiler workers",
+            stage,
+            session.compile_workers,
+        )
     return B12xPreparationCoordinator(
         session,
         batches,
@@ -533,6 +549,56 @@ class B12xPreparedBatch:
         plans, self.plans = self.plans, ()
         for plan in reversed(plans):
             self.session.release(plan)
+
+
+def initialize_b12x_tuning_cache(worker: Worker, kv_cache_config) -> bool:
+    """Use final cache groups and layout with a small disposable block pool."""
+    if not b12x_native_supported(worker) or not worker.use_v2_model_runner:
+        return False
+    # HiSparse has a separate shared host-pool lifecycle.
+    if worker.vllm_config.attention_config.hisparse_config is not None:
+        return False
+    from vllm.v1.attention.backends.utils import record_kv_cache_layout
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+
+    cache = worker.cache_config
+    if kv_cache_config.kv_cache_layout is not None:
+        record_kv_cache_layout(cache, kv_cache_config.kv_cache_layout)
+    saved_override = cache.num_gpu_blocks_override
+    cache.num_gpu_blocks_override = min(
+        kv_cache_config.num_blocks,
+        max(32, 2 + 4 * worker.scheduler_config.max_num_seqs),
+    )
+    try:
+        temporary = get_kv_cache_config_from_groups(
+            worker.vllm_config, kv_cache_config.kv_cache_groups, available_memory=0
+        )
+    finally:
+        cache.num_gpu_blocks_override = saved_override
+    temporary.kv_cache_layout = kv_cache_config.kv_cache_layout
+    worker._b12x_tuning_cache = True
+    cache.num_gpu_blocks = temporary.num_blocks
+    worker.model_runner.initialize_kv_cache(temporary, is_profiling=True)
+    logger.info(
+        "b12x autotuning uses %d temporary KV blocks before allocating "
+        "%d serving blocks",
+        temporary.num_blocks,
+        kv_cache_config.num_blocks,
+    )
+    return True
+
+
+def release_b12x_tuning_cache(worker: Worker) -> None:
+    if not getattr(worker, "_b12x_tuning_cache", False):
+        return
+    from vllm.v1.worker.gpu.cudagraph_utils import _teardown_profiling_state
+
+    batch = getattr(worker, "_b12x_tuning_batch", None)
+    worker._b12x_tuning_batch = None
+    if batch is not None:
+        batch.release()
+    _teardown_profiling_state(cast("GPUModelRunner", worker.model_runner))
+    worker._b12x_tuning_cache = False
 
 
 def prepare_b12x_profile(worker: Worker, *, stage: str) -> B12xPreparedBatch:

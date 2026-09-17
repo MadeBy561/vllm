@@ -395,7 +395,7 @@ class Glm5NextPooledIndexer(nn.Module):
         self._main_cache_num_blocks = 0
 
     def make_b12x_physical_selection_prepare_call(
-        self, output: torch.Tensor, active_counts: torch.Tensor
+        self, output: torch.Tensor, active_counts: torch.Tensor, *, state=None
     ):
         """Prepare pool expansion with the bound cache's exact page geometry."""
         from b12x.preparation import PreparedCall
@@ -408,8 +408,12 @@ class Glm5NextPooledIndexer(nn.Module):
         table = torch.zeros(
             (1, self._parent_table_width), dtype=torch.int32, device=device
         )
+        expand = (
+            self._expand_pooled_topk_to_physical_slots if state is None else state.run
+        )
+        plan_kwargs = {"plan": self._physical_selection_plan} if state is None else {}
         return PreparedCall(
-            run=lambda: self._expand_pooled_topk_to_physical_slots(
+            run=lambda: expand(
                 pools,
                 positions,
                 requests,
@@ -420,6 +424,7 @@ class Glm5NextPooledIndexer(nn.Module):
                 block_size=self.block_size,
                 block_stride_rows=self.block_size,
                 num_cache_blocks=self._main_cache_num_blocks,
+                **plan_kwargs,
             ),
             owners=(pools, positions, requests, table, output, active_counts),
         )
@@ -437,11 +442,13 @@ class Glm5NextPooledIndexer(nn.Module):
             max_page_table_width=self._parent_table_width,
             num_cache_blocks=self._main_cache_num_blocks,
         )
+        self._physical_selection_plan = plan
 
         def prepare(state):
             return self.make_b12x_physical_selection_prepare_call(
                 torch.empty_like(self.topk_indices_buffer),
                 torch.empty_like(self._physical_active_counts),
+                state=state,
             )
 
         return plan.request(
@@ -711,6 +718,7 @@ class Glm5NextPooledIndexer(nn.Module):
                 block_size=self.block_size,
                 block_stride_rows=self.block_size,
                 num_cache_blocks=self._main_cache_num_blocks,
+                plan=self._physical_selection_plan,
             )
         else:
             expand_pool_ids(

@@ -712,7 +712,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 key=key,
                 requests=(request,),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 

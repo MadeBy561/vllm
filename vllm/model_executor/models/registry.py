@@ -112,8 +112,8 @@ _TEXT_GENERATION_MODELS = {
     "Gemma4ForCausalLM": ("gemma4", "Gemma4ForCausalLM"),
     "Qwen3NextForCausalLM": ("qwen3_next", "Qwen3NextForCausalLM"),
     "Qwen3_8FlashNextForCausalLM": (
-        "vllm.models.qwen3_8_flash_next",
-        "Qwen3_8FlashNextForCausalLM",
+        "vllm.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
     ),
     "Qwen4ExpForCausalLM": (
         "vllm.models.qwen4_exp",
@@ -604,8 +604,8 @@ _MULTIMODAL_MODELS = {
         "Qwen3_5MoeForConditionalGeneration",
     ),
     "Qwen3_8FlashNextForConditionalGeneration": (
-        "vllm.models.qwen3_8_flash_next",
-        "Qwen3_8FlashNextForConditionalGeneration",
+        "vllm.models.qwen4_exp",
+        "Qwen4ExpForConditionalGeneration",
     ),
     "Qwen4ExpForConditionalGeneration": (
         "vllm.models.qwen4_exp",
@@ -705,8 +705,8 @@ _SPECULATIVE_DECODING_MODELS = {
     "Qwen3NextMTP": ("qwen3_next_mtp", "Qwen3NextMTP"),
     "Qwen4ExpMTP": ("vllm.models.qwen4_exp", "Qwen4ExpMTP"),
     "Qwen3_8FlashNextMTP": (
-        "vllm.models.qwen3_8_flash_next",
-        "Qwen3_8FlashNextMTP",
+        "vllm.models.qwen4_exp",
+        "Qwen4ExpMTP",
     ),
     "Step3p5MTP": ("step3p5_mtp", "Step3p5MTP"),
     "Qwen3_5MTP": ("qwen3_5_mtp", "Qwen3_5MTP"),

@@ -555,7 +555,6 @@ class B12xC4SparseIndexer(nn.Module):
                 key=(self._preparation_prefix, width, tuple(capacities.items())),
                 requests=tuple(requests),
                 stage="state",
-                autotune=not workload.eager_only,
             ),
         )
 

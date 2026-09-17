@@ -406,7 +406,6 @@ class B12xMHCResidual:
                 key=(id(layer), self.hidden_size, key),
                 requests=tuple(requests),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 
@@ -924,7 +923,6 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                 key=self.prefix,
                 requests=requests,
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 
@@ -1073,7 +1071,6 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                 key=(self.prefix, key),
                 requests=tuple(requests),
                 stage="state",
-                autotune=not workload.eager_only,
             ),
         )
 

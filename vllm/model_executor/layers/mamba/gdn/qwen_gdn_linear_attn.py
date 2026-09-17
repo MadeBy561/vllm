@@ -88,7 +88,10 @@ from vllm.v1.worker.workspace import (
 )
 
 if TYPE_CHECKING:
-    from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import B12xGdnPrefill
+    from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import (
+        B12xGdnPrefill,
+        GdnPrefillStaging,
+    )
 
 
 @dataclass(frozen=True)
@@ -308,7 +311,12 @@ def _resolve_gdn_backend_selection(
     if (
         prefill == "auto"
         and decode is None
-        and getattr(text_config, "model_type", None) == "qwen3_8_flash_next_text"
+        and getattr(text_config, "model_type", None)
+        in {"qwen3_8_flash_next_text", "qwen4_exp_text"}
+        and (
+            vllm_config.kernel_config.linear_backend == "b12x"
+            or vllm_config.kernel_config.moe_backend == "b12x"
+        )
     ):
         return "b12x", "b12x", False
     return prefill, decode or "cuda", explicitly_configured
@@ -801,7 +809,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_decode_plan = None
         self._b12x_decode_staging: _B12xGdnDecodeStaging | None = None
         self._b12x_prefill_plans: dict[int, object] = {}
-        self._b12x_prefill_staging = None
+        self._b12x_prefill_staging: GdnPrefillStaging | None = None
         self._b12x_prefill = None
         if self.gdn_decode_kernel == "b12x":
             self._initialize_b12x_gdn_decode(vllm_config)
@@ -1003,16 +1011,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     key=(self._b12x_preparation_prefix, "gdn-decode"),
                     requests=(request,),
                     stage="state",
-                    autotune=not workload.eager_only,
                 )
             )
         for capacity, plan in self._b12x_prefill_plans.items():
             request = plan.request(
                 name=f"{self._b12x_preparation_prefix}.gdn.prefill.{capacity}",
-                prepare_call=lambda state,
-                capacity=capacity: self._prepare_b12x_gdn_prefill(state, capacity),
-                benchmark_call=lambda state,
-                capacity=capacity: self._benchmark_b12x_gdn_prefill(state, capacity),
+                prepare_call=lambda state, capacity=capacity: (
+                    self._prepare_b12x_gdn_prefill(state, capacity)
+                ),
+                benchmark_call=lambda state, capacity=capacity: (
+                    self._benchmark_b12x_gdn_prefill(state, capacity)
+                ),
             )
             units.append(
                 B12xPreparationUnit(
@@ -1020,7 +1029,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     key=(self._b12x_preparation_prefix, "gdn-prefill", capacity),
                     requests=(request,),
                     stage="state",
-                    autotune=not workload.eager_only,
                 )
             )
         return tuple(units)
@@ -1140,6 +1148,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _b12x_gdn_prefill_call(self, state, capacity: int, *, benchmark: bool):
         from b12x.preparation import PreparedCall
 
+        owners: tuple[torch.Tensor, ...]
         specs = tuple(state.layout.scratch_specs())
         if len(specs) != 1:
             raise RuntimeError("b12x GDN prefill requires one scratch buffer")

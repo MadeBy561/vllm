@@ -194,7 +194,6 @@ class B12xEmbeddingMethod(UnquantizedEmbeddingMethod):
                 key=(id(layer), workload.max_tokens),
                 requests=tuple(requests),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 
@@ -284,7 +283,6 @@ class B12xLinearMethod(UnquantizedLinearMethod):
                 key=(id(layer), capacities),
                 requests=tuple(requests),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 
@@ -414,7 +412,6 @@ class B12xFP8LinearMethod(LinearMethodBase):
                 key=(id(layer), layer.b12x_capacities),
                 requests=requests,
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 
@@ -529,7 +526,6 @@ class B12xRMSNorm(nn.Module):
                         prepare_call=prepare,
                     ),
                 ),
-                autotune=not workload.eager_only,
             ),
         )
 
@@ -822,7 +818,6 @@ class B12xMHC(nn.Module):
                 key=(id(layer), self.hidden_size, key),
                 requests=(*requests, *collapse_requests),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 

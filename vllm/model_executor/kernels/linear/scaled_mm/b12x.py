@@ -279,7 +279,6 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
                 key=(prefix, workload.token_counts),
                 requests=tuple(requests),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 
@@ -535,7 +534,6 @@ class B12xTensorFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
                 key=(prefix, workload.token_counts),
                 requests=tuple(requests),
                 stage="weights",
-                autotune=not workload.eager_only,
             ),
         )
 

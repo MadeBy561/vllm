@@ -177,7 +177,49 @@ def test_batches_group_timed_requests_before_default_only() -> None:
     assert b12x_prepare.b12x_batches([]) == []
 
 
-def test_collect_units_filters_by_stage_and_forces_eager_defaults() -> None:
+@pytest.mark.parametrize("layout", ["BLHNC", "LBHNC"])
+def test_tuning_pool_preserves_final_group_layout_with_less_storage(
+    monkeypatch, layout
+):
+    from vllm.config import CacheConfig
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+    cache = CacheConfig(num_gpu_blocks_override=1024)
+    cache.kv_cache_layout = layout
+    config = SimpleNamespace(
+        cache_config=cache, attention_config=SimpleNamespace(hisparse_config=None)
+    )
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
+    )
+    groups = [KVCacheGroupSpec(layer_names=["a", "b"], kv_cache_spec=spec)]
+    final = get_kv_cache_config_from_groups(config, groups, available_memory=0)
+    final.kv_cache_layout = layout
+    initialized = []
+    worker = SimpleNamespace(
+        use_v2_model_runner=True,
+        vllm_config=config,
+        cache_config=cache,
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        model_runner=SimpleNamespace(
+            initialize_kv_cache=lambda c, **kw: initialized.append((c, kw))
+        ),
+    )
+    monkeypatch.setattr(b12x_prepare, "b12x_native_supported", lambda _: True)
+    assert b12x_prepare.initialize_b12x_tuning_cache(worker, final)
+    temporary, options = initialized.pop()
+    assert options == {"is_profiling": True}
+    assert temporary.kv_cache_groups == final.kv_cache_groups
+    assert temporary.num_blocks == 32
+    assert cache.num_gpu_blocks_override == 1024
+    assert temporary.kv_cache_layout == final.kv_cache_layout
+    for before, after in zip(final.kv_cache_tensors, temporary.kv_cache_tensors):
+        assert after.size * 32 == before.size
+        assert after.block_stride == before.block_stride
+
+
+def test_collect_units_filters_by_stage_and_tunes_eager_shapes() -> None:
     record: list[tuple] = []
     weights, state, tower = torch.nn.Module(), torch.nn.Module(), torch.nn.Module()
     weights.b12x_preparation_provider = _Provider("weights", record=record)
@@ -192,7 +234,7 @@ def test_collect_units_filters_by_stage_and_forces_eager_defaults() -> None:
     units = b12x_prepare.collect_b12x_units(worker, _workload("weights"))
     names = {unit.requests[0].name: unit for unit in units}
     assert set(names) == {f"{id(weights):x}", f"{id(tower):x}"}
-    assert names[f"{id(tower):x}"].autotune is False
+    assert names[f"{id(tower):x}"].autotune is True
     seen = {id(layer): workload for layer, workload in record}
     assert seen[id(tower)].token_counts == (65_536,)
     assert seen[id(tower)].fixed_token_counts == ()
@@ -387,7 +429,7 @@ def test_blockscaled_holder_declares_provided_workspace_under_the_cap(
         ),
         name="x",
     )
-    assert eager.autotune is False and regimes[-1] == ()
+    assert eager.autotune is True and regimes[-1] == ()
 
 
 @pytest.mark.parametrize("fail", [False, True])

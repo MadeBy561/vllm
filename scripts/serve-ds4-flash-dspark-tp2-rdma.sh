@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_ROOT="${VLLM_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 B12X_ROOT="${B12X_ROOT:-/home/luke/projects/b12x}"
+B12X_COMPILE_CACHE_DIR="${B12X_COMPILE_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/b12x/compile/vllm-tp2}"
 SPARK_ROOT="${SPARK_ROOT:-/home/luke/projects/spark-vllm-docker}"
 CLUSTER_LAUNCHER="${CLUSTER_LAUNCHER:-${SPARK_ROOT}/launch-cluster.sh}"
 HEAD_IP="${HEAD_IP:-192.168.42.223}"
@@ -124,7 +125,8 @@ case "${DSPARK_DRAFT_ATTENTION_BACKEND}" in
 esac
 
 snapshot="${HF_CACHE}/hub/models--${MODEL_ID//\//--}/snapshots/${MODEL_REVISION}"
-for path in "${VLLM_ROOT}" "${B12X_ROOT}" "${HF_CACHE}" "${CLUSTER_LAUNCHER}"; do
+for path in "${VLLM_ROOT}" "${B12X_ROOT}" "${B12X_COMPILE_CACHE_DIR}" \
+    "${HF_CACHE}" "${CLUSTER_LAUNCHER}"; do
   if [[ "${path}" == *[[:space:]]* ]]; then
     echo "Spark bind-mount paths cannot contain whitespace: ${path}" >&2
     exit 2
@@ -233,8 +235,13 @@ if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" \
   exit 1
 fi
 
+mkdir -p -- "${B12X_COMPILE_CACHE_DIR}"
+printf -v remote_cache_dir '%q' "${B12X_COMPILE_CACHE_DIR}"
+ssh "${ssh_opts[@]}" "${WORKER_IP}" "mkdir -p -- ${remote_cache_dir}"
+
 mount_args="-v ${VLLM_ROOT}:${VLLM_ROOT}"
 mount_args+=" -v ${B12X_ROOT}:${B12X_ROOT}"
+mount_args+=" -v ${B12X_COMPILE_CACHE_DIR}:${B12X_COMPILE_CACHE_DIR}"
 mount_args+=" -v ${HF_CACHE}:${HF_CACHE}:ro"
 if [[ -n "${VLLM_SPARK_EXTRA_DOCKER_ARGS:-}" ]]; then
   mount_args+=" ${VLLM_SPARK_EXTRA_DOCKER_ARGS}"
@@ -260,6 +267,10 @@ cluster_args=(
   --env "TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas"
   --env "CUDA_VISIBLE_DEVICES=0"
   --env "CUTE_DSL_ARCH=sm_121a"
+  --env "B12X_COMPILE_CACHE_DIR=${B12X_COMPILE_CACHE_DIR}"
+  --env "B12X_WEIGHTS_COMPILE_WORKERS=${B12X_WEIGHTS_COMPILE_WORKERS:-${B12X_COMPILE_WORKERS:-16}}"
+  --env "B12X_STATE_COMPILE_WORKERS=${B12X_STATE_COMPILE_WORKERS:-${B12X_COMPILE_WORKERS:-16}}"
+  --env "B12X_BIND_COMPILE_WORKERS=${B12X_BIND_COMPILE_WORKERS:-${B12X_COMPILE_WORKERS:-4}}"
   --env "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
   --env "SAFETENSORS_FAST_GPU=1"
   --env "OMP_NUM_THREADS=16"
@@ -267,7 +278,7 @@ cluster_args=(
   --env "HF_HOME=${HF_CACHE}"
   --env "HF_HUB_OFFLINE=1"
   --env "TRANSFORMERS_OFFLINE=1"
-  --env "VLLM_PLUGINS=${VLLM_PLUGINS:-}"
+  --env "VLLM_PLUGINS=${VLLM_PLUGINS:-b12x_loader}"
   --env "DG_JIT_USE_NVRTC=0"
   --env "USE_CUDNN=1"
   --env "VLLM_ALLOW_LONG_MAX_MODEL_LEN=1"
@@ -350,7 +361,7 @@ vllm_command=(
   --decode-context-parallel-size 1
   --kv-cache-dtype fp8
   --block-size 256
-  --load-format fastsafetensors
+  --load-format b12x
   --moe-backend b12x
   --linear-backend b12x
   --attention-backend B12X

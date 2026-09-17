@@ -934,9 +934,15 @@ def test_deepseek_c4_default_page_table_width_is_unchanged() -> None:
     assert indexer._max_page_table_width == 4096
 
 
-def test_glm53_physical_selection_prepares_before_resolution_freeze() -> None:
+@pytest.mark.parametrize("autotune", [False, True])
+def test_glm53_physical_selection_prepares_before_resolution_freeze(
+    autotune: bool, monkeypatch
+) -> None:
     from b12x._lib.runtime_control import kernel_resolution_guard
-    from b12x.attention.sparse_mla import expand_pooled_topk_to_physical_slots
+    from b12x.attention.sparse_mla import (
+        expand_pooled_topk_to_physical_slots,
+        pooled_selection,
+    )
     from b12x.preparation import PreparationSession
 
     device = _require_glm_gpu()
@@ -953,11 +959,20 @@ def test_glm53_physical_selection_prepares_before_resolution_freeze() -> None:
     indexer.topk_indices_buffer = output
     indexer._physical_active_counts = counts
     request = indexer.get_b12x_physical_selection_preparation_request()
-    session = PreparationSession(device=device, autotune=False, compile_workers=0)
+    session = PreparationSession(device=device, autotune=autotune, compile_workers=0)
     session.prepare((request,))
     assert request.plan.prepared is not None
+
+    def unexpected_resolution(*args, **kwargs):
+        pytest.fail("pooled selection resolved a kernel after preparation")
+
+    monkeypatch.setattr(
+        pooled_selection._expand_pooled_topk_to_physical_slots_kernel,
+        "run",
+        unexpected_resolution,
+    )
     with kernel_resolution_guard("prepared physical-selection replay"):
-        for rows in (1, 4, 32):
+        for rows in (0, 1, 4, 32):
             call = indexer.make_b12x_physical_selection_prepare_call(
                 output[:rows], counts[:rows]
             )
@@ -965,6 +980,15 @@ def test_glm53_physical_selection_prepares_before_resolution_freeze() -> None:
             assert torch.all(output[:rows, 0] == 0)
             assert torch.all(output[:rows, 1:] == -1)
             assert torch.all(counts[:rows] == 1)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call.run()
+        output.fill_(37)
+        counts.fill_(37)
+        graph.replay()
+        assert torch.all(output[:, 0] == 0)
+        assert torch.all(output[:, 1:] == -1)
+        assert torch.all(counts == 1)
 
 
 def test_glm53_selector_capacity_tracks_auto_fit_max_model_len() -> None:

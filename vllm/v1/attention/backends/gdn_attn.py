@@ -163,7 +163,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         model_type = getattr(vllm_config.model_config.hf_text_config, "model_type", "")
-        if model_type == "qwen3_8_flash_next_text":
+        if model_type in {"qwen3_8_flash_next_text", "qwen4_exp_text"}:
             _, prefill = _resolve_gdn_prefill_backend(vllm_config)
             decode, _ = _resolve_gdn_decode_kernel(vllm_config)
             if prefill == decode == "b12x":

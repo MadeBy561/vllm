@@ -14,18 +14,18 @@ from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader import weight_utils
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.registry import ModelRegistry
-from vllm.models.qwen3_8_flash_next.model import (
+from vllm.models.qwen4_exp.nvidia.model import (
     _remap_qsa_cache_scale_name,
 )
-from vllm.models.qwen3_8_flash_next.mtp import (
-    Qwen3_8FlashNextMTP,
-    Qwen3_8FlashNextMultiTokenPredictor,
+from vllm.models.qwen4_exp.nvidia.mtp import (
+    Qwen4ExpMTP,
+    Qwen4ExpMultiTokenPredictor,
     _remap_mtp_quantized_layers,
     _remap_mtp_weight_name,
 )
-from vllm.models.qwen3_8_flash_next.ple_layer import (
-    Qwen3_8FlashNextNGramEmbedding,
-    Qwen3_8FlashNextPLELayer,
+from vllm.models.qwen4_exp.nvidia.ple_layer import (
+    B12xNGramEmbedding,
+    Qwen4ExpPLELayer,
 )
 
 
@@ -54,9 +54,9 @@ def test_mtp_checkpoint_prefix_mapping(
     model_name: str | None,
 ) -> None:
     assert _remap_mtp_weight_name(checkpoint_name) == model_name
-    assert checkpoint_name.startswith(
-        Qwen3_8FlashNextMTP.checkpoint_weight_name_prefixes
-    ) == (model_name is not None)
+    assert checkpoint_name.startswith(Qwen4ExpMTP.checkpoint_weight_name_prefixes) == (
+        model_name is not None
+    )
 
 
 @pytest.mark.parametrize(
@@ -105,7 +105,7 @@ def test_mtp_loading_skips_target_shards_and_weights(
 
     monkeypatch.setattr(weight_utils, "safe_open", record_open)
     loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
-    prefixes = Qwen3_8FlashNextMTP.checkpoint_weight_name_prefixes
+    prefixes = Qwen4ExpMTP.checkpoint_weight_name_prefixes
     loaded = dict(
         loader.get_all_weights(
             SimpleNamespace(model=str(tmp_path), revision=None),
@@ -142,10 +142,8 @@ def test_mtp_quantized_layers_use_runtime_module_index() -> None:
 
 
 class _PLELoaderAudit(nn.Module):
-    load_weights = Qwen3_8FlashNextNGramEmbedding.load_weights
-    _validate_embedding_loaded = (
-        Qwen3_8FlashNextNGramEmbedding._validate_embedding_loaded
-    )
+    load_weights = B12xNGramEmbedding.load_weights
+    _validate_embedding_loaded = B12xNGramEmbedding._validate_embedding_loaded
 
     def __init__(self, quant_mode: str) -> None:
         super().__init__()
@@ -390,7 +388,7 @@ def test_nvfp4_ple_loader_keeps_local_table_packed() -> None:
 
 
 def test_ple_embedding_uses_query_offsets_for_live_token_count() -> None:
-    embedding = Qwen3_8FlashNextNGramEmbedding.__new__(Qwen3_8FlashNextNGramEmbedding)
+    embedding = B12xNGramEmbedding.__new__(B12xNGramEmbedding)
     nn.Module.__init__(embedding)
     embedding.max_total_tokens = 8
     embedding.max_num_reqs = 4
@@ -414,9 +412,9 @@ def test_ple_embedding_uses_query_offsets_for_live_token_count() -> None:
 
 
 def test_ple_mixed_op_uses_query_offsets_for_live_token_count() -> None:
-    from vllm.models.qwen3_8_flash_next.ple_attn import PLEGraphInputs
+    from vllm.models.qwen4_exp.nvidia.ple_attn import PLEGraphInputs
 
-    layer = Qwen3_8FlashNextPLELayer.__new__(Qwen3_8FlashNextPLELayer)
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(layer)
     layer.max_tokens = 8
     layer.max_seqs = 4
@@ -502,7 +500,7 @@ def _final_parameter_name(checkpoint_name: str) -> str:
     if not outer_name.startswith("model."):
         return outer_name
     inner_name = outer_name.removeprefix("model.")
-    mapped = Qwen3_8FlashNextMultiTokenPredictor.hf_to_vllm_mapper._map_name_with_shard(
+    mapped = Qwen4ExpMultiTokenPredictor.hf_to_vllm_mapper._map_name_with_shard(
         inner_name
     )
     assert mapped is not None
@@ -533,18 +531,19 @@ def _register_parameter(
 
 
 class _LoaderAuditPredictor(nn.Module):
-    hf_to_vllm_mapper = Qwen3_8FlashNextMultiTokenPredictor.hf_to_vllm_mapper
-    load_weights = Qwen3_8FlashNextMultiTokenPredictor.load_weights
+    hf_to_vllm_mapper = Qwen4ExpMultiTokenPredictor.hf_to_vllm_mapper
+    load_weights = Qwen4ExpMultiTokenPredictor.load_weights
 
     def __init__(self) -> None:
         super().__init__()
         self.config = SimpleNamespace(num_experts=512)
+        self.is_fused_shared_expert_enabled = False
         self.num_mtp_layers = 1
         self.mtp_start_layer_idx = 48
 
 
 class _LoaderAuditMTP(nn.Module):
-    load_weights = Qwen3_8FlashNextMTP.load_weights
+    load_weights = Qwen4ExpMTP.load_weights
 
     def __init__(self, parameter_names: set[str], loaded_ids: list[int]) -> None:
         super().__init__()
@@ -578,14 +577,14 @@ def test_native_mtp_tensor_corpus_routes_through_auto_weights_loader() -> None:
 @pytest.mark.parametrize(
     "architecture",
     [
-        "Qwen3_8FlashNextForCausalLM",
-        "Qwen3_8FlashNextForConditionalGeneration",
-        "Qwen3_8FlashNextMTP",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpMTP",
     ],
 )
 def test_lazy_package_exports_match_registry(architecture: str) -> None:
     registered_cls = ModelRegistry.models[architecture].load_model_cls()
 
     assert registered_cls.__name__ == architecture
-    assert registered_cls.__module__.startswith("vllm.models.qwen3_8_flash_next.")
+    assert registered_cls.__module__.startswith("vllm.models.qwen4_exp.")
     assert ModelRegistry.models[architecture].inspect_model_cls() is not None

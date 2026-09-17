@@ -778,7 +778,6 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
                 key=(id(layer), page_size),
                 requests=tuple(requests),
                 stage="state",
-                autotune=not workload.eager_only,
             ),
         )
 

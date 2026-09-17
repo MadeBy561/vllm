@@ -114,7 +114,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
-export VLLM_PLUGINS="${VLLM_PLUGINS:-}"
+export VLLM_PLUGINS="${VLLM_PLUGINS:-b12x_loader}"
 export VLLM_SSM_CONV_STATE_LAYOUT="${VLLM_SSM_CONV_STATE_LAYOUT:-DS}"
 export VLLM_USE_AOT_COMPILE="${VLLM_USE_AOT_COMPILE:-1}"
 export VLLM_USE_MEGA_AOT_ARTIFACT="${VLLM_USE_MEGA_AOT_ARTIFACT:-1}"
@@ -180,8 +180,7 @@ command=(
   --kv-cache-dtype fp8
   --quantization modelopt_mixed
   --block-size 16
-  --load-format safetensors
-  --safetensors-load-strategy lazy
+  --load-format b12x
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}"
   --max-model-len "${MAX_MODEL_LEN}"
   --max-num-seqs "${MAX_NUM_SEQS}"

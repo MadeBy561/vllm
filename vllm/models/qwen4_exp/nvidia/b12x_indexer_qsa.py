@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Replicated QSA index projection for Qwen3.8-Flash-Next."""
+"""Replicated QSA index projection for Qwen4Exp."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
-from ..config import Qwen3_8FlashNextTextConfig
+from ..config import Qwen4ExpTextConfig
 
 
 class QSAIndexer(nn.Module):
@@ -28,7 +28,7 @@ class QSAIndexer(nn.Module):
         self,
         *,
         vllm_config: VllmConfig,
-        config: Qwen3_8FlashNextTextConfig,
+        config: Qwen4ExpTextConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:

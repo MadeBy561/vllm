@@ -42,7 +42,7 @@ class B12xWorkload:
     ``stage`` selects the lifecycle point: ``weights`` runs after model load
     and before memory profiling; ``state`` runs after the KV and state pools
     exist. ``eager_only`` marks multimodal-encoder shapes that are executed
-    eagerly, never captured, and prepared with their default configuration.
+    eagerly and never captured.
     """
 
     stage: Literal["weights", "state"]

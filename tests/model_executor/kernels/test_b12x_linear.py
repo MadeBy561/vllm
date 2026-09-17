@@ -501,6 +501,33 @@ def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
     assert layer.weight_scale.weight_loader is scale_loader
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_b12x_mxfp8_dequantizes_before_serving_plan_preparation(out_dtype) -> None:
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        get_and_maybe_dequant_weights,
+    )
+
+    layer = torch.nn.Module()
+    layer.prefix = "test.dequant.kv_b_proj"
+    values = torch.arange(8 * 96, device="cuda").reshape(8, 96).remainder(31)
+    values = (values - 15).to(torch.float8_e4m3fn)
+    scales = torch.arange(24, device="cuda").reshape(8, 3).remainder(5)
+    scales = (scales + 124).to(torch.uint8)
+    layer.weight = torch.nn.Parameter(values, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+    kernel = object.__new__(B12xMxfp8LinearKernel)
+    kernel.process_weights_after_loading(layer)
+
+    assert layer.weight.numel() == 0 and layer.b12x_linear.plan is None
+    actual = get_and_maybe_dequant_weights(layer, out_dtype=out_dtype)
+    expected = values.float() * torch.exp2(scales.float() - 127).repeat_interleave(
+        32, dim=1
+    )
+    torch.testing.assert_close(actual, expected.to(out_dtype), rtol=0, atol=0)
+    assert layer.b12x_linear.plan is None
+
+
 def test_b12x_mxfp8_reload_reuses_packed_tensor_addresses(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear.mxfp8.b12x as b12x_mod
 

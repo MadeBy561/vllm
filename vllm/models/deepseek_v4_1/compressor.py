@@ -320,7 +320,6 @@ class DeepseekCompressor(nn.Module):
             key=(self.prefix, capacities),
             requests=tuple(requests),
             stage="weights",
-            autotune=not workload.eager_only,
         )
 
     def _project(self, hidden_states):
@@ -398,7 +397,6 @@ class DeepseekCompressor(nn.Module):
                 key=(self.prefix, self.compress_ratio, self.capacity, self.requests),
                 requests=(request,),
                 stage="state",
-                autotune=not workload.eager_only,
             ),
         )
 

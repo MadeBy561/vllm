@@ -8,22 +8,22 @@ from typing import Any
 import pytest
 import torch
 
-import vllm.models.qwen3_8_flash_next.nvidia.qsa as qsa_module
-from vllm.models.qwen3_8_flash_next.common import qsa_cache as qsa_cache_module
-from vllm.models.qwen3_8_flash_next.common.qsa_cache import (
+import vllm.models.qwen4_exp.nvidia.b12x_qsa as qsa_module
+from vllm.models.qwen4_exp.common import b12x_qsa_cache as qsa_cache_module
+from vllm.models.qwen4_exp.common.b12x_qsa_cache import (
     qsa_compressed_cache_view,
     qsa_compressed_slot_mapping,
     qsa_logical_positions,
     qsa_raw_slot_mapping,
 )
-from vllm.models.qwen3_8_flash_next.model_state import Qwen3_8FlashNextModelState
-from vllm.models.qwen3_8_flash_next.nvidia.qsa import (
-    Qwen3_8FlashNextQSAAttention,
-    Qwen3_8FlashNextQSABackend,
-    Qwen3_8FlashNextQSAImpl,
-    Qwen3_8FlashNextQSAMetadata,
-    Qwen3_8FlashNextQSAMetadataBuilder,
+from vllm.models.qwen4_exp.nvidia.b12x_qsa import (
+    Qwen4ExpQSAAttention,
+    Qwen4ExpQSABackend,
+    Qwen4ExpQSAImpl,
+    Qwen4ExpQSAMetadata,
+    Qwen4ExpQSAMetadataBuilder,
 )
+from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -52,7 +52,7 @@ def test_qsa_backend_platform_probe_uses_b12x_selector_geometry(
         dtype=torch.bfloat16,
     )
 
-    packed = Qwen3_8FlashNextQSABackend.customize_spec(probe)
+    packed = Qwen4ExpQSABackend.customize_spec(probe)
     fp8_probe = FullAttentionSpec(
         block_size=1,
         num_kv_heads=2,
@@ -60,7 +60,7 @@ def test_qsa_backend_platform_probe_uses_b12x_selector_geometry(
         head_size_v=256,
         dtype=torch.uint8,
     )
-    fp8_packed = Qwen3_8FlashNextQSABackend.customize_spec(fp8_probe)
+    fp8_packed = Qwen4ExpQSABackend.customize_spec(fp8_probe)
 
     assert packed.unpadded_page_size_bytes == 2048
     assert packed.page_size_padded == 2128
@@ -91,12 +91,12 @@ def test_qsa_backend_platform_probe_uses_b12x_selector_geometry(
 
 
 def test_qsa_backend_selects_the_manager_block_without_dense_page_limits() -> None:
-    assert select_common_block_size(384, [Qwen3_8FlashNextQSABackend]) == 384
-    assert select_common_block_size(512, [Qwen3_8FlashNextQSABackend]) == 512
-    assert Qwen3_8FlashNextQSABackend.supports_block_size(384)
-    assert Qwen3_8FlashNextQSABackend.supports_block_size(512)
-    assert not Qwen3_8FlashNextQSABackend.supports_block_size(12)
-    assert Qwen3_8FlashNextQSABackend.get_preferred_block_size(70) == 72
+    assert select_common_block_size(384, [Qwen4ExpQSABackend]) == 384
+    assert select_common_block_size(512, [Qwen4ExpQSABackend]) == 512
+    assert Qwen4ExpQSABackend.supports_block_size(384)
+    assert Qwen4ExpQSABackend.supports_block_size(512)
+    assert not Qwen4ExpQSABackend.supports_block_size(12)
+    assert Qwen4ExpQSABackend.get_preferred_block_size(70) == 72
 
 
 def test_qsa_selector_tail_is_zero_copy_in_block_outer_layer_pages() -> None:
@@ -173,7 +173,7 @@ def test_qsa_selector_tail_remains_bf16_with_fp8_main_cache() -> None:
 
 
 def test_qsa_main_cache_views_reinterpret_fp8_storage() -> None:
-    impl = Qwen3_8FlashNextQSAImpl.__new__(Qwen3_8FlashNextQSAImpl)
+    impl = Qwen4ExpQSAImpl.__new__(Qwen4ExpQSAImpl)
     impl.num_kv_heads = 1
     impl.head_size = 256
     impl.kv_cache_dtype = "fp8"
@@ -219,9 +219,9 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
         )
         return backing, cache
 
-    owner = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
+    owner = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
     torch.nn.Module.__init__(owner)
-    impl = Qwen3_8FlashNextQSAImpl.__new__(Qwen3_8FlashNextQSAImpl)
+    impl = Qwen4ExpQSAImpl.__new__(Qwen4ExpQSAImpl)
     impl.num_kv_heads, impl.head_size, impl.kv_cache_dtype = 1, 256, "fp8"
     owner.impl = impl
     owner.max_tokens, owner.max_seqs, owner.max_seq_len = 32, 2, maximum
@@ -468,13 +468,13 @@ def test_qsa_selector_fork_requires_one_full_graph(
     eligible,
 ) -> None:
     """A selector fork must not escape a piecewise graph before its join."""
-    layer = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
+    layer = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
     torch.nn.Module.__init__(layer)
     layer.overlap_input_projections = True
     layer.max_decode_rows = 16
     layer.max_speculative_tokens = 3
     layer.layer_name = "qsa"
-    metadata = Qwen3_8FlashNextQSAMetadata.__new__(Qwen3_8FlashNextQSAMetadata)
+    metadata = Qwen4ExpQSAMetadata.__new__(Qwen4ExpQSAMetadata)
     metadata.num_actual_tokens = 4
     metadata.max_query_len = query_len
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
@@ -555,7 +555,7 @@ def test_qsa_run_consumes_projection_views_and_writes_live_output(monkeypatch) -
         kv_cache=None,
     )
     monkeypatch.setattr(qsa_module, "get_b12x_qsa", lambda: SimpleNamespace(run=run))
-    Qwen3_8FlashNextQSAAttention._run_b12x_qsa(
+    Qwen4ExpQSAAttention._run_b12x_qsa(
         owner,
         metadata=SimpleNamespace(max_seq_len=rows, slot_mapping=positions),
         positions=positions,
@@ -573,7 +573,7 @@ def test_qsa_run_consumes_projection_views_and_writes_live_output(monkeypatch) -
 
 
 def test_qsa_selects_the_smallest_sufficient_prefill_context_plan() -> None:
-    owner = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
+    owner = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
     owner.max_decode_rows = 6
     owner.max_seq_len = 63
     binding_32 = object()
@@ -600,7 +600,7 @@ def test_qsa_selects_the_smallest_sufficient_prefill_context_plan() -> None:
 
 def test_qsa_prefill_dispatches_through_the_b12x_transaction(monkeypatch) -> None:
     rows = 8
-    metadata = Qwen3_8FlashNextQSAMetadata(
+    metadata = Qwen4ExpQSAMetadata(
         num_actual_tokens=rows,
         max_query_len=rows,
         query_start_loc=torch.tensor([0, rows], dtype=torch.int32),
@@ -610,7 +610,7 @@ def test_qsa_prefill_dispatches_through_the_b12x_transaction(monkeypatch) -> Non
         slot_mapping=torch.arange(rows, dtype=torch.int64),
         is_prefilling=torch.ones(1, dtype=torch.bool),
     )
-    owner = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
+    owner = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
     torch.nn.Module.__init__(owner)
     owner.layer_name = "model.layers.0.attn"
     owner.kv_cache = torch.ones(1)
@@ -681,8 +681,8 @@ def test_qsa_compressed_slot_mapping_keeps_pool_offsets_in_int64() -> None:
     assert int(slots[0]) > torch.iinfo(torch.int32).max
 
 
-def _bare_qwen_model_state_for_draft_metadata() -> Qwen3_8FlashNextModelState:
-    state = Qwen3_8FlashNextModelState.__new__(Qwen3_8FlashNextModelState)
+def _bare_qwen_model_state_for_draft_metadata() -> Qwen4ExpModelState:
+    state = Qwen4ExpModelState.__new__(Qwen4ExpModelState)
     state.max_num_reqs = 8
     state.uses_qsa = True
     state.qsa_state_slot_ids = torch.arange(8, dtype=torch.int32)
@@ -744,7 +744,7 @@ def test_qsa_postprocess_commits_acceptance_before_mamba_alignment_reset() -> No
         ) -> None:
             num_accepted_tokens_gpu.fill_(1)
 
-    state = Qwen3_8FlashNextModelState.__new__(Qwen3_8FlashNextModelState)
+    state = Qwen4ExpModelState.__new__(Qwen4ExpModelState)
     state.uses_qsa = True
     state.qsa_committed_num_accepted_tokens_gpu = torch.full(
         (5,), 9, dtype=torch.int32, device="cuda"
@@ -903,10 +903,8 @@ def test_qsa_mtp_metadata_preserves_previous_acceptance_until_first_lookahead() 
     state.qsa_committed_num_accepted_tokens_gpu[7] = 4
     idx_mapping = torch.tensor([7, 3, -1, -1], dtype=torch.int32)
 
-    def make_builder() -> Qwen3_8FlashNextQSAMetadataBuilder:
-        builder = Qwen3_8FlashNextQSAMetadataBuilder.__new__(
-            Qwen3_8FlashNextQSAMetadataBuilder
-        )
+    def make_builder() -> Qwen4ExpQSAMetadataBuilder:
+        builder = Qwen4ExpQSAMetadataBuilder.__new__(Qwen4ExpQSAMetadataBuilder)
         builder._request_ids = torch.empty(4, dtype=torch.int32)
         builder.max_speculative_tokens = 4
         builder._capture_state_slot_ids = torch.arange(4, dtype=torch.int32)
@@ -1004,9 +1002,7 @@ def test_qsa_mtp_metadata_preserves_previous_acceptance_until_first_lookahead() 
 
 
 def test_qsa_builder_stages_runtime_state_in_capture_buffers() -> None:
-    builder = Qwen3_8FlashNextQSAMetadataBuilder.__new__(
-        Qwen3_8FlashNextQSAMetadataBuilder
-    )
+    builder = Qwen4ExpQSAMetadataBuilder.__new__(Qwen4ExpQSAMetadataBuilder)
     builder._request_ids = torch.empty(4, dtype=torch.int32)
     builder.max_speculative_tokens = 2
     builder._capture_state_slot_ids = torch.arange(4, dtype=torch.int32)
@@ -1100,10 +1096,8 @@ def test_qsa_builder_stages_runtime_state_in_capture_buffers() -> None:
 
 
 def test_qsa_cache_group_rebinding_preserves_live_metadata_owner() -> None:
-    def make_builder() -> Qwen3_8FlashNextQSAMetadataBuilder:
-        builder = Qwen3_8FlashNextQSAMetadataBuilder.__new__(
-            Qwen3_8FlashNextQSAMetadataBuilder
-        )
+    def make_builder() -> Qwen4ExpQSAMetadataBuilder:
+        builder = Qwen4ExpQSAMetadataBuilder.__new__(Qwen4ExpQSAMetadataBuilder)
         builder._request_ids = torch.empty(4, dtype=torch.int32)
         builder.max_speculative_tokens = 2
         builder._capture_state_slot_ids = torch.arange(4, dtype=torch.int32)
@@ -1190,9 +1184,7 @@ def test_qsa_cache_group_rebinding_preserves_live_metadata_owner() -> None:
 
 
 def test_qsa_builder_updates_fused_draft_acceptance_in_place() -> None:
-    builder = Qwen3_8FlashNextQSAMetadataBuilder.__new__(
-        Qwen3_8FlashNextQSAMetadataBuilder
-    )
+    builder = Qwen4ExpQSAMetadataBuilder.__new__(Qwen4ExpQSAMetadataBuilder)
     accepted = torch.tensor([4, 2, 1, 1], dtype=torch.int32)
     accepted_ptr = accepted.data_ptr()
     metadata = SimpleNamespace(qsa_num_accepted_tokens=accepted)
@@ -1209,7 +1201,7 @@ def test_qsa_builder_updates_fused_draft_acceptance_in_place() -> None:
 
 
 def test_qsa_speculative_anchor_snapshot_restores_all_persistent_slots() -> None:
-    owner = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
+    owner = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
     torch.nn.Module.__init__(owner)
     owner.max_seqs = 8
     owner._raw_interval_start_positions = torch.tensor(
@@ -1255,7 +1247,7 @@ def test_mtp_anchor_row_map_follows_compaction_during_graph_replay(
     device = _require_qsa_gpu()
     from b12x.attention import qsa as b12x_qsa
 
-    layer = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
+    layer = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
     torch.nn.Module.__init__(layer)
     layer._share_mtp_indices = True
     layer.max_tokens, layer.max_seqs, layer.max_speculative_tokens = 16, 4, 3
@@ -1346,7 +1338,7 @@ def test_projected_qsa_uses_complete_run_with_ready_event(monkeypatch) -> None:
         impl=SimpleNamespace(do_kv_cache_update=lambda *_: events.append("kv")),
     )
     monkeypatch.setattr(qsa_module, "get_b12x_qsa", lambda: SimpleNamespace(run=run))
-    Qwen3_8FlashNextQSAAttention._run_projected_qsa(
+    Qwen4ExpQSAAttention._run_projected_qsa(
         layer,
         torch.arange(rows),
         torch.empty(rows, 8),
@@ -1400,7 +1392,7 @@ def test_qsa_staging_shares_live_request_state_but_not_group_page_tables(
     monkeypatch.setattr(qsa_module, "get_forward_context", lambda: context)
 
     def owner():
-        layer = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
+        layer = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
         torch.nn.Module.__init__(layer)
         layer.max_seqs = max_seqs
         layer.max_speculative_tokens, layer.position_axes = 3, 1
@@ -1417,7 +1409,7 @@ def test_qsa_staging_shares_live_request_state_but_not_group_page_tables(
         return layer
 
     a, b = owner(), owner()
-    metadata = Qwen3_8FlashNextQSAMetadata(
+    metadata = Qwen4ExpQSAMetadata(
         num_actual_tokens=4,
         max_query_len=2,
         max_seq_len=8,
@@ -1519,7 +1511,7 @@ def test_qsa_staging_shares_live_request_state_but_not_group_page_tables(
 def test_reused_qsa_passes_live_anchor_map_after_kv_update(monkeypatch) -> None:
     """A reuse transaction writes KV first and passes only typed reuse inputs."""
     rows = 2
-    metadata = Qwen3_8FlashNextQSAMetadata.__new__(Qwen3_8FlashNextQSAMetadata)
+    metadata = Qwen4ExpQSAMetadata.__new__(Qwen4ExpQSAMetadata)
     metadata.num_actual_tokens = rows
     metadata.max_query_len, metadata.max_seq_len, metadata.causal = 1, 8, True
     metadata.slot_mapping = torch.arange(rows)
@@ -1565,7 +1557,7 @@ def test_reused_qsa_passes_live_anchor_map_after_kv_update(monkeypatch) -> None:
             DraftSelectionReuse=SimpleNamespace,
         ),
     )
-    Qwen3_8FlashNextQSAAttention._run_reused_qsa(
+    Qwen4ExpQSAAttention._run_reused_qsa(
         layer,
         torch.empty_like(output),
         torch.empty_like(output),

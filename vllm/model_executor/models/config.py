@@ -986,7 +986,7 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             )
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:
-            _strip_qwen4_exp_mrope(vllm_config.model_config)
+            _strip_qwen4_exp_target_and_draft_mrope(vllm_config)
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.method not in {
             "mtp",
@@ -1004,7 +1004,7 @@ class Qwen4ExpForCausalLMConfig(Qwen4ExpForConditionalGenerationConfig):
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
 
-        _strip_qwen4_exp_mrope(vllm_config.model_config)
+        _strip_qwen4_exp_target_and_draft_mrope(vllm_config)
 
 
 class Qwen4ExpMTPConfig(Qwen4ExpForConditionalGenerationConfig):
@@ -1018,7 +1018,7 @@ class Qwen4ExpMTPConfig(Qwen4ExpForConditionalGenerationConfig):
         _strip_qwen4_exp_mrope(vllm_config.model_config)
 
 
-def _strip_qwen3_8_flash_next_target_and_draft_mrope(
+def _strip_qwen4_exp_target_and_draft_mrope(
     vllm_config: "VllmConfig",
 ) -> None:
     """Keep a text target and its native draft on the same position contract."""
@@ -1037,36 +1037,9 @@ def _strip_qwen3_8_flash_next_target_and_draft_mrope(
     draft_model_config.model_arch_config = draft_model_config.get_model_arch_config()
 
 
-class Qwen3_8FlashNextForConditionalGenerationConfig(
-    Qwen4ExpForConditionalGenerationConfig
-):
-    @staticmethod
-    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
-        multimodal_config = vllm_config.model_config.multimodal_config
-        if multimodal_config is not None and multimodal_config.language_model_only:
-            _strip_qwen3_8_flash_next_target_and_draft_mrope(vllm_config)
-
-
-class Qwen3_8FlashNextForCausalLMConfig(Qwen3_8FlashNextForConditionalGenerationConfig):
-    @staticmethod
-    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        Qwen3_8FlashNextForConditionalGenerationConfig.verify_and_update_config(
-            vllm_config
-        )
-        _strip_qwen3_8_flash_next_target_and_draft_mrope(vllm_config)
-
-
-class Qwen3_8FlashNextMTPConfig(Qwen3_8FlashNextForConditionalGenerationConfig):
-    """Preserve M-RoPE for a VL target and use 1D RoPE for a text target."""
-
-    @staticmethod
-    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        Qwen3_8FlashNextForConditionalGenerationConfig.verify_and_update_config(
-            vllm_config
-        )
-        if not hasattr(vllm_config.model_config.hf_config, "vision_config"):
-            _strip_qwen4_exp_mrope(vllm_config.model_config)
+Qwen3_8FlashNextForConditionalGenerationConfig = Qwen4ExpForConditionalGenerationConfig
+Qwen3_8FlashNextForCausalLMConfig = Qwen4ExpForCausalLMConfig
+Qwen3_8FlashNextMTPConfig = Qwen4ExpMTPConfig
 
 
 class ColQwen3_5Config(Qwen3_5ForConditionalGenerationConfig):
