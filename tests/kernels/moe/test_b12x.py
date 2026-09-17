@@ -1258,10 +1258,10 @@ def test_b12x_moe_cuda_graph_replay(
 )
 @pytest.mark.parametrize("tokens", [4, 128])
 @torch.inference_mode()
-def test_b12x_moe_tuning_replays_native_candidate_in_cuda_graph(
-    weight_dtype, activation_dtype, tokens, workspace_init
+def test_b12x_moe_tuning_times_native_candidate_without_capture(
+    weight_dtype, activation_dtype, tokens, workspace_init, monkeypatch
 ) -> None:
-    """The race must time graph execution with live producers and fixed storage."""
+    """Tuning uses gated events with live producers and fixed MoE storage."""
     from b12x.preparation._measurement import _prepare_race
     from b12x.preparation.types import require_prepared
 
@@ -1281,29 +1281,39 @@ def test_b12x_moe_tuning_replays_native_candidate_in_cuda_graph(
         try:
             request = units[0].requests[0]
             plan = request.plan
-            assert plan.invocation["tuning_execution_context"] == "cuda_graph"
             state = require_prepared(plan, plan.component_id)
             call = request.benchmark_call(state)
-            assert call.capture_safe
+            assert not call.capture_safe
             call.restore()
             call.invoke()
             expected = call.output.clone()
             assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
             address = call.output.data_ptr()
             session.freeze()
-            race = _prepare_race(
-                [call], device_ordinal=torch.accelerator.current_device_index()
-            )
-            assert race.timers[0].graph is not None
-            for _ in range(3):
-                call.output.fill_(float("nan"))
+
+            def forbidden_capture(*args, **kwargs):
+                raise AssertionError("autotuning must not capture CUDA graphs")
+
+            run = call.run
+
+            def checked_run():
                 allocated = torch.accelerator.memory_stats()["allocation.all.allocated"]
-                race.timers[0].replay()
-                torch.accelerator.synchronize()
+                result = run()
                 assert (
                     torch.accelerator.memory_stats()["allocation.all.allocated"]
                     == allocated
                 )
+                return result
+
+            call.run = checked_run
+            monkeypatch.setattr(torch.cuda, "CUDAGraph", forbidden_capture)
+            race = _prepare_race(
+                [call], device_ordinal=torch.accelerator.current_device_index()
+            )
+            for _ in range(3):
+                call.output.fill_(float("nan"))
+                race.timers[0].replay()
+                torch.accelerator.synchronize()
                 assert call.output.data_ptr() == address
                 torch.testing.assert_close(call.output, expected, atol=2e-2, rtol=2e-2)
         finally:
