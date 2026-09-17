@@ -42,6 +42,9 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-10737418240}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
 DSPARK_DRAFT_ATTENTION_BACKEND="${DSPARK_DRAFT_ATTENTION_BACKEND:-auto}"
+DRAFT_SAMPLE_METHOD="${DRAFT_SAMPLE_METHOD:-probabilistic}"
+DSPARK_ADAPTIVE_VERIFICATION="${DSPARK_ADAPTIVE_VERIFICATION:-0}"
+DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE="${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE:-1.0}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.82}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
@@ -71,7 +74,9 @@ Environment overrides include HEAD_IP, LUXON_IP, GRAVITON_IP, CHRONITON_IP,
 MODEL_ID, MODEL_REVISION, HF_CACHE, MAX_MODEL_LEN, MAX_NUM_SEQS,
 NUM_SPECULATIVE_TOKENS, KV_CACHE_MEMORY_BYTES, GPU_MEMORY_UTILIZATION,
 B12X_ROOT, B12X_COMPILE_CACHE_DIR, NCCL_ROOT, IMAGE_NAME, CONTAINER_MEMORY_GB,
-TOKENIZER_MODE, ENGRAM_CONFIG, LIMIT_MM_PER_PROMPT and SECCOMP_PROFILE.
+TOKENIZER_MODE, ENGRAM_CONFIG, LIMIT_MM_PER_PROMPT, SECCOMP_PROFILE,
+DRAFT_SAMPLE_METHOD, DSPARK_ADAPTIVE_VERIFICATION and
+DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE.
 EOF
 }
 
@@ -391,14 +396,43 @@ compilation_config=$(printf \
 
 speculative_args=()
 if ((NUM_SPECULATIVE_TOKENS > 0)); then
-  draft_attention_json=
-  if [[ "${DSPARK_DRAFT_ATTENTION_BACKEND}" != auto ]]; then
-    draft_attention_json=$(printf ',"attention_backend":"%s"' \
-      "${DSPARK_DRAFT_ATTENTION_BACKEND}")
-  fi
-  speculative_config=$(printf \
-    '{"method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"probabilistic"%s}' \
-    "${NUM_SPECULATIVE_TOKENS}" "${draft_attention_json}")
+  speculative_config="$(
+    "${PYTHON_BIN}" - "${NUM_SPECULATIVE_TOKENS}" \
+      "${DSPARK_DRAFT_ATTENTION_BACKEND}" "${DRAFT_SAMPLE_METHOD}" \
+      "${DSPARK_ADAPTIVE_VERIFICATION}" \
+      "${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE}" <<'PY'
+import json
+import math
+import sys
+
+tokens, attention, sampling, adaptive, scale = sys.argv[1:]
+if sampling not in {"greedy", "probabilistic"}:
+    raise SystemExit("DRAFT_SAMPLE_METHOD must be greedy or probabilistic")
+booleans = {"1": True, "true": True, "yes": True, "on": True,
+            "0": False, "false": False, "no": False, "off": False}
+if adaptive.lower() not in booleans:
+    raise SystemExit("DSPARK_ADAPTIVE_VERIFICATION must be a boolean")
+adaptive = booleans[adaptive.lower()]
+try:
+    scale = float(scale)
+except ValueError:
+    raise SystemExit("DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE must be positive")
+if not math.isfinite(scale) or scale <= 0 or (not adaptive and scale != 1):
+    raise SystemExit("Verification cost scale must be positive; changing it requires adaptive verification")
+config = {
+    "method": "dspark",
+    "num_speculative_tokens": int(tokens),
+    "draft_tensor_parallel_size": 4,
+    "draft_sample_method": sampling,
+    "rejection_sample_method": "standard",
+    "enable_adaptive_verification": adaptive,
+    "adaptive_verification_cost_scale": scale,
+}
+if attention != "auto":
+    config["attention_backend"] = attention
+print(json.dumps(config))
+PY
+  )"
   speculative_args=(--speculative-config "${speculative_config}")
 fi
 
