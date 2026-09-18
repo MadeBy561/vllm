@@ -102,11 +102,12 @@ class _PreparedMoECall:
             for buffer in scratch:
                 buffer.zero_()
 
-        route_patterns = tuple(route_ids.unbind(0))
+        # Keep route_ids alive through the producer for weakref-based trial
+        # reuse, without exporting trial buffers into the serving plan.
 
         def produce(pattern: int = 0) -> None:
             hidden.copy_(activation_source)
-            ids.copy_(route_patterns[pattern])
+            ids.copy_(route_ids[pattern])
             weights.copy_(route_weights)
 
         def restore() -> None:
@@ -129,9 +130,8 @@ class _PreparedMoECall:
             reset=reset,
             restore=restore,
             capture_safe=False,
-            owners=tensors,
             benchmark_producers=tuple(
-                partial(produce, pattern) for pattern in range(len(route_patterns))
+                partial(produce, pattern) for pattern in range(route_ids.shape[0])
             ),
         )
 

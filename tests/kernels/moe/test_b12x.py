@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -941,6 +943,25 @@ def test_b12x_moe_candidate_calls_share_bounded_trial_storage(
         assert all(row.unique().numel() == topk for row in ids)
         second_producer()
         torch.testing.assert_close(ids, first_ids)
+
+    # Published plans retain call.owners after discarding their priming calls.
+    published_owners = first_call.owners + second_call.owners
+    trial_refs = [
+        weakref.ref(tensor)
+        for bound in (first_state.bound, second_state.bound)
+        for tensor in (
+            bound["a"],
+            bound["output"],
+            bound["topk_ids"],
+            bound["topk_weights"],
+            *bound["scratch"],
+        )
+    ]
+    first_state.bound = second_state.bound = None
+    del first_call, second_call, first_producer, second_producer, ids, scratch
+    gc.collect()
+    assert all(ref() is None for ref in trial_refs)
+    assert published_owners == ()
 
 
 def test_b12x_source_release_preserves_prepared_storage_owner() -> None:
