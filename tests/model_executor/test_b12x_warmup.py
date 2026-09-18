@@ -135,6 +135,77 @@ def test_collective_describers_reject_process_local_identity(
         describers[0](workload)
 
 
+@pytest.mark.parametrize(
+    "module_name,class_name",
+    [
+        ("qwen3_5", "Qwen3_5Model"),
+        ("qwen3_5_mtp", "Qwen3_5MultiTokenPredictor"),
+        ("qwen3_next", "Qwen3NextModel"),
+        ("qwen3_next_mtp", "Qwen3NextMultiTokenPredictor"),
+    ],
+)
+@pytest.mark.parametrize("prefix", ["", "language_model.model", "mtp"])
+@pytest.mark.usefixtures("default_vllm_config")
+def test_qwen_embedding_collectives_have_rank_stable_names(
+    monkeypatch, module_name, class_name, prefix
+) -> None:
+    import importlib
+
+    from vllm.config import CompilationMode
+    from vllm.model_executor.layers import vocab_parallel_embedding as embedding
+
+    module = importlib.import_module(f"vllm.model_executor.models.{module_name}")
+    hf = SimpleNamespace(
+        vocab_size=128,
+        hidden_size=64,
+        num_hidden_layers=0,
+        mtp_num_hidden_layers=0,
+        num_nextn_predict_layers=0,
+        rms_norm_eps=1e-6,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf, hf_text_config=hf),
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(num_redundant_experts=0)
+        ),
+        quant_config=None,
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+    )
+    if hasattr(module, "make_layers"):
+        monkeypatch.setattr(
+            module, "make_layers", lambda *a, **kw: (0, 0, torch.nn.ModuleList())
+        )
+    if hasattr(module, "ColumnParallelLinear"):
+        monkeypatch.setattr(
+            module, "ColumnParallelLinear", lambda *a, **kw: torch.nn.Identity()
+        )
+    monkeypatch.setattr(
+        module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    monkeypatch.setattr(embedding, "get_tensor_model_parallel_world_size", lambda: 2)
+    describers = []
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.register_b12x_collective_describer",
+        lambda owner, describe: describers.append(describe),
+    )
+    qualified_name = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
+    workload = _workload(token_counts=(1, 4), fixed_token_counts=(1, 4))
+    for rank in (0, 1):
+        describers.clear()
+        monkeypatch.setattr(
+            embedding, "get_tensor_model_parallel_rank", lambda rank=rank: rank
+        )
+        model = getattr(module, class_name)(vllm_config=config, prefix=prefix)
+        assert model.embed_tokens.tp_size == 2
+        assert len(describers) == 1
+        invocations = describers[0](workload)
+        assert [item.name for item in invocations] == [
+            f"{qualified_name}.embedding_all_reduce.m1",
+            f"{qualified_name}.embedding_all_reduce.m4",
+        ]
+        assert [item.shape for item in invocations] == [(1, 64), (4, 64)]
+
+
 def test_preparation_token_counts_cover_every_serving_regime() -> None:
     counts = b12x_preparation_token_counts(
         max_tokens=32,
