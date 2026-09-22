@@ -741,6 +741,26 @@ def test_workload_declares_the_same_decode_counts_in_both_stages() -> None:
     )
 
 
+def test_state_workload_uses_allocated_block_table_widths_per_layer() -> None:
+    worker = _config_worker(capture_sizes=(1, 2, 4), max_seqs=2, speculative_tokens=0)
+    worker.model_runner.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=["target.attn.0", "target.attn.1"]),
+            SimpleNamespace(layer_names=["draft.attn"]),
+        ]
+    )
+    worker.model_runner.block_tables = SimpleNamespace(
+        input_block_tables=[
+            torch.empty((2, 2112), device="meta", dtype=torch.int32),
+            torch.empty((2, 4224), device="meta", dtype=torch.int32),
+        ]
+    )
+    assert not b12x_prepare.b12x_workload(worker, stage="weights").block_table_widths
+    assert dict(
+        b12x_prepare.b12x_workload(worker, stage="state").block_table_widths
+    ) == {"target.attn.0": 2112, "target.attn.1": 2112, "draft.attn": 4224}
+
+
 def test_provider_attachment_never_registers_a_child_module() -> None:
     from vllm.utils.b12x import set_b12x_preparation_provider
 
