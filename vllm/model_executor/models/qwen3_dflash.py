@@ -613,9 +613,23 @@ class DFlashQwen3Model(nn.Module):
             )
 
         output_size, input_size = self._fused_kv_weight.shape
-        self._fused_kv_linear.input_size_per_partition = input_size
-        self._fused_kv_linear.output_size_per_partition = output_size
-        self._fused_kv_linear.logical_widths = [output_size]
+        # Fused context K/V has an independent weight shape and kernel
+        # lifecycle; do not repack through the query projection's method.
+        fused_method = ModelOptLinearMethod(
+            quant_method.spec, quant_method.ctx, quant_method.fmt
+        )
+        fused_method.input_dtype = quant_method.input_dtype
+        fused_method.out_dtype = quant_method.out_dtype
+        fused_method.marlin_input_dtype = quant_method.marlin_input_dtype
+        self._fused_kv_linear.has_bias = self._fused_kv_bias is not None
+        fused_method.create_weights(
+            self._fused_kv_linear,
+            input_size_per_partition=input_size,
+            output_partition_sizes=[output_size],
+            input_size=input_size,
+            output_size=output_size,
+            params_dtype=self.hidden_norm.weight.dtype,
+        )
         self._fused_kv_linear.register_parameter(
             "weight", nn.Parameter(self._fused_kv_weight, requires_grad=False)
         )
@@ -623,13 +637,13 @@ class DFlashQwen3Model(nn.Module):
             "weight_scale",
             nn.Parameter(self._fused_kv_weight_scale, requires_grad=False),
         )
-        quant_method.process_weights_after_loading(self._fused_kv_linear)
-        self._fused_kv_quant_method = quant_method
+        fused_method.process_weights_after_loading(self._fused_kv_linear)
+        self._fused_kv_quant_method = fused_method
         self._fused_kv_weight = None
         self._fused_kv_weight_scale = None
         logger.info_once(
             "Using %s for the fused DFlash context K/V projection.",
-            type(quant_method.kernel).__name__,
+            type(fused_method.kernel).__name__,
         )
 
     def _project_context_kv(
