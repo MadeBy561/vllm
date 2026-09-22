@@ -23,6 +23,25 @@ WINDOW = 8
 SEQ_LENS = [5, 37]
 
 
+@pytest.mark.skip_global_cleanup
+def test_omni_configures_dflash_auxiliary_layers():
+    from vllm.model_executor.models.interfaces import supports_eagle3
+    from vllm.model_executor.models.mimo_v2 import MiMoV2FlashForCausalLM, MiMoV2Model
+    from vllm.model_executor.models.mimo_v2_omni import MiMoV2OmniForCausalLM
+
+    model = MiMoV2OmniForCausalLM.__new__(MiMoV2OmniForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.language_model = MiMoV2FlashForCausalLM.__new__(MiMoV2FlashForCausalLM)
+    torch.nn.Module.__init__(model.language_model)
+    backbone = MiMoV2Model.__new__(MiMoV2Model)
+    torch.nn.Module.__init__(backbone)
+    model.language_model.model = backbone
+
+    assert supports_eagle3(model)
+    model.set_aux_hidden_state_layers((1, 16, 32, 48, 70))
+    assert backbone.aux_hidden_state_layers == (1, 16, 32, 48, 70)
+
+
 @pytest.fixture
 def vision_attn_env():
     init_distributed_environment(
