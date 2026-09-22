@@ -142,11 +142,13 @@ def test_collective_describers_reject_process_local_identity(
         ("qwen3_5_mtp", "Qwen3_5MultiTokenPredictor"),
         ("qwen3_next", "Qwen3NextModel"),
         ("qwen3_next_mtp", "Qwen3NextMultiTokenPredictor"),
+        ("nemotron_h", "NemotronHModel"),
+        ("nemotron_h_mtp", "NemotronHMultiTokenPredictor"),
     ],
 )
 @pytest.mark.parametrize("prefix", ["", "language_model.model", "mtp"])
 @pytest.mark.usefixtures("default_vllm_config")
-def test_qwen_embedding_collectives_have_rank_stable_names(
+def test_embedding_collectives_have_rank_stable_names(
     monkeypatch, module_name, class_name, prefix
 ) -> None:
     import importlib
@@ -162,6 +164,8 @@ def test_qwen_embedding_collectives_have_rank_stable_names(
         mtp_num_hidden_layers=0,
         num_nextn_predict_layers=0,
         rms_norm_eps=1e-6,
+        layer_norm_epsilon=1e-5,
+        hybrid_override_pattern="",
     )
     config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=hf, hf_text_config=hf),
@@ -170,7 +174,22 @@ def test_qwen_embedding_collectives_have_rank_stable_names(
         ),
         quant_config=None,
         compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+        cache_config=None,
     )
+    if module_name == "nemotron_h_mtp":
+        hf.num_nextn_predict_layers = 1
+        hf.mtp_hybrid_override_pattern = "*"
+        config.speculative_config = SimpleNamespace(
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(get_text_config=lambda: hf)
+            )
+        )
+        monkeypatch.setattr(module, "get_draft_quant_config", lambda _: None)
+        monkeypatch.setattr(
+            module,
+            "NemotronHMTPAttentionDecoderLayer",
+            lambda **kw: torch.nn.Identity(),
+        )
     if hasattr(module, "make_layers"):
         monkeypatch.setattr(
             module, "make_layers", lambda *a, **kw: (0, 0, torch.nn.ModuleList())
@@ -179,9 +198,10 @@ def test_qwen_embedding_collectives_have_rank_stable_names(
         monkeypatch.setattr(
             module, "ColumnParallelLinear", lambda *a, **kw: torch.nn.Identity()
         )
-    monkeypatch.setattr(
-        module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
-    )
+    if hasattr(module, "get_pp_group"):
+        monkeypatch.setattr(
+            module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
     monkeypatch.setattr(embedding, "get_tensor_model_parallel_world_size", lambda: 2)
     describers = []
     monkeypatch.setattr(
