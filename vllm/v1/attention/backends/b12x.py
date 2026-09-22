@@ -202,6 +202,10 @@ class B12xPagedAttentionBackend(AttentionBackend):
         return [64, 128, 192, 256]
 
     @classmethod
+    def supports_non_causal(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_sink(cls) -> bool:
         return True
 
@@ -473,6 +477,11 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         )
         self._plans: dict[_PagedPlanKey, object] = {}
         self.supports_quant_query_input = False
+        self._noncausal = None
+        if vllm_config.attention_config.use_non_causal:
+            from vllm.v1.attention.ops.b12x_noncausal import B12xNoncausalAttention
+
+            self._noncausal = B12xNoncausalAttention(self)
 
         logger.info_once(
             "Using b12x with q_heads=%d kv_heads=%d head_dim_qk=%d "
@@ -693,6 +702,10 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             self._max_page_table_widths[page_size] = table_width
         if workload.output_dtype != self.dtype:
             raise ValueError("b12x paged output dtype differs from its loaded contract")
+        if self._noncausal is not None:
+            return self._noncausal.preparation_units(
+                layer, key_cache, value_cache, self._max_page_table_widths[page_size]
+            )
         plans: dict[_PagedPlanKey, object] = {}
         requests = []
         batches = tuple(
@@ -1096,7 +1109,10 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         key_cache, value_cache = self._kv_cache_views(kv_cache)
         page_size = _kv_page_size(key_cache, value_cache)
         if not attn_metadata.causal:
-            raise NotImplementedError("b12x supports causal attention only.")
+            if self._noncausal is None:
+                raise ValueError("B12X noncausal attention was not configured.")
+            self._noncausal.forward(q, out, key_cache, value_cache, attn_metadata)
+            return output
 
         page_table = _ensure_i32_contiguous(attn_metadata.block_table, "block_table")
         cache_seqlens = _ensure_i32_contiguous(attn_metadata.seq_lens, "seq_lens")
