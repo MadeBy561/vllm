@@ -378,19 +378,30 @@ def test_collect_units_filters_by_stage_and_tunes_eager_shapes() -> None:
     assert id(tower) not in {id(layer) for layer, _ in record}
 
 
-def test_qwen_vision_preparation_uses_encoder_and_connector_token_counts(
+@pytest.mark.parametrize("model_type", ["qwen3_vl", "mimo_v2"])
+def test_vision_preparation_uses_encoder_and_connector_token_counts(
     monkeypatch,
+    model_type,
 ) -> None:
+    from vllm.model_executor.models.mimo_v2_omni import MiMoV2OmniForCausalLM
     from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
     from vllm.multimodal import encoder_budget
 
-    model = Qwen3VLForConditionalGeneration.__new__(Qwen3VLForConditionalGeneration)
+    cls = (
+        Qwen3VLForConditionalGeneration
+        if model_type == "qwen3_vl"
+        else MiMoV2OmniForCausalLM
+    )
+    model = cls.__new__(cls)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
     model.visual = torch.nn.Module()
+    model.visual.spatial_merge_unit = 4
     model.visual.blocks = torch.nn.Sequential(torch.nn.Identity())
     model.visual.merger = torch.nn.Identity()
-    model.visual.deepstack_merger_list = torch.nn.ModuleList([torch.nn.Identity()])
+    model.visual.deepstack_merger_list = torch.nn.ModuleList(
+        [torch.nn.Identity()] if model_type == "qwen3_vl" else []
+    )
     worker = _worker(model)
     worker.vllm_config = object()
     worker.model_runner.mm_registry = object()
