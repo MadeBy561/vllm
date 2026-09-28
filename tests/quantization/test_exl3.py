@@ -299,6 +299,27 @@ def test_exl3_detection_preserves_explicit_quantization(checkpoint_quant_config)
     )
 
 
+@pytest.mark.parametrize("selected", [None, "exl3", "mxfp4"])
+def test_model_config_detects_exl3_without_overriding_explicit_method(
+    checkpoint_quant_config, selected
+):
+    from transformers import PretrainedConfig
+
+    from vllm.config import ModelConfig
+
+    config = SimpleNamespace(
+        quantization=selected,
+        model_arch_config=SimpleNamespace(quantization_config=checkpoint_quant_config),
+        hf_config=PretrainedConfig(),
+    )
+    if selected == "mxfp4":
+        with pytest.raises(ValueError, match="does not match"):
+            ModelConfig._verify_quantization(config)
+    else:
+        ModelConfig._verify_quantization(config)
+        assert config.quantization == "exl3"
+
+
 def test_exl3_config_preserves_serialized_projection_formats(
     checkpoint_quant_config,
 ):
