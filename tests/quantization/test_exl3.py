@@ -225,6 +225,45 @@ def test_exl3_rejects_mismatched_expert_math(moe_config, fields):
         Exl3MoEMethod(replace(moe_config, **fields))
 
 
+def test_exl3_shared_mlp_loads_tp9_tail_without_changing_checkpoint_width(
+    monkeypatch, default_vllm_config
+):
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.layers.quantization.exl3 import Exl3Config
+    from vllm.models.kimi_k3.nvidia import model as kimi
+
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(world_size=9, rank_in_group=8)
+    )
+    quant = Exl3Config(["gate_up_proj", "down_proj"])
+    model = kimi.KimiLinearModel.__new__(kimi.KimiLinearModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(linear_attn_config={}, is_moe=False)
+    model.mlp = kimi.KimiMLP(32, 6144, "silu", quant, reduce_results=False)
+    gate = torch.randn(6144, 32)
+    up = torch.randn_like(gate)
+    down = torch.randn(32, 6144)
+    model.load_weights(
+        [
+            (f"mlp.{name}.weight", weight)
+            for name, weight in (
+                ("gate_proj", gate),
+                ("up_proj", up),
+                ("down_proj", down),
+            )
+        ]
+    )
+    local = model.mlp.down_proj.weight.shape[1]
+    assert local == 704
+    start, valid = 8 * local, 6144 - 8 * local
+    for shard, weight in enumerate((gate, up)):
+        actual = model.mlp.gate_up_proj.weight[shard * local : (shard + 1) * local]
+        torch.testing.assert_close(actual[:valid], weight[start:])
+        assert torch.count_nonzero(actual[valid:]) == 0
+    torch.testing.assert_close(model.mlp.down_proj.weight[:, :valid], down[:, start:])
+    assert torch.count_nonzero(model.mlp.down_proj.weight[:, valid:]) == 0
+
+
 @pytest.mark.parametrize(
     "fields", [{"use_ep": True, "ep_size": 2}, {"dp_size": 2}, {"enable_eplb": True}]
 )

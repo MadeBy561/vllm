@@ -109,6 +109,10 @@ from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
 )
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.ops import attn_res
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    enable_kimi_projection_tail_padding,
+    projection_checkpoint_dimensions,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
@@ -252,6 +256,11 @@ class KimiMLP(nn.Module):
         )
         replicate = use_sequence_parallel and not self.shard_sequence_parallel
 
+        checkpoint_intermediate_size = intermediate_size
+        if quant_config is not None and quant_config.get_name() == "exl3":
+            tp = 1 if replicate else get_tensor_model_parallel_world_size()
+            intermediate_size = cdiv(intermediate_size, tp * 32) * tp * 32
+
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -271,6 +280,16 @@ class KimiMLP(nn.Module):
             disable_tp=replicate,
             prefix=f"{prefix}.down_proj",
         )
+        if intermediate_size != checkpoint_intermediate_size:
+            enable_kimi_projection_tail_padding(self.gate_up_proj)
+            enable_kimi_projection_tail_padding(self.down_proj)
+            self._tp_checkpoint_dimensions = projection_checkpoint_dimensions(
+                {
+                    "gate_proj": (0, checkpoint_intermediate_size),
+                    "up_proj": (0, checkpoint_intermediate_size),
+                    "down_proj": (1, checkpoint_intermediate_size),
+                }
+            )
         self.gemm_rs_ar = None
         # RS requires sequence sharding; AR operates on replicated tokens.
         use_gemm_rs_ar = self.shard_sequence_parallel or (
