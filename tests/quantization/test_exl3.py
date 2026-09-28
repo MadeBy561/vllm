@@ -191,7 +191,7 @@ def test_exl3_moe_uses_manifest_width_without_changing_shared_experts(
     runtime = SimpleNamespace(
         kernel_config=SimpleNamespace(moe_backend="b12x"),
         parallel_config=SimpleNamespace(enable_expert_parallel=False),
-        model_config=SimpleNamespace(model="checkpoint"),
+        model_config=SimpleNamespace(model="checkpoint", quantization="exl3"),
     )
     quant = SimpleNamespace(get_name=lambda: "exl3")
     for rank in range(tp_size):
@@ -421,6 +421,9 @@ def test_exl3_split_kda_projection_keeps_gate_and_beta_order():
         head_dim=1,
         local_num_heads=1,
         in_proj_padding=2,
+        _split_projection_overlap_max_tokens=0,
+        _projection_aux_stream=None,
+        _projection_events=None,
         in_proj_qkv=lambda value: (value @ qkv.T, None),
         in_proj_gfab=lambda value: (value @ gfab.T, None),
         f_b_proj=lambda value: (value @ fb.T, None),

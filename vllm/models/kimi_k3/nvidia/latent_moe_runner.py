@@ -185,6 +185,7 @@ class LatentMoERunner(MoERunner):
             and self._shared_experts is not None
             and not self._fused_output_is_reduced
             and not self.moe_config.is_sequence_parallel
+            and not getattr(self.routed_output_transform, "output_is_tp_partial", False)
         )
 
     def _select_tail_tier(
