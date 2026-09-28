@@ -301,6 +301,76 @@ def test_exl3_config_preserves_serialized_projection_formats(
         config.get_quant_method(layer, "model.layers.3.self_attn.fused_qkv_a_g_proj")
 
 
+@pytest.mark.parametrize("tp_size", [9, 10, 16])
+@pytest.mark.parametrize("channels", [1, 2])
+def test_exl3_kda_state_loader_zero_fills_only_absent_heads(
+    monkeypatch, tp_size, channels
+):
+    from vllm.models.kimi_k3.nvidia import kda
+    from vllm.models.kimi_k3.nvidia.tp_projection import (
+        enable_kimi_projection_tail_padding,
+    )
+
+    monkeypatch.setattr(kda, "get_tensor_model_parallel_rank", lambda: tp_size - 1)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.full((2 * channels,), float("nan")))
+    checkpoint = torch.arange((2 * tp_size - 1) * channels, dtype=torch.float32)
+    loader = kda.a_log_weight_loader(0)
+    with pytest.raises(RuntimeError):
+        loader(layer.weight, checkpoint)
+    enable_kimi_projection_tail_padding(layer)
+    loader(layer.weight, checkpoint)
+    expected = torch.cat((checkpoint[-channels:], torch.zeros(channels)))
+    torch.testing.assert_close(layer.weight, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tp_size", [9, 10, 16])
+def test_exl3_kda_convolution_padding_updates_decode_storage(tp_size):
+    from vllm.models.kimi_k3.nvidia.kda import _make_decode_conv1d_weight_loader
+
+    parameter = torch.nn.Parameter(torch.full((12, 1, 3), float("nan")))
+    parameter.allow_tp_padding = True
+    decode = torch.full((3, 3, 4), float("nan"))
+    checkpoint = torch.arange((tp_size * 4 - 2) * 3).reshape(-1, 3).float()
+    loader = _make_decode_conv1d_weight_loader(
+        [tp_size * 4] * 3, tp_size, tp_size - 1, decode
+    )
+    expected = torch.cat((checkpoint[-2:], torch.zeros(2, 3)))
+    for shard in range(3):
+        loader(parameter, checkpoint + shard, shard)
+        shard_expected = expected.clone()
+        shard_expected[:2] += shard
+        torch.testing.assert_close(
+            parameter[shard * 4 : (shard + 1) * 4, 0],
+            shard_expected,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(decode[shard], shard_expected.T, rtol=0, atol=0)
+
+
+def test_exl3_split_kda_projection_keeps_gate_and_beta_order():
+    from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
+
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    qkv = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    gfab = torch.arange(24, dtype=torch.float32).reshape(6, 4) + 1
+    fb = torch.tensor([[2.0], [3.0]])
+    layer = SimpleNamespace(
+        local_projection_size=2,
+        head_dim=1,
+        local_num_heads=1,
+        in_proj_padding=2,
+        in_proj_qkv=lambda value: (value @ qkv.T, None),
+        in_proj_gfab=lambda value: (value @ gfab.T, None),
+        f_b_proj=lambda value: (value @ fb.T, None),
+    )
+    actual = KimiK3DeltaAttention._project_split_input(layer, x)
+    expected = (x @ qkv.T, x @ gfab[:2].T, (x @ gfab[2:3].T) @ fb.T, x @ gfab[3:4].T)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("defect", ["manifest", "dense", "gate", "qkv"])
 def test_exl3_config_rejects_unsupported_wire_formats(checkpoint_quant_config, defect):
     from vllm.model_executor.layers.quantization.exl3 import Exl3Config
