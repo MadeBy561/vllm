@@ -1854,6 +1854,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             tuple[str, torch.Tensor] | tuple[str, torch.Tensor, dict[str, Any]]
         ],
     ) -> set[str]:
+        from .tp_projection import validate_checkpoint_tensor
+
+        checkpoint_dimensions = {
+            f"{prefix}.{name}": dimension
+            for prefix, module in self.named_modules()
+            for name, dimension in getattr(
+                module, "_tp_checkpoint_dimensions", {}
+            ).items()
+        }
         kda_config = self.config.linear_attn_config
         use_full_rank_gate = bool(
             kda_config and kda_config.get("use_full_rank_gate", False)
@@ -1927,6 +1936,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         loaded_params: set[str] = set()
         for args in weights:
             name, loaded_weight = args[0], args[1]
+            validate_checkpoint_tensor(name, loaded_weight, checkpoint_dimensions)
             kwargs: dict[str, Any] = args[2] if len(args) > 2 else {}
             if "rotary_emb.inv_freq" in name:
                 continue
