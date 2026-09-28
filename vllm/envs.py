@@ -12,6 +12,13 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
+    VLLM_MLA_PREFILL_DCP_OVERLAP: bool = False
+    VLLM_MLA_PREFILL_DCP_FP8_TRANSPORT: bool = False
+    VLLM_KIMI_SHARD_QKV_A: bool = False
+    VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
+    VLLM_DCP_SHARD_DRAFT: str | None = None
+    VLLM_USE_B12X_DCP_A2A: bool = False
     VLLM_HOST_IP: str = ""
     VLLM_PORT: int | None = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
@@ -629,6 +636,22 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Experimental Kimi MLA and DCP controls.
+    "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE": lambda: int(
+        os.getenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "0")
+    ),
+    "VLLM_MLA_PREFILL_DCP_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_MLA_PREFILL_DCP_OVERLAP", "0"))
+    ),
+    "VLLM_MLA_PREFILL_DCP_FP8_TRANSPORT": lambda: bool(
+        int(os.getenv("VLLM_MLA_PREFILL_DCP_FP8_TRANSPORT", "0"))
+    ),
+    "VLLM_USE_B12X_DCP_A2A": lambda: bool(int(os.getenv("VLLM_USE_B12X_DCP_A2A", "0"))),
+    "VLLM_KIMI_SHARD_QKV_A": lambda: bool(int(os.getenv("VLLM_KIMI_SHARD_QKV_A", "0"))),
+    "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
+        os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
+    ),
+    "VLLM_DCP_SHARD_DRAFT": lambda: os.getenv("VLLM_DCP_SHARD_DRAFT"),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]

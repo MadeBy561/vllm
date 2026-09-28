@@ -35,6 +35,27 @@ class B12xPrefillBackend(MLAPrefillBackend):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._plans = {}
+        self._context_projection_enabled = False
+
+    @staticmethod
+    def _can_project_context(layer):
+        from vllm import envs
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+        from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+        method = getattr(layer, "quant_method", None)
+        weight = getattr(layer, "weight", None)
+        return (
+            not envs.VLLM_BATCH_INVARIANT
+            and type(method) is UnquantizedLinearMethod
+            and method._gemm_impl is default_unquantized_gemm
+            and weight is not None
+            and weight.dtype in (torch.bfloat16, torch.float16)
+            and getattr(layer, "bias", None) is None
+            and not getattr(layer, "gather_output", False)
+            and not layer._forward_hooks
+            and not layer._forward_pre_hooks
+        )
 
     def clone(self):
         # Plans contain immutable geometry, not request metadata or workspace.
@@ -56,6 +77,7 @@ class B12xPrefillBackend(MLAPrefillBackend):
 
         if workload.stage != "weights":
             return ()
+        self._context_projection_enabled = self._can_project_context(layer.kv_b_proj)
         rows = self.vllm_config.scheduler_config.max_num_batched_tokens
         seqs = self.vllm_config.scheduler_config.max_num_seqs
         kv_rows = MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
@@ -116,7 +138,48 @@ class B12xPrefillBackend(MLAPrefillBackend):
         # kv_b_proj emits interleaved K/V heads. The contiguous attention API
         # consumes a compact V view; this copy is included in prefill timings.
         specs = [(spec.shape, spec.dtype), (state.plan.v_shape, state.plan.dtype)]
+        if self._context_projection_enabled and not state.plan.causal:
+            rows, heads, _ = state.plan.v_shape
+            specs.extend(
+                [
+                    (
+                        (rows, heads, self.qk_nope_head_dim + self.v_head_dim),
+                        state.plan.dtype,
+                    ),
+                    (state.plan.k_shape, state.plan.dtype),
+                ]
+            )
         return current_workspace_manager().get_simultaneous(*specs)
+
+    def project_context_kv(self, layer, latent, positional_key):
+        """Project and pack into caller scratch without changing GEMM geometry.
+
+        The returned K/V views live until the next use of the model's workspace
+        lane. Projection and attention consume that lane on the caller stream;
+        DCP transport owns separate buffers and may overlap both operations.
+        """
+        from b12x.preparation import require_prepared
+
+        if not self._context_projection_enabled or not self._can_project_context(layer):
+            return None
+        if latent.ndim != 2 and not (latent.ndim == 3 and latent.shape[1] == 1):
+            return None
+        state = require_prepared(self._plans[False], "attention.varlen", latent.device)
+        _, values, projected, keys = self._workspace(state)
+        rows = latent.shape[0]
+        if rows > projected.shape[0]:
+            raise ValueError("MLA context projection exceeds the prepared capacity")
+        projected, keys, values = projected[:rows], keys[:rows], values[:rows]
+        # Preserve the input rank and strides: flattening a DCP [N, 1, K]
+        # input can select a different GEMM reduction than F.linear.
+        projection_out = projected.view(*latent.shape[:-1], -1)
+        torch.matmul(latent, layer.weight.t(), out=projection_out)
+        keys[..., : self.qk_nope_head_dim].copy_(
+            projected[..., : self.qk_nope_head_dim]
+        )
+        keys[..., self.qk_nope_head_dim :].copy_(positional_key)
+        values.copy_(projected[..., self.qk_nope_head_dim :])
+        return keys, values
 
     def _prepare_call(self, state):
         from b12x.preparation import PreparedCall
@@ -216,3 +279,51 @@ class B12xPrefillBackend(MLAPrefillBackend):
             False,
             out,
         )
+
+
+class B12xContextPrefillBackend(B12xPrefillBackend):
+    """B12X cached-context attention with FA2 causal-suffix arithmetic.
+
+    The causal suffix controls short-prompt generation even when context
+    attention is never used. Keeping its FA2 arithmetic avoids changing those
+    outputs while accelerating the larger cached-context operation.
+    """
+
+    _prepared_causal_modes = (False,)
+
+    @staticmethod
+    def get_name():
+        return "B12X_CONTEXT"
+
+    def __init__(self, *args, **kwargs):
+        from .flash_attn import FlashAttnPrefillBackend
+
+        super().__init__(*args, **kwargs)
+        self._causal_backend = FlashAttnPrefillBackend(*args, **kwargs)
+        if self._causal_backend.vllm_flash_attn_version != 2:
+            raise ValueError("B12X_CONTEXT requires FlashAttention 2 causal prefill")
+
+    def _run(self, q, k, v, cu_q, cu_k, max_q, max_k, causal, out):
+        if not causal:
+            return super()._run(q, k, v, cu_q, cu_k, max_q, max_k, causal, out)
+        value, lse = self._causal_backend._flash_attn_varlen_diff_headdims(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            softmax_scale=self.scale,
+            causal=True,
+            return_softmax_lse=True,
+        )
+        # FA2 pads V to Q's width. Honor the shared backend's compact-out
+        # contract without passing the incompatible compact buffer to FA2.
+        value = value[..., : self.v_head_dim]
+        if out is None:
+            value = value.contiguous()
+        else:
+            out.copy_(value)
+            value = out
+        return value, lse

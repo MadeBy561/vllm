@@ -961,6 +961,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     """Sliding window attention with MLA cache format."""
 
     cache_dtype_str: str | None = None
+    non_causal_multi_token_decode: bool = False
     # DeepseekV4-only: see MLAAttentionSpec.model_version.
     alignment: int | None = None  # Default to None for no padding.
     model_version: str | None = None
@@ -1029,6 +1030,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
             dcp_replicated=dcp_replicated_set.pop(),
             prefix_cache_enabled=specs[0].prefix_cache_enabled,
             prefill_replay_window=specs[0].prefill_replay_window,

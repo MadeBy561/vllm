@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
@@ -89,7 +90,9 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_qkv_quant_kv_cache_fp8_insert,
 )
 from vllm.models.kimi_k3.nvidia.tp_projection import (
+    can_reuse_projection_output,
     enable_kimi_projection_tail_padding,
+    project_into_consumed_output,
     projection_checkpoint_dimensions,
 )
 from vllm.platforms import current_platform
@@ -109,7 +112,11 @@ from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
 from vllm.v1.attention.ops.dcp import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, get_kv_quant_mode
+from vllm.v1.kv_cache_interface import (
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+    get_kv_quant_mode,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
@@ -148,6 +155,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         use_rope: bool = False,
         non_causal_multi_token_decode: bool = False,
         run_gemm_rs_ar: bool = False,
+        draft_kv_window: int | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -159,6 +167,17 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.kv_lora_rank = kv_lora_rank
         self.use_output_gate = use_output_gate
         self.non_causal_multi_token_decode = non_causal_multi_token_decode
+        self.draft_kv_window = (
+            (
+                envs.VLLM_DSPARK_DRAFT_KV_WINDOW
+                if draft_kv_window is None
+                else draft_kv_window
+            )
+            if non_causal_multi_token_decode
+            else 0
+        )
+        if self.draft_kv_window < 0:
+            raise ValueError("The Kimi-K3 draft KV window must be non-negative")
         # Latent "head" seen by the attention kernel / KV cache.
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.scale = self.qk_head_dim**-0.5
@@ -235,11 +254,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     bias=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.fused_qkv_a_g_proj",
+                    shard_latents=envs.VLLM_KIMI_SHARD_QKV_A,
                 )
                 # Only supports unquantized weights for sliced side-stream path
                 # for now.
-                if aux_stream is not None and isinstance(
-                    self.fused_qkv_a_g_proj.quant_method, UnquantizedLinearMethod
+                if (
+                    aux_stream is not None
+                    and not self.fused_qkv_a_g_proj.shard_latents
+                    and isinstance(
+                        self.fused_qkv_a_g_proj.quant_method, UnquantizedLinearMethod
+                    )
                 ):
                     self.aux_stream = aux_stream
                     self._gate_events = (torch.cuda.Event(), torch.cuda.Event())
@@ -412,6 +436,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             "parallelism."
         )
         self.dcp_world_size = parallel_config.decode_context_parallel_size
+        if self.get_kv_cache_spec(vllm_config).dcp_replicated:
+            self.dcp_world_size = 1
+            self.impl.dcp_world_size = 1
+            self.impl.dcp_rank = 0
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             query_dtype = (
@@ -431,6 +459,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 padded_num_heads=self.q_pad_num_heads,
                 is_lse_base_on_e=self.impl.lse_base_on_e,
                 use_pcp=False,
+                use_b12x=(
+                    self.attn_backend.get_name() == "B12X"
+                    and envs.VLLM_USE_B12X_DCP_A2A
+                ),
             )
         self.prefill_backend = get_mla_prefill_backend(vllm_config)(
             num_heads=self.num_local_heads,
@@ -441,6 +473,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             v_head_dim=self.v_head_dim,
             vllm_config=vllm_config,
         )
+        if callable(getattr(self.prefill_backend, "get_b12x_preparation_units", None)):
+            set_b12x_preparation_provider(self, self)
 
         if callable(getattr(self.prefill_backend, "get_b12x_preparation_units", None)):
             set_b12x_preparation_provider(self, self)
@@ -472,21 +506,43 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    def get_kv_cache_spec(
+        self, vllm_config: VllmConfig
+    ) -> MLAAttentionSpec | SlidingWindowMLASpec:
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
-        # TODO: Remove this mypy workaround once the K3 PR is fully merged.
-        return MLAAttentionSpec(  # type: ignore[call-arg]
+        shard_draft = (envs.VLLM_DCP_SHARD_DRAFT or "0").lower() in ("1", "true", "yes")
+        dcp_replicated = bool(
+            self.non_causal_multi_token_decode
+            and not shard_draft
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
+        common_kwargs = dict(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            dcp_replicated=dcp_replicated,
+            non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+        )
+        if self.draft_kv_window:
+            if self.draft_kv_window < vllm_config.cache_config.block_size:
+                raise ValueError("The draft KV window must cover at least one KV block")
+            if (
+                shard_draft
+                and vllm_config.parallel_config.decode_context_parallel_size > 1
+            ):
+                raise ValueError("A bounded Kimi DSpark window requires replicated KV")
+            return SlidingWindowMLASpec(
+                **common_kwargs, sliding_window=self.draft_kv_window
+            )
+        return MLAAttentionSpec(
+            **common_kwargs,
             # fp8_ds_mla: 656-byte custom layout; see flashmla_sparse.py.
             state_content_bytes=656 if self.kv_cache_dtype == "fp8_ds_mla" else None,
-            non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
@@ -575,6 +631,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         qkv_lora: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Expand q-LoRA output and run attention."""
         q_lora_rank = self.q_lora_rank
@@ -597,13 +654,21 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        self._attention(positions, q, kv_c_normed, k_pe.unsqueeze(1), attn_out)
+        self._attention(
+            positions,
+            q,
+            kv_c_normed,
+            k_pe.unsqueeze(1),
+            attn_out,
+            rope_cos_sin_cache=rope_cos_sin_cache,
+        )
         return attn_out
 
     def _forward_q_lora(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run the q-LoRA path, including gate overlap when eligible."""
         q_lora_rank = self.q_lora_rank
@@ -626,6 +691,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     positions,
                     hidden_states,
                     self._unquantized_gemm(hidden_states, qkv_a_weight),
+                    rope_cos_sin_cache=rope_cos_sin_cache,
                 ),
                 lambda: self._unquantized_gemm(hidden_states, gate_weight),
                 start_event,
@@ -644,13 +710,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             qkv_lora = qkv_a_proj(hidden_states)[0]
             gate = self.g_proj(hidden_states)[0] if self.g_proj is not None else None
 
-        attn_out = self._apply_q_lora_attention(positions, hidden_states, qkv_lora)
+        attn_out = self._apply_q_lora_attention(
+            positions, hidden_states, qkv_lora, rope_cos_sin_cache=rope_cos_sin_cache
+        )
         return attn_out, gate
 
     def _forward_full_rank_q(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run the full-rank Q path with an optional sequential gate."""
         q_proj = self.q_proj
@@ -667,7 +736,14 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        self._attention(positions, q, kv_c_normed, k_pe.unsqueeze(1), attn_out)
+        self._attention(
+            positions,
+            q,
+            kv_c_normed,
+            k_pe.unsqueeze(1),
+            attn_out,
+            rope_cos_sin_cache=rope_cos_sin_cache,
+        )
 
         gate = self.g_proj(hidden_states)[0] if self.g_proj is not None else None
         return attn_out, gate
@@ -676,11 +752,17 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        output: torch.Tensor | None = None,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.q_lora_rank is None:
-            attn_out, gate = self._forward_full_rank_q(positions, hidden_states)
+            attn_out, gate = self._forward_full_rank_q(
+                positions, hidden_states, rope_cos_sin_cache=rope_cos_sin_cache
+            )
         else:
-            attn_out, gate = self._forward_q_lora(positions, hidden_states)
+            attn_out, gate = self._forward_q_lora(
+                positions, hidden_states, rope_cos_sin_cache=rope_cos_sin_cache
+            )
 
         if gate is not None:
             attn_out = _gate_sigmoid_mul(attn_out, gate)
@@ -688,7 +770,14 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(attn_out):
             return self.gemm_rs_ar(attn_out, self.o_proj.weight)
 
+        if output is not None:
+            return project_into_consumed_output(self.o_proj, attn_out, output)
         return self.o_proj(attn_out)[0]
+
+    def should_use_caller_output(self, output: torch.Tensor) -> bool:
+        return self.gemm_rs_ar is None and can_reuse_projection_output(
+            self.o_proj, output
+        )
 
     @eager_break_during_capture
     def _attention(
@@ -698,6 +787,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         attn_out: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_by_layer = forward_context.attn_metadata
@@ -725,7 +815,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         if self.rotary_emb is not None:
             # Pass the fp32 cos/sin table straight to the fused epilogue (it reads
             # fp32 and does the RoPE math in fp32) -- no per-forward dtype cast.
-            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            cos_sin_cache = (
+                self.rotary_emb.cos_sin_cache
+                if rope_cos_sin_cache is None
+                else rope_cos_sin_cache
+            )
             rope_positions = positions
 
         # Decode tokens are laid out first, prefill tokens after. The fused
