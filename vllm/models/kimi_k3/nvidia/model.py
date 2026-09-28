@@ -109,6 +109,10 @@ from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
 )
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.ops import attn_res
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    enable_kimi_projection_tail_padding,
+    projection_checkpoint_dimensions,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
@@ -252,6 +256,11 @@ class KimiMLP(nn.Module):
         )
         replicate = use_sequence_parallel and not self.shard_sequence_parallel
 
+        checkpoint_intermediate_size = intermediate_size
+        if quant_config is not None and quant_config.get_name() == "exl3":
+            tp = 1 if replicate else get_tensor_model_parallel_world_size()
+            intermediate_size = cdiv(intermediate_size, tp * 32) * tp * 32
+
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -271,6 +280,16 @@ class KimiMLP(nn.Module):
             disable_tp=replicate,
             prefix=f"{prefix}.down_proj",
         )
+        if intermediate_size != checkpoint_intermediate_size:
+            enable_kimi_projection_tail_padding(self.gate_up_proj)
+            enable_kimi_projection_tail_padding(self.down_proj)
+            self._tp_checkpoint_dimensions = projection_checkpoint_dimensions(
+                {
+                    "gate_proj": (0, checkpoint_intermediate_size),
+                    "up_proj": (0, checkpoint_intermediate_size),
+                    "down_proj": (1, checkpoint_intermediate_size),
+                }
+            )
         self.gemm_rs_ar = None
         # RS requires sequence sharding; AR operates on replicated tokens.
         use_gemm_rs_ar = self.shard_sequence_parallel or (
@@ -1161,6 +1180,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "in_proj_qkvgfab": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"],
+        "in_proj_qkv": ["q_proj", "k_proj", "v_proj"],
+        "in_proj_gfab": ["g_proj", "f_a_proj", "b_proj"],
         "conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
         "fused_qkv_a_g_proj": ["q_a_proj", "kv_a_proj_with_mqa", "g_proj"],
@@ -1475,6 +1496,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             tuple[str, torch.Tensor] | tuple[str, torch.Tensor, dict[str, Any]]
         ],
     ) -> set[str]:
+        from .tp_projection import validate_checkpoint_tensor
+
+        checkpoint_dimensions = {
+            f"{prefix}.{name}": dimension
+            for prefix, module in self.named_modules()
+            for name, dimension in getattr(
+                module, "_tp_checkpoint_dimensions", {}
+            ).items()
+        }
         kda_config = self.config.linear_attn_config
         use_full_rank_gate = bool(
             kda_config and kda_config.get("use_full_rank_gate", False)
@@ -1487,6 +1517,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             (".in_proj_qkvgfab", ".v_proj", 2),
             (".in_proj_qkvgfab", ".b_proj", beta_shard_id),
             (".in_proj_qkvgfab", ".f_a_proj", 4),
+            (".in_proj_qkv", ".q_proj", 0),
+            (".in_proj_qkv", ".k_proj", 1),
+            (".in_proj_qkv", ".v_proj", 2),
+            (".in_proj_gfab", ".g_proj", 0),
+            (".in_proj_gfab", ".f_a_proj", 1),
+            (".in_proj_gfab", ".b_proj", 2),
             (".conv1d", ".q_conv1d", 0),
             (".conv1d", ".k_conv1d", 1),
             (".conv1d", ".v_conv1d", 2),
@@ -1501,6 +1537,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     (".fused_qkv_a_g_proj", ".q_a_proj", 0),
                     (".fused_qkv_a_g_proj", ".kv_a_proj_with_mqa", 1),
                     (".fused_qkv_a_g_proj", ".g_proj", 2),
+                    (".fused_qkv_a_proj", ".q_a_proj", 0),
+                    (".fused_qkv_a_proj", ".kv_a_proj_with_mqa", 1),
                 ]
             else:
                 stacked_params_mapping += [
@@ -1540,6 +1578,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         loaded_params: set[str] = set()
         for args in weights:
             name, loaded_weight = args[0], args[1]
+            validate_checkpoint_tensor(name, loaded_weight, checkpoint_dimensions)
             kwargs: dict[str, Any] = args[2] if len(args) > 2 else {}
             if "rotary_emb.inv_freq" in name:
                 continue

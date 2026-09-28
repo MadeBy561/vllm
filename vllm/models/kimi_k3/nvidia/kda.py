@@ -38,13 +38,20 @@ from vllm.model_executor.layers.quantization.modelopt import (
 )
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
-    sharded_weight_loader,
 )
-from vllm.model_executor.parameter import BasevLLMParameter, BlockQuantScaleParameter
+from vllm.model_executor.parameter import (
+    BasevLLMParameter,
+    BlockQuantScaleParameter,
+    copy_tensor_parallel_shard,
+)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
+)
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    enable_kimi_projection_tail_padding,
+    projection_checkpoint_dimensions,
 )
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
@@ -85,10 +92,41 @@ def a_log_weight_loader(
             )
             loaded_weight = loaded_weight.view(loaded_weight.shape[2])
 
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
-        return default_weight_loader(param, loaded_weight)
+        copy_tensor_parallel_shard(
+            param.data,
+            loaded_weight,
+            shard_axis,
+            start_idx,
+            shard_size,
+            allow_padding=getattr(param, "allow_tp_padding", False),
+        )
 
     return loader
+
+
+def use_split_mixed_precision_input_projection(quant_config: object | None) -> bool:
+    """Keep serialized MXFP8 Q/K/V separate from BF16 gate/factor/beta weights."""
+    ignored = set(getattr(quant_config, "dense_ignored_layers", ()))
+    return (
+        getattr(quant_config, "dense_format", None) == "mxfp8"
+        and not ignored.intersection({"q_proj", "k_proj", "v_proj"})
+        and {"g_proj", "f_a_proj", "b_proj"}.issubset(ignored)
+    )
+
+
+def initialize_kda_input_projection_padding(
+    layer: nn.Module, padding_rows: int, hidden_size: int
+) -> None:
+    """Declare and zero local projection rows absent from the checkpoint."""
+    if padding_rows == 0:
+        return
+    if padding_rows < 0 or padding_rows > layer.weight.shape[0]:
+        raise ValueError(
+            "KDA input projection padding must fit the local weight rows, got "
+            f"padding_rows={padding_rows}, rows={layer.weight.shape[0]}."
+        )
+    layer._vllm_online_processing_unloaded = {"weight": padding_rows * hidden_size}
+    layer.weight.data[-padding_rows:].zero_()
 
 
 class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
@@ -512,11 +550,18 @@ def _make_decode_conv1d_weight_loader(
         shard_size = sharded_dims[loaded_shard_id]
         source_start = tp_rank * shard_size
         target_start = sum(sharded_dims[:loaded_shard_id])
-        loaded_shard = loaded_weight[source_start : source_start + shard_size]
-        param.data[target_start : target_start + shard_size].copy_(loaded_shard)
+        destination = param.data[target_start : target_start + shard_size]
+        copy_tensor_parallel_shard(
+            destination,
+            loaded_weight,
+            0,
+            source_start,
+            shard_size,
+            allow_padding=getattr(param, "allow_tp_padding", False),
+        )
         if decode_conv1d_weight is not None and not param.is_meta:
             decode_conv1d_weight[loaded_shard_id].copy_(
-                loaded_shard.squeeze(1).transpose(0, 1)
+                destination.squeeze(1).transpose(0, 1)
             )
 
     return weight_loader
@@ -596,6 +641,34 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         assert self.num_heads % self.tp_size == 0
         self.local_num_heads = divide(self.num_heads, self.tp_size)
         self.projection_size = self.head_dim * self.num_heads
+        original_heads = kda_config.get("original_num_heads", self.num_heads)
+        if original_heads != self.num_heads:
+            original_width = original_heads * self.head_dim
+            self._tp_checkpoint_dimensions = projection_checkpoint_dimensions(
+                {
+                    **{
+                        name: (0, original_width)
+                        for name in (
+                            "q_proj",
+                            "k_proj",
+                            "v_proj",
+                            "g_proj",
+                            "f_b_proj",
+                            "q_conv1d",
+                            "k_conv1d",
+                            "v_conv1d",
+                        )
+                    },
+                    "b_proj": (0, original_heads),
+                    "o_proj": (1, original_width),
+                }
+            )
+            self._tp_checkpoint_dimensions.update(
+                {
+                    "A_log": (None, original_heads),
+                    "dt_bias": (None, original_width),
+                }
+            )
         self.local_projection_size = divide(self.projection_size, self.tp_size)
         self.conv_size = kda_config["short_conv_kernel_size"]
         assert kda_config.get("use_full_rank_gate", False), (
@@ -624,19 +697,46 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             else 16
         )
         self.in_proj_padding = -local_output_size % alignment
-        if self.in_proj_padding:
-            in_proj_output_sizes.append(self.in_proj_padding * self.tp_size)
-        self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
-            self.hidden_size,
-            in_proj_output_sizes,
-            replicated_shard_id=4,
-            tp_size=self.tp_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=in_proj_prefix,
+        self.split_mixed_precision_input = use_split_mixed_precision_input_projection(
+            self.quant_config
         )
-        if self.in_proj_padding:
-            self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
+        if self.split_mixed_precision_input:
+            self.in_proj_qkv = MergedColumnParallelLinear(
+                self.hidden_size,
+                [self.projection_size] * 3,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkv",
+            )
+            gfab_sizes = [self.projection_size, self.head_dim, self.num_heads]
+            if self.in_proj_padding:
+                gfab_sizes.append(self.in_proj_padding * self.tp_size)
+            self.in_proj_gfab = _KimiGDNMergedColumnParallelLinear(
+                self.hidden_size,
+                gfab_sizes,
+                replicated_shard_id=1,
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_gfab",
+            )
+            padded_projection = self.in_proj_gfab
+        else:
+            if self.in_proj_padding:
+                in_proj_output_sizes.append(self.in_proj_padding * self.tp_size)
+            self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
+                self.hidden_size,
+                in_proj_output_sizes,
+                replicated_shard_id=4,
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=in_proj_prefix,
+            )
+            padded_projection = self.in_proj_qkvgfab
+        initialize_kda_input_projection_padding(
+            padded_projection, self.in_proj_padding, self.hidden_size
+        )
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -648,7 +748,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.dt_bias = nn.Parameter(
             torch.empty(self.local_projection_size, dtype=torch.float32)
         )
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.dt_bias, {"weight_loader": a_log_weight_loader(0)})
 
         # One packed parameter and cache let decode run a single conv update.
         # Prefill slices them back into Q/K/V to obtain dense outputs cheaply.
@@ -708,6 +808,16 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             torch.empty(self.local_num_heads, dtype=torch.float32)
         )
         set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader(0)})
+        if self.num_heads != kda_config.get("original_num_heads", self.num_heads):
+            self.dt_bias.allow_tp_padding = True
+            self.A_log.allow_tp_padding = True
+            inputs = (
+                (self.in_proj_qkv, self.in_proj_gfab)
+                if self.split_mixed_precision_input
+                else (self.in_proj_qkvgfab,)
+            )
+            for projection in (*inputs, self.f_b_proj, self.conv1d):
+                enable_kimi_projection_tail_padding(projection)
 
         self.gate_lower_bound: float | None = kda_config.get("gate_lower_bound", None)
         if self.gate_lower_bound is not None:
@@ -781,6 +891,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        if self.num_heads != kda_config.get("original_num_heads", self.num_heads):
+            enable_kimi_projection_tail_padding(self.o_proj)
         self.gemm_rs_ar = None
         if run_gemm_rs_ar:
             from vllm.models.kimi_k3.nvidia.ops.cute_dsl.gemm_rs_ar import (
@@ -808,6 +920,18 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             ),
         )
 
+    def _project_split_input(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project MXFP8 Q/K/V separately from BF16 gates and factors."""
+        mixed_qkv = self.in_proj_qkv(hidden_states)[0]
+        split_sizes = [self.local_projection_size, self.head_dim, self.local_num_heads]
+        if self.in_proj_padding:
+            split_sizes.append(self.in_proj_padding)
+        projected = self.in_proj_gfab(hidden_states)[0].split(split_sizes, dim=-1)
+        g_proj_states, f_a, beta = projected[:3]
+        return mixed_qkv, g_proj_states, self.f_b_proj(f_a)[0], beta
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -816,7 +940,11 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
         projection_events = self._projection_events
         projection_aux_stream = self._projection_aux_stream
-        if (
+        if self.split_mixed_precision_input:
+            mixed_qkv, g_proj_states, g1, beta = self._project_split_input(
+                hidden_states
+            )
+        elif (
             0 < num_tokens <= self._projection_overlap_max_tokens
             and hidden_states.stride() == (self.hidden_size, 1)
             and projection_events is not None
