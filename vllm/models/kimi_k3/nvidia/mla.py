@@ -25,7 +25,7 @@ KV cache, and absorbs ``kv_b_proj`` into ``W_UK_T`` / ``W_UV`` -- mirroring the
 
 K3 specifics: optional rotary embedding (disabled for the target model's NoPE
 layers, enabled for DSpark) and an optional sigmoid output gate (``g_proj``,
-merged into ``fused_qkv_a_g_proj`` when the q-LoRA front-end is present).
+merged into ``fused_qkv_a_g_proj`` when its checkpoint precision matches Q/KV).
 
 Out of scope (extension points, not wired here): prefill context parallelism
 (PCP), sparse/indexer MLA, and the ROCm/aiter fp8/fp4 BMM fast paths.
@@ -88,8 +88,13 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_kv_concat_quant_fp8,
     fused_mla_qkv_quant_kv_cache_fp8_insert,
 )
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    enable_kimi_projection_tail_padding,
+    projection_checkpoint_dimensions,
+)
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.utils.b12x import set_b12x_preparation_provider
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
@@ -206,6 +211,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self.fused_qkv_a_proj: MergedColumnParallelLinear | None = None
         self.fused_qkv_a_g_proj: KimiK3MergedQKVGateLinear | None = None
         self.q_proj: ColumnParallelLinear | None = None
+        self.q_b_proj: ColumnParallelLinear | None = None
         self.kv_a_proj_with_mqa: ReplicatedLinear | None = None
         self.g_proj: ColumnParallelLinear | None = None
         self.aux_stream: torch.cuda.Stream | None = None
@@ -215,7 +221,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         if self.q_lora_rank is not None:
             # The latent Q and KV shards are replicated across TP ranks. Their
             # TP splitting happens in q_b_proj and kv_b_proj instead.
-            if use_output_gate:
+            if use_output_gate and not getattr(
+                quant_config, "separate_mla_output_gate", False
+            ):
                 # The output gate is shard 2 of the same input projection.
                 self.fused_qkv_a_g_proj = KimiK3MergedQKVGateLinear(
                     hidden_size=self.hidden_size,
@@ -247,6 +255,14 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     prefix=f"{prefix}.fused_qkv_a_proj",
                     disable_tp=True,
                 )
+                if use_output_gate:
+                    self.g_proj = ColumnParallelLinear(
+                        self.hidden_size,
+                        self.num_heads * self.v_head_dim,
+                        bias=False,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.g_proj",
+                    )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 self.q_lora_rank,
@@ -299,6 +315,29 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        if num_heads != getattr(config, "original_num_attention_heads", num_heads):
+            original_heads = config.original_num_attention_heads
+            self._tp_checkpoint_dimensions = projection_checkpoint_dimensions(
+                {
+                    "q_proj": (0, original_heads * self.qk_head_dim),
+                    "q_b_proj": (0, original_heads * self.qk_head_dim),
+                    "kv_b_proj": (
+                        0,
+                        original_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                    ),
+                    "g_proj": (0, original_heads * self.v_head_dim),
+                    "o_proj": (1, original_heads * self.v_head_dim),
+                }
+            )
+            for projection in (
+                self.q_proj,
+                self.q_b_proj,
+                self.kv_b_proj,
+                self.g_proj,
+                self.o_proj,
+            ):
+                if projection is not None:
+                    enable_kimi_projection_tail_padding(projection)
         self.gemm_rs_ar = None
         if run_gemm_rs_ar:
             from vllm.models.kimi_k3.nvidia.ops.cute_dsl.gemm_rs_ar import (
@@ -356,6 +395,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             kv_b_proj=self.kv_b_proj,
             indexer=None,
         )
+        provider = getattr(self.impl, "b12x_preparation_provider", None)
+        if provider is not None:
+            set_b12x_preparation_provider(self, provider)
         if getattr(self.impl, "dcp_world_size", -1) < 1:
             # FlashAttention requires the cp_world_size is positive and the cp_rank
             # is non negative; manually set here if not set by caller (-1 is unset)
@@ -400,6 +442,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             vllm_config=vllm_config,
         )
 
+        if callable(getattr(self.prefill_backend, "get_b12x_preparation_units", None)):
+            set_b12x_preparation_provider(self, self)
+
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -409,6 +454,17 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     # ------------------------------------------------------------------
     # AttentionLayerBase interface
     # ------------------------------------------------------------------
+    def get_b12x_preparation_units(self, layer, workload):
+        if layer is not self:
+            raise ValueError("Kimi MLA preparation owner mismatch")
+        provider = getattr(self.impl, "b12x_preparation_provider", None)
+        decode_hook = getattr(provider, "get_b12x_preparation_units", None)
+        units = tuple(decode_hook(self, workload)) if callable(decode_hook) else ()
+        prefill_hook = getattr(self.prefill_backend, "get_b12x_preparation_units", None)
+        if callable(prefill_hook):
+            units += tuple(prefill_hook(self, workload))
+        return units
+
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
@@ -533,6 +589,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             self.kv_a_layernorm.weight.data,
             self.rms_norm_eps,
         )
+        assert self.q_b_proj is not None
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
 
         attn_out = torch.empty(
@@ -577,17 +634,15 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
 
         # run g_proj together with qkv_a
-        if self.use_output_gate:
-            qkv_a_proj = self.fused_qkv_a_g_proj
-            assert qkv_a_proj is not None
-            qkv_lora, gate = qkv_a_proj(hidden_states)[0].split(
+        if self.fused_qkv_a_g_proj is not None:
+            qkv_lora, gate = self.fused_qkv_a_g_proj(hidden_states)[0].split(
                 [qkv_a_rows, self.num_local_heads * self.v_head_dim], dim=-1
             )
         else:
             qkv_a_proj = self.fused_qkv_a_proj
             assert qkv_a_proj is not None
             qkv_lora = qkv_a_proj(hidden_states)[0]
-            gate = None
+            gate = self.g_proj(hidden_states)[0] if self.g_proj is not None else None
 
         attn_out = self._apply_q_lora_attention(positions, hidden_states, qkv_lora)
         return attn_out, gate
@@ -989,7 +1044,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
         Supported configs (K3 fp8 policy):
           - bf16 cache        -> bf16 prefill query
-          - plain fp8 cache   -> fp8 prefill query (unscaled q/k/v; cache _k_scale)
+          - plain fp8 cache   -> fp8 prefill query, or bf16 query for NoPE
           - fp8_ds_mla cache  -> bf16 prefill query (656B per-tile self-scaled)
         """
         prefill = attn_metadata.prefill
@@ -1021,30 +1076,42 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
             )
         elif is_quantized_kv_cache(self.kv_cache_dtype):
-            assert fp8_prefill, (
-                "Kimi-K3 fp8 KV cache requires an fp8 prefill query; enable "
-                "--attention-config '{\"use_prefill_query_quantization\": true}'."
-            )
-            # Plain per-tensor fp8: quant q/k/v (unscaled, matching forward_mha's
-            # unscaled `.to(fp8)`) and insert the fp8 latent (scaled by _k_scale).
-            kv_cache = self.kv_cache
-            if kv_cache.dtype != torch.float8_e4m3fn:
-                kv_cache = kv_cache.view(torch.float8_e4m3fn)
-            q, k, v = fused_mla_qkv_quant_kv_cache_fp8_insert(
-                q,
-                k_nope,
-                k_pe,
-                kv_c_normed,
-                v,
-                kv_cache,
-                slot_mapping,
-                self._one_scale,
-                self._one_scale,
-                self._one_scale,
-                self._k_scale_inv,
-                positions,
-                cos_sin_cache,
-            )
+            if fp8_prefill:
+                kv_cache = self.kv_cache
+                if kv_cache.dtype != torch.float8_e4m3fn:
+                    kv_cache = kv_cache.view(torch.float8_e4m3fn)
+                q, k, v = fused_mla_qkv_quant_kv_cache_fp8_insert(
+                    q,
+                    k_nope,
+                    k_pe,
+                    kv_c_normed,
+                    v,
+                    kv_cache,
+                    slot_mapping,
+                    self._one_scale,
+                    self._one_scale,
+                    self._one_scale,
+                    self._k_scale_inv,
+                    positions,
+                    cos_sin_cache,
+                )
+            else:
+                assert positions is None and cos_sin_cache is None, (
+                    "BF16 prefill with an FP8 cache requires Kimi-K3 NoPE attention."
+                )
+                k_pe_flat = k_pe.reshape(k_pe.shape[0], -1)
+                k = torch.cat(
+                    (k_nope, k_pe_flat[:, None, :].expand(-1, k_nope.shape[1], -1)),
+                    dim=-1,
+                )
+                ops.concat_and_cache_mla(
+                    kv_c_normed,
+                    k_pe_flat,
+                    self.kv_cache,
+                    slot_mapping.flatten(),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
+                )
         else:
             # Concat full K = [k_nope | k_pe] and insert [kv_c_normed | k_pe]
             # into the paged cache for these prefill tokens, in one launch.

@@ -488,10 +488,15 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
         "fp8_e4m3",
     ):
         return "fp8_ds_mla"
-    if backend_name == "B12X" and kv_cache_dtype in (
-        "auto",
-        "fp8",
-        "fp8_e4m3",
+    if (
+        backend_name == "B12X"
+        and attn_backend.is_sparse()
+        and kv_cache_dtype
+        in (
+            "auto",
+            "fp8",
+            "fp8_e4m3",
+        )
     ):
         return "fp8_ds_mla"
     return kv_cache_dtype
@@ -805,6 +810,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     v_head_dim=self.v_head_dim,
                     vllm_config=vllm_config,
                 )
+
+                if callable(
+                    getattr(self.prefill_backend, "get_b12x_preparation_units", None)
+                ):
+                    set_b12x_preparation_provider(self, self)
 
         self.kv_cache = torch.tensor([])
 
@@ -1706,6 +1716,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         provider = getattr(impl, "b12x_preparation_provider", None)
         hook = getattr(provider, "get_b12x_preparation_units", None)
         backend_units = tuple(hook(impl, workload)) if callable(hook) else ()
+        prefill_hook = getattr(
+            getattr(self, "prefill_backend", None), "get_b12x_preparation_units", None
+        )
+        if callable(prefill_hook):
+            backend_units += tuple(prefill_hook(self, workload))
         weight = getattr(self, "W_UK_T", None)
         if (
             not isinstance(weight, torch.Tensor)
