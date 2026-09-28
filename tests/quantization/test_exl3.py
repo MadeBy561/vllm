@@ -563,3 +563,71 @@ def test_exl3_padding_does_not_mutate_official_mxfp4_config():
         model, SimpleNamespace(tensor_parallel_size=10)
     )
     assert vars(model) == {"quantization": "mxfp4"}
+
+
+@pytest.mark.parametrize("backend", ["nvidia", "amd"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_latent_runner_preserves_routed_output_dtype(backend, dtype):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+    from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
+    from vllm.models.kimi_k3.nvidia import latent_moe_runner
+
+    cls = (
+        latent_moe_runner.LatentMoERunner
+        if backend == "nvidia"
+        else ROCmLatentMoERunner
+    )
+    runner = SimpleNamespace(
+        layer_name="latent_dtype_test",
+        _quant_method=SimpleNamespace(has_unpadded_output=False, output_dtype=dtype),
+        moe_config=SimpleNamespace(should_defer_moe_finalize=lambda _: False),
+        _maybe_pad_hidden_states=lambda shared, routed: (routed, None, None),
+        _forward_entry=torch.ops.vllm.moe_forward_shared,
+        _select_tail_tier=lambda *_: latent_moe_runner.LatentTailTier.COLUMN_PARALLEL,
+        _shard_up_proj_tail=lambda routed, shared, _: routed,
+        _maybe_add_zero_expert_output=lambda result: result,
+    )
+    runner._encode_layer_name = lambda: MoERunner._encode_layer_name(runner)
+    with FakeTensorMode():
+        hidden = torch.empty(2, 8, dtype=torch.bfloat16)
+        shared = torch.empty(2, 16, dtype=torch.bfloat16)
+        result = cls._fused_forward(runner, hidden, torch.empty(2, 4), None, shared)
+    assert result.shape == hidden.shape
+    assert result.dtype == dtype
+
+
+@pytest.mark.parametrize("tp_size", [8, 9])
+def test_sharded_latent_tail_covers_every_output_column(monkeypatch, tp_size):
+    from vllm.models.kimi_k3.nvidia import latent_moe_runner
+
+    generator = torch.Generator().manual_seed(0)
+    weight = torch.randn(4096, 8, generator=generator)
+    partials = torch.randn(tp_size, 2, 8, generator=generator)
+    shared = torch.randn(tp_size, 2, 4096, generator=generator)
+    reduced_latent = partials.sum(0)
+    monkeypatch.setattr(
+        latent_moe_runner, "tensor_model_parallel_all_reduce", lambda _: reduced_latent
+    )
+    runner = SimpleNamespace(
+        moe_config=SimpleNamespace(tp_size=tp_size),
+        routed_output_transform=SimpleNamespace(
+            norm=None, up_proj=SimpleNamespace(weight=weight)
+        ),
+        _maybe_reduce_final_output=lambda output, *args, **kwargs: output,
+    )
+    outputs = []
+    for rank in range(tp_size):
+        monkeypatch.setattr(
+            latent_moe_runner, "get_tensor_model_parallel_rank", lambda rank=rank: rank
+        )
+        outputs.append(
+            latent_moe_runner.LatentMoERunner._shard_up_proj_tail(
+                runner, partials[rank], shared[rank].clone(), None
+            )
+        )
+    torch.testing.assert_close(
+        torch.stack(outputs).sum(0),
+        torch.nn.functional.linear(reduced_latent, weight) + shared.sum(0),
+    )
