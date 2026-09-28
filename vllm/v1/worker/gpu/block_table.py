@@ -6,12 +6,19 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
 from vllm.v1.worker.gpu.buffer_utils import (
     FusedStagedWriter,
     StagedWriteTensor,
     UvaBackedTensor,
     _load_ptr,
 )
+
+
+def slot_mapping_mode(layer_spec: KVCacheSpec) -> tuple[bool, bool]:
+    """Return whether the worker computes slot mappings for a group with this
+    layer spec, and whether the group is a per-request ring."""
+    return layer_spec.uses_slot_mapping, isinstance(layer_spec, CircularBufferSpec)
 
 
 class BlockTables:

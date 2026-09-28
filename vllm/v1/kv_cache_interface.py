@@ -277,8 +277,8 @@ class KVCacheSpec:
     def uses_slot_mapping(self) -> bool:
         """Whether the worker computes a per-token slot mapping for this spec.
 
-        Specs that address their pages themselves (raw storage, ring buffers)
-        take no slot mapping row.
+        Specs that address their pages themselves (raw storage) take no slot
+        mapping row.
         """
         return True
 
@@ -925,6 +925,10 @@ class CircularBufferSpec(AttentionSpec):
     by the speculative lookahead: a speculative step stores all of its rows,
     drafts included, before acceptance is known, while the next step still
     reads the open group's committed keys from the ring.
+
+    The worker maps every real row into that block at its position modulo
+    ``block_size`` and padding rows to the pad slot; owners write only rows
+    with a valid slot.
     """
 
     @property
@@ -949,10 +953,6 @@ class CircularBufferSpec(AttentionSpec):
 
     @property
     def prefix_cacheable(self) -> bool:
-        return False
-
-    @property
-    def uses_slot_mapping(self) -> bool:
         return False
 
 

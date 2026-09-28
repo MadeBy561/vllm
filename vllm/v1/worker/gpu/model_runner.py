@@ -68,7 +68,6 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
     KVCacheConfig,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -101,7 +100,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_attn_backend,
     init_kv_cache,
 )
-from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.block_table import BlockTables, slot_mapping_mode
 from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
 from vllm.v1.worker.gpu.buffer_utils import (
     set_default_max_concurrency,
@@ -626,8 +625,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             layer_spec = (
                 spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
             )
-            slot_mapping_enabled.append(layer_spec.uses_slot_mapping)
-            slot_mapping_circular.append(isinstance(layer_spec, CircularBufferSpec))
+            mapping_enabled, mapping_circular = slot_mapping_mode(layer_spec)
+            slot_mapping_enabled.append(mapping_enabled)
+            slot_mapping_circular.append(mapping_circular)
             group_cp_sizes.append(
                 1 if getattr(layer_spec, "dcp_replicated", False) else self.dcp_size
             )

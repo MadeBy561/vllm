@@ -162,7 +162,9 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
         runner.initialize_kv_cache(kv_cache_config)
 
     assert captured["max_num_blocks_per_group"] == [1, 1]
-    assert captured["slot_mapping_enabled"] == [False, True]
+    # The worker maps the ring into its block; QSA still builds its own slots.
+    assert captured["slot_mapping_enabled"] == [True, True]
+    assert captured["slot_mapping_circular"] == [True, False]
 
 
 @pytest.mark.parametrize(
