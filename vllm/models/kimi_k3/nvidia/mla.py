@@ -460,7 +460,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 is_lse_base_on_e=self.impl.lse_base_on_e,
                 use_pcp=False,
                 use_b12x=(
-                    self.attn_backend.get_name() == "B12X_MLA"
+                    self.attn_backend.get_name() == "B12X"
                     and envs.VLLM_USE_B12X_DCP_A2A
                 ),
             )
@@ -473,6 +473,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             v_head_dim=self.v_head_dim,
             vllm_config=vllm_config,
         )
+        if callable(getattr(self.prefill_backend, "get_b12x_preparation_units", None)):
+            set_b12x_preparation_provider(self, self)
+
         if callable(getattr(self.prefill_backend, "get_b12x_preparation_units", None)):
             set_b12x_preparation_provider(self, self)
 
