@@ -28,6 +28,7 @@ class BlockTables:
         cp_interleave: int = 1,
         slot_mapping_enabled: list[bool] | None = None,
         group_cp_sizes: list[int] | None = None,
+        slot_mapping_circular: list[bool] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -50,6 +51,12 @@ class BlockTables:
             slot_mapping_enabled = [True] * self.num_kv_cache_groups
         assert len(slot_mapping_enabled) == self.num_kv_cache_groups
         self._slot_mapping_enabled = slot_mapping_enabled
+        # A circular group keeps one block per request as a ring: every position maps
+        # into that block at position modulo the block size.
+        if slot_mapping_circular is None:
+            slot_mapping_circular = [False] * self.num_kv_cache_groups
+        assert len(slot_mapping_circular) == self.num_kv_cache_groups
+        self._slot_mapping_circular = slot_mapping_circular
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -113,6 +120,9 @@ class BlockTables:
         )
         self.slot_mapping_enabled = torch.tensor(
             self._slot_mapping_enabled, dtype=torch.bool, device=self.device
+        )
+        self.slot_mapping_circular = torch.tensor(
+            self._slot_mapping_circular, dtype=torch.bool, device=self.device
         )
         self.group_cp_sizes = torch.tensor(
             self.group_cp_sizes_list, dtype=torch.int32, device=self.device
@@ -228,6 +238,7 @@ class BlockTables:
             self.block_sizes_tensor,
             self.kernel_block_sizes_tensor,
             self.slot_mapping_enabled,
+            self.slot_mapping_circular,
             self.group_cp_sizes,
             slot_mappings,
             slot_mappings.stride(0),
@@ -308,6 +319,7 @@ def _compute_slot_mappings_kernel(
     block_sizes,  # [num_kv_cache_groups]
     kernel_block_sizes,  # [num_kv_cache_groups]
     slot_mapping_enabled,  # [num_kv_cache_groups]
+    slot_mapping_circular,  # [num_kv_cache_groups]
     group_cp_sizes,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
@@ -339,6 +351,7 @@ def _compute_slot_mappings_kernel(
     kv_block_size = tl.load(block_sizes + group_id)
     kernel_block_size = tl.load(kernel_block_sizes + group_id)
     mapping_enabled = tl.load(slot_mapping_enabled + group_id)
+    circular = tl.load(slot_mapping_circular + group_id)
     group_cp_size = tl.load(group_cp_sizes + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
@@ -366,7 +379,7 @@ def _compute_slot_mappings_kernel(
             local_positions = virtual_block_indices * kv_block_size + local_offsets
 
         block_indices = tl.where(
-            mapping_enabled, local_positions // kernel_block_size, 0
+            mapping_enabled & ~circular, local_positions // kernel_block_size, 0
         )
         block_offsets = local_positions % kernel_block_size
         valid_block = token_mask & (block_indices < num_blocks)

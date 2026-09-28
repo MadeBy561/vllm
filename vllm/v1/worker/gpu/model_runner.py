@@ -68,6 +68,7 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     KVCacheConfig,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -617,6 +618,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         block_sizes = []
         max_num_blocks_per_group = []
         slot_mapping_enabled = []
+        slot_mapping_circular = []
         group_cp_sizes = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
@@ -625,6 +627,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
             )
             slot_mapping_enabled.append(layer_spec.uses_slot_mapping)
+            slot_mapping_circular.append(isinstance(layer_spec, CircularBufferSpec))
             group_cp_sizes.append(
                 1 if getattr(layer_spec, "dcp_replicated", False) else self.dcp_size
             )
@@ -707,6 +710,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             kernel_block_sizes=self.kernel_block_sizes,
             slot_mapping_enabled=slot_mapping_enabled,
+            slot_mapping_circular=slot_mapping_circular,
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
