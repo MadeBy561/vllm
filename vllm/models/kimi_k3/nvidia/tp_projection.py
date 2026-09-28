@@ -299,6 +299,15 @@ def validate_checkpoint_tensor(
     if expected is None:
         return
     axis, size = expected
+    # Kimi-K3 stores 96 KDA heads in a flat 128-entry A_log tensor.
+    if (
+        name.endswith(".A_log")
+        and axis is None
+        and size == 96
+        and tensor.shape == (128,)
+        and not torch.count_nonzero(tensor[96:]).item()
+    ):
+        return
     actual = (
         tensor.numel()
         if axis is None

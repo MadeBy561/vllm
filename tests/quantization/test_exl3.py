@@ -225,6 +225,45 @@ def test_exl3_rejects_mismatched_expert_math(moe_config, fields):
         Exl3MoEMethod(replace(moe_config, **fields))
 
 
+def test_exl3_shared_mlp_loads_tp9_tail_without_changing_checkpoint_width(
+    monkeypatch, default_vllm_config
+):
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.layers.quantization.exl3 import Exl3Config
+    from vllm.models.kimi_k3.nvidia import model as kimi
+
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(world_size=9, rank_in_group=8)
+    )
+    quant = Exl3Config(["gate_up_proj", "down_proj"])
+    model = kimi.KimiLinearModel.__new__(kimi.KimiLinearModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(linear_attn_config={}, is_moe=False)
+    model.mlp = kimi.KimiMLP(32, 6144, "silu", quant, reduce_results=False)
+    gate = torch.randn(6144, 32)
+    up = torch.randn_like(gate)
+    down = torch.randn(32, 6144)
+    model.load_weights(
+        [
+            (f"mlp.{name}.weight", weight)
+            for name, weight in (
+                ("gate_proj", gate),
+                ("up_proj", up),
+                ("down_proj", down),
+            )
+        ]
+    )
+    local = model.mlp.down_proj.weight.shape[1]
+    assert local == 704
+    start, valid = 8 * local, 6144 - 8 * local
+    for shard, weight in enumerate((gate, up)):
+        actual = model.mlp.gate_up_proj.weight[shard * local : (shard + 1) * local]
+        torch.testing.assert_close(actual[:valid], weight[start:])
+        assert torch.count_nonzero(actual[valid:]) == 0
+    torch.testing.assert_close(model.mlp.down_proj.weight[:, :valid], down[:, start:])
+    assert torch.count_nonzero(model.mlp.down_proj.weight[:, valid:]) == 0
+
+
 @pytest.mark.parametrize(
     "fields", [{"use_ep": True, "ep_size": 2}, {"dp_size": 2}, {"enable_eplb": True}]
 )
@@ -374,10 +413,13 @@ def test_exl3_split_kda_projection_keeps_gate_and_beta_order():
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("checkpoint_heads", [69, 70, 72])
+@pytest.mark.parametrize(
+    "original_heads,checkpoint_heads,padding_value",
+    [(70, 69, 0), (70, 70, 0), (70, 72, 0), (96, 128, 0), (96, 128, 1)],
+)
 @pytest.mark.parametrize("legacy_shape", [False, True])
 def test_kimi_weight_loading_checks_original_heads_before_tail_padding(
-    monkeypatch, checkpoint_heads, legacy_shape
+    monkeypatch, original_heads, checkpoint_heads, padding_value, legacy_shape
 ):
     from vllm.models.kimi_k3.nvidia import kda
     from vllm.models.kimi_k3.nvidia.model import KimiLinearModel
@@ -386,23 +428,31 @@ def test_kimi_weight_loading_checks_original_heads_before_tail_padding(
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(linear_attn_config={}, is_moe=False)
     model.attention = torch.nn.Module()
-    model.attention._tp_checkpoint_dimensions = {"A_log": (None, 70)}
-    parameter = torch.nn.Parameter(torch.full((8,), -1.0))
+    model.attention._tp_checkpoint_dimensions = {"A_log": (None, original_heads)}
+    local_heads = (original_heads + 8) // 9
+    parameter = torch.nn.Parameter(torch.full((local_heads,), -1.0))
     parameter.allow_tp_padding = True
     parameter.weight_loader = kda.a_log_weight_loader(0)
     model.attention.register_parameter("A_log", parameter)
     monkeypatch.setattr(kda, "get_tensor_model_parallel_rank", lambda: 8)
     checkpoint = torch.arange(checkpoint_heads, dtype=torch.float32)
+    if original_heads == 96:
+        checkpoint[96:] = padding_value
     if legacy_shape:
         checkpoint = checkpoint.view(1, 1, -1, 1)
     weights = [("attention.A_log", checkpoint)]
-    if checkpoint_heads != 70:
+    valid = checkpoint_heads == original_heads or (
+        original_heads == 96 and padding_value == 0 and not legacy_shape
+    )
+    if not valid:
         with pytest.raises(ValueError, match="original head count"):
             model.load_weights(weights)
         assert torch.all(parameter == -1)
     else:
         assert model.load_weights(weights) == {"attention.A_log"}
-        expected = torch.cat((torch.arange(64, 70), torch.zeros(2)))
+        expected = torch.zeros(local_heads)
+        values = torch.arange(8 * local_heads, original_heads)
+        expected[: len(values)] = values
         torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
 
 

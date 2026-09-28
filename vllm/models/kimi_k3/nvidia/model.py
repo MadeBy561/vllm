@@ -122,6 +122,7 @@ from vllm.models.kimi_k3.nvidia.tp_projection import (
     can_reuse_projection_output,
     enable_kimi_projection_tail_padding,
     project_into_consumed_output,
+    projection_checkpoint_dimensions,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
@@ -313,6 +314,13 @@ class KimiMLP(nn.Module):
         if intermediate_size != checkpoint_intermediate_size:
             enable_kimi_projection_tail_padding(self.gate_up_proj)
             enable_kimi_projection_tail_padding(self.down_proj)
+            self._tp_checkpoint_dimensions = projection_checkpoint_dimensions(
+                {
+                    "gate_proj": (0, checkpoint_intermediate_size),
+                    "up_proj": (0, checkpoint_intermediate_size),
+                    "down_proj": (1, checkpoint_intermediate_size),
+                }
+            )
         self.gemm_rs_ar = None
         # RS requires sequence sharding; AR operates on replicated tokens.
         use_gemm_rs_ar = self.shard_sequence_parallel or (
