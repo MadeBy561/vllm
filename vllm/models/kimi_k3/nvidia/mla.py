@@ -90,6 +90,7 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
 )
 from vllm.models.kimi_k3.nvidia.tp_projection import (
     enable_kimi_projection_tail_padding,
+    projection_checkpoint_dimensions,
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -314,6 +315,19 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             prefix=f"{prefix}.o_proj",
         )
         if num_heads != getattr(config, "original_num_attention_heads", num_heads):
+            original_heads = config.original_num_attention_heads
+            self._tp_checkpoint_dimensions = projection_checkpoint_dimensions(
+                {
+                    "q_proj": (0, original_heads * self.qk_head_dim),
+                    "q_b_proj": (0, original_heads * self.qk_head_dim),
+                    "kv_b_proj": (
+                        0,
+                        original_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                    ),
+                    "g_proj": (0, original_heads * self.v_head_dim),
+                    "o_proj": (1, original_heads * self.v_head_dim),
+                }
+            )
             for projection in (
                 self.q_proj,
                 self.q_b_proj,
