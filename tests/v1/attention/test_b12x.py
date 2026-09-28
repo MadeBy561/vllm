@@ -100,7 +100,11 @@ def test_b12x_dense_mla_prepared_capacity_replay_and_high_pages(
         max_model_len=128 * dcp_size,
         speculative_tokens=3,
     )
-    units = impl.get_b12x_preparation_units(layer, workload)
+    owner = layer
+    if dcp_size > 1:
+        impl.bind_kv_cache(cache)
+        owner = impl
+    units = impl.get_b12x_preparation_units(owner, workload)
     capacity = 14 if parallel_drafting else 8
     assert max(impl._capacities) == capacity
     heads = 6 * dcp_size
