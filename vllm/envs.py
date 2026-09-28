@@ -59,10 +59,6 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
-    VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
-    VLLM_MLA_PREFILL_DCP_OVERLAP: bool = False
-    VLLM_MLA_PREFILL_DCP_FP8_TRANSPORT: bool = False
-    VLLM_KIMI_L2_PREFETCH: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -206,6 +202,9 @@ if TYPE_CHECKING:
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
+    VLLM_DS41_MARKOV_NVFP4: bool = False
+    VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
+    VLLM_DS41_ENGRAM_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
     VLLM_B12X_MLA_CKV_GATHER: bool = False
@@ -234,21 +233,6 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_KIMI_K3_GEMM_RS: bool = False
-    VLLM_KIMI_SHARD_QKV_A: bool = False
-    VLLM_KIMI_SHARD_AUXILIARY_PROJECTIONS: bool = False
-    VLLM_KIMI_ALIGNED_DECODE_PROJECTIONS: bool = False
-    VLLM_K3_KV_GROUP_SIZE: int = 0
-    VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
-    VLLM_DSPARK_COMPACT_ROPE: bool = False
-    VLLM_DFLASH_AUX_MXFP8_STREAMING: bool = False
-    VLLM_DFLASH_AUX_BF16_STAGING: bool = False
-    VLLM_DFLASH_COMPACT_ROPE: bool = False
-    VLLM_DFLASH_SHARD_AUX_PROJECTION: bool = False
-    VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
-    VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
-    VLLM_KIMI_K3_B12X_DSPARK_ARGMAX: bool = False
-    VLLM_DCP_SHARD_DRAFT: str | None = None
-    VLLM_USE_B12X_DCP_A2A: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -645,9 +629,6 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    # Cache hints for immutable Kimi dense weights during TP reductions.
-    # Opt in only after measuring the served topology; prefill is unchanged.
-    "VLLM_KIMI_L2_PREFETCH": lambda: os.getenv("VLLM_KIMI_L2_PREFETCH", "0") == "1",
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
@@ -1134,20 +1115,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
-    ),
-    # Gathered MLA context rows; zero retains automatic workspace sizing.
-    "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE": lambda: int(
-        os.getenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "0")
-    ),
-    # Prefetch the following MLA context chunk while attention consumes the
-    # preceding chunk. Requires DCP with the standard NCCL KV gather transport.
-    "VLLM_MLA_PREFILL_DCP_OVERLAP": lambda: bool(
-        int(os.getenv("VLLM_MLA_PREFILL_DCP_OVERLAP", "0"))
-    ),
-    # Transfer existing E4M3 KV bytes and each rank's scale before upconversion.
-    # Requires overlapped DCP prefill and BF16 attention inputs.
-    "VLLM_MLA_PREFILL_DCP_FP8_TRANSPORT": lambda: bool(
-        int(os.getenv("VLLM_MLA_PREFILL_DCP_FP8_TRANSPORT", "0"))
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
@@ -1681,60 +1648,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use the SM100 BF16 GEMM-RS kernel for eligible Kimi-K3 sequence-parallel
     # row-parallel projections. All TP ranks must belong to one NVLink domain.
     "VLLM_KIMI_K3_GEMM_RS": lambda: bool(int(os.getenv("VLLM_KIMI_K3_GEMM_RS", "0"))),
-    # Shard Kimi-K3 MLA latent projection weights and gather their outputs.
-    "VLLM_USE_B12X_DCP_A2A": lambda: bool(int(os.getenv("VLLM_USE_B12X_DCP_A2A", "0"))),
-    "VLLM_KIMI_SHARD_QKV_A": lambda: bool(int(os.getenv("VLLM_KIMI_SHARD_QKV_A", "0"))),
-    # Shard Kimi router and latent MoE weights when token rows are replicated.
-    "VLLM_KIMI_SHARD_AUXILIARY_PROJECTIONS": lambda: bool(
-        int(os.getenv("VLLM_KIMI_SHARD_AUXILIARY_PROJECTIONS", "0"))
-    ),
-    # Align BF16 auxiliary GEMMs with EXL3 expert shards for multi-row decode,
-    # preserving prefill.
-    "VLLM_KIMI_ALIGNED_DECODE_PROJECTIONS": lambda: bool(
-        int(os.getenv("VLLM_KIMI_ALIGNED_DECODE_PROJECTIONS", "0"))
-    ),
-    # Overlap split Kimi MXFP8 Q/K/V with BF16 gate/factor/beta projections
-    # during CUDA graph capture. Zero preserves sequential dispatch.
-    "VLLM_KIMI_KDA_PROJECTION_STREAM_TOKEN_THRESHOLD": lambda: int(
-        os.getenv("VLLM_KIMI_KDA_PROJECTION_STREAM_TOKEN_THRESHOLD", "0")
-    ),
-    # Bound physical group width for Kimi's recurrent target and MLA draft pool.
-    "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
-    # Keep a bounded draft-only MLA tail; target verification retains full KV.
-    "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
-        os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
-    ),
-    # Stage DFlash auxiliary inputs in MXFP8 and use B12X for its FC only.
-    "VLLM_DFLASH_AUX_MXFP8_STREAMING": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_AUX_MXFP8_STREAMING", "0"))
-    ),
-    "VLLM_DFLASH_AUX_BF16_STAGING": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_AUX_BF16_STAGING", "0"))
-    ),
-    # Keep only the unscaled rotary rows consumed by a DFlash forward.
-    "VLLM_DFLASH_COMPACT_ROPE": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_COMPACT_ROPE", "0"))
-    ),
-    # Partition DFlash auxiliary FC output rows and gather complete activations.
-    "VLLM_DFLASH_SHARD_AUX_PROJECTION": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_SHARD_AUX_PROJECTION", "0"))
-    ),
-    # Materialize only the FP32 rotary rows used by one draft forward.
-    "VLLM_DSPARK_COMPACT_ROPE": lambda: bool(
-        int(os.getenv("VLLM_DSPARK_COMPACT_ROPE", "0"))
-    ),
-    "VLLM_DSPARK_SHARD_MARKOV_HEAD": lambda: bool(
-        int(os.getenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "0"))
-    ),
-    "VLLM_DSPARK_REPLICATE_MARKOV_W1": lambda: bool(
-        int(os.getenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "0"))
-    ),
-    # Exact distributed greedy selection without gathering vocabulary logits.
-    "VLLM_KIMI_K3_B12X_DSPARK_ARGMAX": lambda: bool(
-        int(os.getenv("VLLM_KIMI_K3_B12X_DSPARK_ARGMAX", "0"))
-    ),
-    # Kimi DSpark defaults to replicated draft KV within a DCP group.
-    "VLLM_DCP_SHARD_DRAFT": lambda: os.getenv("VLLM_DCP_SHARD_DRAFT"),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
@@ -1779,6 +1692,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
         int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
+    ),
+    # Quantize the DeepSeek V4.1 DSpark Markov transition head to NVFP4 (fits
+    # the GB10 L2; draft graph 3.57 -> 3.0 ms). Off until its effect on
+    # acceptance is measured.
+    "VLLM_DS41_MARKOV_NVFP4": lambda: bool(
+        int(os.getenv("VLLM_DS41_MARKOV_NVFP4", "0"))
+    ),
+    # Give the DeepSeek V4.1 DSpark drafter its own NVFP4 vocabulary head.
+    "VLLM_DS41_DRAFT_NVFP4_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DS41_DRAFT_NVFP4_HEAD", "0"))
+    ),
+    # Read DeepSeek V4.1 disk Engram rows while the target graph starts.
+    "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_DS41_ENGRAM_OVERLAP", "1"))
     ),
     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
