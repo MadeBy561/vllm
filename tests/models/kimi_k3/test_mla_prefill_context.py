@@ -39,6 +39,36 @@ _CONTEXT_LENS = [200, 48, 32, 0]
 _QUERY_LENS = [8, 4, 6, 5]
 
 
+def test_prepared_prefill_preserves_kimi_decode_preparation():
+    """Kimi owns both backends; preparing only decode leaves prefill unusable."""
+    layer = MultiHeadLatentAttention.__new__(MultiHeadLatentAttention)
+    torch.nn.Module.__init__(layer)
+    workload = object()
+    calls = []
+
+    def units(owner, request, kind):
+        assert owner is layer and request is workload
+        calls.append(kind)
+        return (kind,)
+
+    layer.impl = SimpleNamespace(
+        b12x_preparation_provider=SimpleNamespace(
+            get_b12x_preparation_units=lambda owner, request: units(
+                owner, request, "decode"
+            )
+        )
+    )
+    layer.prefill_backend = SimpleNamespace(
+        get_b12x_preparation_units=lambda owner, request: units(
+            owner, request, "prefill"
+        )
+    )
+    assert layer.get_b12x_preparation_units(layer, workload) == ("decode", "prefill")
+    assert calls == ["decode", "prefill"]
+    with pytest.raises(ValueError, match="owner mismatch"):
+        layer.get_b12x_preparation_units(object(), workload)
+
+
 class _RecordingPrefillBackend:
     """Records what each chunk is asked to attend over.
 

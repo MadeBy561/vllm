@@ -94,6 +94,7 @@ from vllm.models.kimi_k3.nvidia.tp_projection import (
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.utils.b12x import set_b12x_preparation_provider
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
@@ -394,6 +395,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             kv_b_proj=self.kv_b_proj,
             indexer=None,
         )
+        provider = getattr(self.impl, "b12x_preparation_provider", None)
+        if provider is not None:
+            set_b12x_preparation_provider(self, provider)
         if getattr(self.impl, "dcp_world_size", -1) < 1:
             # FlashAttention requires the cp_world_size is positive and the cp_rank
             # is non negative; manually set here if not set by caller (-1 is unset)
@@ -438,6 +442,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             vllm_config=vllm_config,
         )
 
+        if callable(getattr(self.prefill_backend, "get_b12x_preparation_units", None)):
+            set_b12x_preparation_provider(self, self)
+
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -447,6 +454,17 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     # ------------------------------------------------------------------
     # AttentionLayerBase interface
     # ------------------------------------------------------------------
+    def get_b12x_preparation_units(self, layer, workload):
+        if layer is not self:
+            raise ValueError("Kimi MLA preparation owner mismatch")
+        provider = getattr(self.impl, "b12x_preparation_provider", None)
+        decode_hook = getattr(provider, "get_b12x_preparation_units", None)
+        units = tuple(decode_hook(self, workload)) if callable(decode_hook) else ()
+        prefill_hook = getattr(self.prefill_backend, "get_b12x_preparation_units", None)
+        if callable(prefill_hook):
+            units += tuple(prefill_hook(self, workload))
+        return units
+
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
