@@ -371,6 +371,62 @@ def test_exl3_split_kda_projection_keeps_gate_and_beta_order():
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("checkpoint_heads", [69, 70, 72])
+@pytest.mark.parametrize("legacy_shape", [False, True])
+def test_kimi_weight_loading_checks_original_heads_before_tail_padding(
+    monkeypatch, checkpoint_heads, legacy_shape
+):
+    from vllm.models.kimi_k3.nvidia import kda
+    from vllm.models.kimi_k3.nvidia.model import KimiLinearModel
+
+    model = KimiLinearModel.__new__(KimiLinearModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(linear_attn_config={}, is_moe=False)
+    model.attention = torch.nn.Module()
+    model.attention._tp_checkpoint_dimensions = {"A_log": (None, 70)}
+    parameter = torch.nn.Parameter(torch.full((8,), -1.0))
+    parameter.allow_tp_padding = True
+    parameter.weight_loader = kda.a_log_weight_loader(0)
+    model.attention.register_parameter("A_log", parameter)
+    monkeypatch.setattr(kda, "get_tensor_model_parallel_rank", lambda: 8)
+    checkpoint = torch.arange(checkpoint_heads, dtype=torch.float32)
+    if legacy_shape:
+        checkpoint = checkpoint.view(1, 1, -1, 1)
+    weights = [("attention.A_log", checkpoint)]
+    if checkpoint_heads != 70:
+        with pytest.raises(ValueError, match="original head count"):
+            model.load_weights(weights)
+        assert torch.all(parameter == -1)
+    else:
+        assert model.load_weights(weights) == {"attention.A_log"}
+        expected = torch.cat((torch.arange(64, 70), torch.zeros(2)))
+        torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("suffix", ["weight", "weight_scale"])
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+def test_kimi_padded_projection_rejects_truncated_weights_and_scales(
+    axis, suffix, delta
+):
+    from vllm.models.kimi_k3.nvidia.tp_projection import (
+        projection_checkpoint_dimensions,
+        validate_checkpoint_tensor,
+    )
+
+    dimensions = projection_checkpoint_dimensions({"projection": (axis, 70 * 128)})
+    name = f"projection.{suffix}"
+    size = 70 * 128 // (32 if suffix == "weight_scale" and axis == 1 else 1)
+    shape = [2, 2]
+    shape[axis] = size + delta
+    value = torch.empty(shape)
+    if delta:
+        with pytest.raises(ValueError, match="original head count"):
+            validate_checkpoint_tensor(name, value, dimensions)
+    else:
+        validate_checkpoint_tensor(name, value, dimensions)
+
+
 @pytest.mark.parametrize("defect", ["manifest", "dense", "gate", "qkv"])
 def test_exl3_config_rejects_unsupported_wire_formats(checkpoint_quant_config, defect):
     from vllm.model_executor.layers.quantization.exl3 import Exl3Config
