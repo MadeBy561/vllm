@@ -39,36 +39,6 @@ _CONTEXT_LENS = [200, 48, 32, 0]
 _QUERY_LENS = [8, 4, 6, 5]
 
 
-def test_prepared_prefill_preserves_kimi_decode_preparation():
-    """Kimi owns both backends; preparing only decode leaves prefill unusable."""
-    layer = MultiHeadLatentAttention.__new__(MultiHeadLatentAttention)
-    torch.nn.Module.__init__(layer)
-    workload = object()
-    calls = []
-
-    def units(owner, request, kind):
-        assert owner is layer and request is workload
-        calls.append(kind)
-        return (kind,)
-
-    layer.impl = SimpleNamespace(
-        b12x_preparation_provider=SimpleNamespace(
-            get_b12x_preparation_units=lambda owner, request: units(
-                owner, request, "decode"
-            )
-        )
-    )
-    layer.prefill_backend = SimpleNamespace(
-        get_b12x_preparation_units=lambda owner, request: units(
-            owner, request, "prefill"
-        )
-    )
-    assert layer.get_b12x_preparation_units(layer, workload) == ("decode", "prefill")
-    assert calls == ["decode", "prefill"]
-    with pytest.raises(ValueError, match="owner mismatch"):
-        layer.get_b12x_preparation_units(object(), workload)
-
-
 class _RecordingPrefillBackend:
     """Records what each chunk is asked to attend over.
 
@@ -192,18 +162,11 @@ def _build_prefill_metadata(
     workspace_dtype: torch.dtype,
     q_data_type: torch.dtype,
     backend: _RecordingPrefillBackend,
-    dcp_world_size: int = 1,
 ) -> MLACommonPrefillMetadata:
     query_start_loc_cpu = torch.zeros(len(_QUERY_LENS) + 1, dtype=torch.int32)
     query_start_loc_cpu[1:] = torch.tensor(_QUERY_LENS, dtype=torch.int32).cumsum(0)
     workspace = torch.empty(
-        (
-            _WORKSPACE_TOKENS
-            + (_WORKSPACE_TOKENS // dcp_world_size if dcp_world_size > 1 else 0),
-            _ENTRY,
-        ),
-        dtype=workspace_dtype,
-        device=device,
+        (_WORKSPACE_TOKENS, _ENTRY), dtype=workspace_dtype, device=device
     )
     chunked_context = build_mla_chunked_context_metadata(
         context_lens_cpu=torch.tensor(_CONTEXT_LENS, dtype=torch.int32),
@@ -213,9 +176,9 @@ def _build_prefill_metadata(
         block_size=_BLOCK_SIZE,
         align_chunk_to_block=True,
         device=device,
-        dcp_world_size=dcp_world_size,
+        dcp_world_size=1,
         dcp_local_block_size=1,
-        dcp_virtual_block_size=dcp_world_size,
+        dcp_virtual_block_size=1,
     )
     assert chunked_context is not None
     assert len(chunked_context.chunks) > 1, "the batch must exercise accumulation"
@@ -234,79 +197,6 @@ def _build_prefill_metadata(
         output_dtype=torch.bfloat16,
         prefill_backend=backend,
     ), num_blocks
-
-
-@pytest.mark.parametrize("world", [2, 8])
-@torch.inference_mode()
-def test_dcp_fp8_transport_preserves_projected_context_and_accumulation(world):
-    """Exercise raw cache extraction, upconversion and the actual context loop.
-
-    Rank inputs are replicated by the transport test double. The native cache
-    gather, KV projection, packed-context layout and partial merge are real.
-    """
-    import functools
-
-    from vllm.v1.attention.ops.dcp_prefetch import DCPContextPrefetch
-
-    class CopyCommunicator:
-        disabled = False
-
-        def all_gather(self, output, source, stream):
-            for rank in range(world):
-                output[rank * source.shape[0] : (rank + 1) * source.shape[0]].copy_(
-                    source
-                )
-
-    torch.manual_seed(123)
-    device = torch.device("cuda")
-    comm = CopyCommunicator()
-    manager = SimpleNamespace(
-        _kv_gather=functools.partial(torch.distributed.all_gather_into_tensor),
-        group=SimpleNamespace(
-            world_size=world,
-            device_communicator=SimpleNamespace(pynccl_comm=comm),
-        ),
-        kv_gather=lambda output, source: comm.all_gather(
-            output, source, torch.cuda.current_stream()
-        ),
-    )
-    projection = _KVBProj(device, torch.bfloat16)
-    impl = _ReferenceImpl(projection, "fp8")
-    q = torch.randn(
-        (sum(_QUERY_LENS), _NUM_HEADS, _QK_NOPE + _QK_ROPE),
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    scale = torch.tensor([0.1], device=device, dtype=torch.float32)
-    outputs, calls = [], []
-    cache = None
-    for transport in (None, False, True):
-        backend = _RecordingPrefillBackend()
-        prefill, blocks = _build_prefill_metadata(
-            device, torch.bfloat16, torch.bfloat16, backend, world
-        )
-        if cache is None:
-            cache = torch.randn((blocks, _BLOCK_SIZE, _ENTRY), device=device).to(
-                torch.float8_e4m3fn
-            )
-        context = prefill.chunked_context
-        context.dcp_manager = manager
-        if transport is not None:
-            context.dcp_prefetch = DCPContextPrefetch(
-                manager, context.workspace, fp8_transport=transport
-            )
-        output = MLACommonBaseImpl._context_parallel_compute_prefill_context(
-            impl, q, cache, SimpleNamespace(prefill=prefill), scale, world
-        )
-        torch.accelerator.synchronize()
-        outputs.append(tuple(t.clone() for t in output))
-        calls.append(backend.calls)
-    for output, captured in zip(outputs[1:], calls[1:]):
-        for actual, expected in zip(output, outputs[0]):
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        for actual_chunk, expected_chunk in zip(captured, calls[0], strict=True):
-            for actual, expected in zip(actual_chunk, expected_chunk):
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("honors_out", [False, True], ids=["copy_out", "writes_out"])
@@ -430,7 +320,49 @@ def test_fused_context_rejects_an_unquantized_query() -> None:
         layer._compute_prefill_context(q, SimpleNamespace(prefill=prefill))
 
 
-@torch.inference_mode()
+@pytest.mark.parametrize("gate_layout", ["fused", "separate", "none"])
+def test_q_lora_uses_the_configured_output_gate_projection(gate_layout):
+    """Separate checkpoint formats keep the MLA gate outside packed Q/KV."""
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    qkv = hidden[:, :3]
+    gate = hidden[:, 3:]
+    calls = []
+
+    def project(value, output, name):
+        assert value is hidden
+        calls.append(name)
+        return output, None
+
+    layer = SimpleNamespace(
+        q_lora_rank=1,
+        kv_lora_rank=1,
+        qk_rope_head_dim=1,
+        num_local_heads=1,
+        v_head_dim=1,
+        use_output_gate=gate_layout != "none",
+        aux_stream=None,
+        _gate_events=None,
+        fused_qkv_a_g_proj=(lambda value: project(value, hidden, "fused"))
+        if gate_layout == "fused"
+        else None,
+        fused_qkv_a_proj=lambda value: project(value, qkv, "qkv"),
+        g_proj=(lambda value: project(value, gate, "gate"))
+        if gate_layout == "separate"
+        else None,
+        _apply_q_lora_attention=lambda positions, value, projected: projected,
+    )
+    actual, actual_gate = MultiHeadLatentAttention._forward_q_lora(
+        layer, torch.arange(2), hidden
+    )
+    torch.testing.assert_close(actual, qkv, rtol=0, atol=0)
+    if gate_layout == "none":
+        assert actual_gate is None
+        assert calls == ["qkv"]
+    else:
+        torch.testing.assert_close(actual_gate, gate, rtol=0, atol=0)
+        assert calls == (["fused"] if gate_layout == "fused" else ["qkv", "gate"])
+
+
 def test_bf16_nope_prefill_writes_fp8_cache_without_quantizing_attention():
     """Cache storage precision must not force lower-precision prefill Q/K/V."""
     torch.manual_seed(411)

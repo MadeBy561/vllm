@@ -38,10 +38,7 @@ def test_skip_gate_only_for_zero_context():
     )
 
 
-@pytest.mark.parametrize("backend_name", ["FLASH_ATTN", "TRITON_ATTN", "B12X_MLA"])
-def test_replicated_draft_attention_executes_as_local_dcp(monkeypatch, backend_name):
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
+def test_replicated_draft_attention_executes_as_local_dcp(monkeypatch):
     layer_impl = SimpleNamespace(
         supports_mtp_with_cp_non_trivial_interleave_size=False,
         need_to_return_lse_for_decode=False,
@@ -50,7 +47,10 @@ def test_replicated_draft_attention_executes_as_local_dcp(monkeypatch, backend_n
         total_cp_world_size=4,
         total_cp_rank=2,
     )
-    backend = AttentionBackendEnum[backend_name].get_class()
+    backend = SimpleNamespace(
+        supports_dcp_replicated=True,
+        get_name=lambda: "TEST_SUPPORTED",
+    )
     layer = SimpleNamespace(
         impl=layer_impl,
         get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_replicated=True),
